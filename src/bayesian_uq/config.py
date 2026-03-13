@@ -88,6 +88,7 @@ class ExperimentConfig(BaseModel):
     run_name: str
     model: str
     think: bool = False
+    prompt_mode: Literal["direct", "cot", "cot_structured"] = "direct"
     question_set: str
     confidence_threshold: float = 0.95
     max_queries_per_question: int = 12

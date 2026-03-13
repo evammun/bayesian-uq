@@ -36,25 +36,26 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 QUESTIONS_PATH = PROJECT_ROOT / "data" / "questions.json"
 ANSWER_LETTERS = ["A", "B", "C", "D"]
 
-# Colour palette
+# Colour palette — cool-toned teals, blues, grays
 TEAL = "#2D7F83"
 DEEP_BLUE = "#1E4D8A"
-ROSE = "#B85C5C"
-GOLD = "#C4A35A"
-SLATE = "#5B6770"
+DARK_TEAL = "#2F555A"
+CHARCOAL = "#1A2F32"
+SLATE = "#6B7280"
+GOLD = "#EEB127"       # high-contrast accent for incorrect / negative indicators
 BG = "#FDFCFB"
 TRANSPARENT = "rgba(0,0,0,0)"
-TEXT = "#2C3E50"
+TEXT = "#1A2F32"
 GRAY_MID = "#6B7280"
 GRAY_LIGHT = "#8B95A1"
 GRID = "#E8E4E0"
 BORDER = "#E5E0DB"
 
 # Colours for multi-run overlays (up to 6 runs)
-RUN_COLORS = [TEAL, DEEP_BLUE, ROSE, GOLD, SLATE, "#5A9F6E"]
+RUN_COLORS = [TEAL, DEEP_BLUE, DARK_TEAL, CHARCOAL, SLATE, "#3A8A8F"]
 
 # Stacked area chart colours for answer choices A/B/C/D
-CHOICE_COLORS = [TEAL, DEEP_BLUE, GOLD, ROSE]
+CHOICE_COLORS = [TEAL, DEEP_BLUE, CHARCOAL, DARK_TEAL]
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +312,14 @@ def format_run_name(cfg: dict) -> str:
     shuffle = "shuffle on" if cfg.get("shuffle_choices", True) else "shuffle off"
     para = "para on" if cfg.get("use_paraphrases") else "para off"
 
-    tokens = [model_str, think, shuffle, para]
+    # Prompt mode: only show if non-default (direct is the baseline)
+    prompt_mode = cfg.get("prompt_mode", "direct")
+    prompt_label = {"cot": "CoT", "cot_structured": "CoT-struct"}.get(prompt_mode)
+
+    tokens = [model_str]
+    if prompt_label:
+        tokens.append(prompt_label)
+    tokens.extend([think, shuffle, para])
 
     # Question count
     max_q = cfg.get("max_questions")
@@ -339,6 +347,7 @@ def format_short_labels(runs_list: list[dict]) -> dict[str, str]:
     thinks = {bool(c.get("think")) for c in configs}
     shuffles = {bool(c.get("shuffle_choices", True)) for c in configs}
     paras = {bool(c.get("use_paraphrases")) for c in configs}
+    prompts = {c.get("prompt_mode", "direct") for c in configs}
 
     # Build per-run short labels including only differing parts
     result = {}
@@ -349,6 +358,12 @@ def format_short_labels(runs_list: list[dict]) -> dict[str, str]:
         # Include model only if it varies
         if len(models) > 1:
             tokens.append(_parse_model_str(cfg))
+
+        # Include prompt mode only if it varies across runs
+        if len(prompts) > 1:
+            pm = cfg.get("prompt_mode", "direct")
+            pm_label = {"direct": "direct", "cot": "CoT", "cot_structured": "CoT-struct"}.get(pm, pm)
+            tokens.append(pm_label)
 
         # Always include variable flags; skip fixed ones
         if len(thinks) > 1:
@@ -511,6 +526,73 @@ def get_category(subject: str) -> str:
             if kw in s:
                 return category
     return "Other"
+
+
+# Subject group mapping (~10 groups for filtering)
+_SUBJECT_GROUP_RULES = [
+    ("Mathematics & Statistics", [
+        "abstract_algebra", "college_mathematics", "elementary_mathematics",
+        "high_school_mathematics", "high_school_statistics",
+    ]),
+    ("Physical Sciences", [
+        "college_physics", "conceptual_physics", "high_school_physics",
+        "electrical_engineering", "astronomy", "college_chemistry",
+        "high_school_chemistry",
+    ]),
+    ("Life Sciences & Medicine", [
+        "college_biology", "high_school_biology", "anatomy", "nutrition",
+        "human_aging", "virology", "medical_genetics", "clinical_knowledge",
+        "college_medicine", "professional_medicine",
+    ]),
+    ("Computer Science & AI", [
+        "college_computer_science", "high_school_computer_science",
+        "computer_security", "machine_learning",
+    ]),
+    ("Law & Politics", [
+        "professional_law", "international_law", "jurisprudence",
+        "high_school_government_and_politics", "us_foreign_policy",
+        "security_studies",
+    ]),
+    ("Economics & Business", [
+        "high_school_macroeconomics", "high_school_microeconomics",
+        "econometrics", "professional_accounting", "management",
+        "marketing", "business_ethics", "public_relations",
+    ]),
+    ("Psychology & Sociology", [
+        "high_school_psychology", "professional_psychology", "sociology",
+        "human_sexuality", "moral_disputes", "moral_scenarios",
+    ]),
+    ("History & Geography", [
+        "high_school_european_history", "high_school_us_history",
+        "high_school_world_history", "prehistory", "high_school_geography",
+    ]),
+    ("Philosophy & Logic", [
+        "philosophy", "world_religions", "logical_fallacies", "formal_logic",
+    ]),
+]
+
+
+def get_subject_group(subject: str) -> str:
+    """Map a subject to one of ~10 broad content-area groups."""
+    s = subject.lower()
+    for group, subjects in _SUBJECT_GROUP_RULES:
+        if s in subjects:
+            return group
+    return "Other"
+
+
+def get_level(subject: str) -> str:
+    """Extract academic level from subject name prefix."""
+    s = subject.lower()
+    if s.startswith("elementary_"):
+        return "Elementary"
+    if s.startswith("high_school_"):
+        return "High School"
+    if s.startswith("college_"):
+        return "College"
+    if s.startswith("professional_"):
+        return "Professional"
+    return "General"
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +806,7 @@ def _pct_histogram(
 
     for label, colour, mask in [
         ("Correct", TEAL, valid["correct"] == True),    # noqa: E712
-        ("Incorrect", ROSE, valid["correct"] == False),  # noqa: E712
+        ("Incorrect", GOLD, valid["correct"] == False),  # noqa: E712
     ]:
         subset = valid[mask]
         if len(subset) == 0:
@@ -734,7 +816,7 @@ def _pct_histogram(
             histnorm="percent",
             name=label,
             marker_color=colour,
-            opacity=0.55,
+            opacity=0.85,
             nbinsx=nbins,
         ))
 
@@ -751,65 +833,78 @@ with tab2:
     st.header("Posterior Diagnostics")
     st.caption("Does the posterior know what it knows?")
 
-    # --- Section 1: Uncertainty signature scatter plot (hero visualisation) ---
-    st.markdown("#### Uncertainty signature")
+    # --- Filters: level and subject group ---
+    # Collect all subjects across selected runs to populate filter options
+    _all_subjects = set()
+    for run in runs:
+        _all_subjects.update(run["df"]["subject"].unique())
+    _available_levels = sorted({get_level(s) for s in _all_subjects})
+    _available_groups = sorted({get_subject_group(s) for s in _all_subjects})
+
+    _filter_col1, _filter_col2 = st.columns(2)
+    with _filter_col1:
+        _selected_levels = st.multiselect(
+            "Filter by level",
+            options=_available_levels,
+            default=_available_levels,
+            key="diag_level_filter",
+        )
+    with _filter_col2:
+        _selected_groups = st.multiselect(
+            "Filter by subject group",
+            options=_available_groups,
+            default=_available_groups,
+            key="diag_group_filter",
+        )
+
+    # Apply filters to each run's dataframe and question_results
+    # Store filtered versions so all sections below use them
+    _filtered_runs = []
+    for run in runs:
+        rdf = run["df"].copy()
+        rdf["_level"] = rdf["subject"].apply(get_level)
+        rdf["_group"] = rdf["subject"].apply(get_subject_group)
+        mask = rdf["_level"].isin(_selected_levels) & rdf["_group"].isin(_selected_groups)
+        fdf = rdf[mask].drop(columns=["_level", "_group"]).copy()
+        # Filter question_results to match
+        fqids = set(fdf["question_id"])
+        fqr = [qr for qr in run["question_results"] if qr["question_id"] in fqids]
+        _filtered_runs.append({
+            **run,
+            "df": fdf,
+            "question_results": fqr,
+        })
+    # Use filtered runs for the rest of this tab
+    runs_diag = _filtered_runs
+
+    # Show how many questions pass the filter
+    _total_filtered = sum(len(r["df"]) for r in runs_diag)
+    _total_unfiltered = sum(len(r["df"]) for r in runs)
+    if _total_filtered < _total_unfiltered:
+        st.caption(f"Showing {_total_filtered} / {_total_unfiltered} questions after filtering")
+
+    # --- Section 1: Concentration distribution (correct vs incorrect) ---
+    st.markdown("#### Concentration distribution")
     st.caption(
-        "Each dot is one question. Top-left = fast and decisive. "
-        "Bottom-right = slow and uncertain."
+        "How decisive is the posterior? High concentration = one answer dominates. "
+        "Low concentration = spread across choices. Correct answers should cluster high."
     )
 
     if multi:
-        cols = st.columns(len(runs))
-        for col, run in zip(cols, runs):
+        cols = st.columns(len(runs_diag))
+        for col, run in zip(cols, runs_diag):
             with col:
-                rdf = run["df"]
-                valid = rdf[rdf["correct"].notna()].copy()
-                fig = go.Figure()
-                for label, colour, mask in [
-                    ("Correct", TEAL, valid["correct"] == True),      # noqa: E712
-                    ("Incorrect", ROSE, valid["correct"] == False),    # noqa: E712
-                ]:
-                    subset = valid[mask]
-                    if len(subset) == 0:
-                        continue
-                    fig.add_trace(go.Scatter(
-                        x=subset["queries_used"],
-                        y=subset["concentration"],
-                        mode="markers",
-                        marker=dict(color=colour, size=8, opacity=0.6),
-                        name=label,
-                    ))
-                fig.update_layout(
-                    title_text=run["display_name"],
-                    xaxis_title="Queries used",
-                    yaxis_title="Concentration ratio",
-                    yaxis_range=[0, 1.05],
+                fig = _pct_histogram(
+                    run["df"], "concentration", run["display_name"],
+                    "Concentration ratio",
                 )
-                st.plotly_chart(apply_theme(fig, height=340), use_container_width=True)
+                st.plotly_chart(apply_theme(fig, height=300), width="stretch")
     else:
-        rdf = runs[0]["df"]
-        valid = rdf[rdf["correct"].notna()].copy()
-        fig = go.Figure()
-        for label, colour, mask in [
-            ("Correct", TEAL, valid["correct"] == True),      # noqa: E712
-            ("Incorrect", ROSE, valid["correct"] == False),    # noqa: E712
-        ]:
-            subset = valid[mask]
-            if len(subset) == 0:
-                continue
-            fig.add_trace(go.Scatter(
-                x=subset["queries_used"],
-                y=subset["concentration"],
-                mode="markers",
-                marker=dict(color=colour, size=8, opacity=0.6),
-                name=label,
-            ))
-        fig.update_layout(
-            xaxis_title="Queries used",
-            yaxis_title="Concentration ratio",
-            yaxis_range=[0, 1.05],
+        fig = _pct_histogram(
+            runs_diag[0]["df"], "concentration", "",
+            "Concentration ratio",
         )
-        st.plotly_chart(apply_theme(fig, height=400), use_container_width=True)
+        st.plotly_chart(apply_theme(fig, height=350), width="stretch")
 
     st.markdown(
         "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
@@ -824,37 +919,279 @@ with tab2:
     )
 
     if multi:
-        cols = st.columns(len(runs))
-        for col, run in zip(cols, runs):
+        cols = st.columns(len(runs_diag))
+        for col, run in zip(cols, runs_diag):
             with col:
                 fig = _pct_histogram(
                     run["df"], "queries_used", run["display_name"],
                     "Queries used",
                 )
-                st.plotly_chart(apply_theme(fig, height=260), use_container_width=True)
+                st.plotly_chart(apply_theme(fig, height=260), width="stretch")
     else:
         fig = _pct_histogram(
-            runs[0]["df"], "queries_used", "",
+            runs_diag[0]["df"], "queries_used", "",
             "Queries used",
         )
-        st.plotly_chart(apply_theme(fig, height=300), use_container_width=True)
+        st.plotly_chart(apply_theme(fig, height=300), width="stretch")
 
     st.markdown(
         "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
         unsafe_allow_html=True,
     )
 
-    # --- Section 2b: Drill-through by convergence speed ---
+    # --- Section 3: Summary metrics table ---
+    st.markdown("#### Summary metrics")
+
+    summary_rows = []
+    for run in runs_diag:
+        rdf = run["df"]
+        valid = rdf[rdf["correct"].notna()]
+        correct_mask = valid["correct"] == True   # noqa: E712
+        incorrect_mask = valid["correct"] == False  # noqa: E712
+        n_correct = int(correct_mask.sum())
+        acc = n_correct / len(valid) if len(valid) > 0 else None
+
+        # Average queries split by correctness
+        avg_q_correct = float(valid.loc[correct_mask, "queries_used"].mean()) if correct_mask.any() else None
+        avg_q_incorrect = float(valid.loc[incorrect_mask, "queries_used"].mean()) if incorrect_mask.any() else None
+
+        # Average concentration split by correctness
+        avg_conc_correct = float(valid.loc[correct_mask, "concentration"].mean()) if correct_mask.any() else None
+        avg_conc_incorrect = float(valid.loc[incorrect_mask, "concentration"].mean()) if incorrect_mask.any() else None
+
+        # Prompt mode label for the table
+        _pm = run["config"].get("prompt_mode", "direct")
+        _pm_label = {"direct": "direct", "cot": "CoT", "cot_structured": "CoT-struct"}.get(_pm, _pm)
+
+        summary_rows.append({
+            "Run": run["display_name"],
+            "Prompt": _pm_label,
+            "Paraphrases": "on" if run["config"].get("use_paraphrases") else "off",
+            "Accuracy": acc,
+            "AUROC": compute_auroc(rdf),
+            "ECE": compute_ece(rdf),
+            "Avg queries (correct)": round(avg_q_correct, 1) if avg_q_correct is not None else None,
+            "Avg queries (incorrect)": round(avg_q_incorrect, 1) if avg_q_incorrect is not None else None,
+            "Avg conc. (correct)": round(avg_conc_correct, 3) if avg_conc_correct is not None else None,
+            "Avg conc. (incorrect)": round(avg_conc_incorrect, 3) if avg_conc_incorrect is not None else None,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    def _highlight_best(s: pd.Series) -> list[str]:
+        """Highlight the best value per column in teal."""
+        if s.name in ("Run", "Prompt", "Paraphrases"):
+            return [""] * len(s)
+        numeric = pd.to_numeric(s, errors="coerce")
+        if numeric.isna().all():
+            return [""] * len(s)
+        # Lower is better for ECE and query counts; higher is better for the rest
+        lower_is_better = ("ECE", "Avg queries (correct)", "Avg queries (incorrect)",
+                           "Avg conc. (incorrect)")
+        if s.name in lower_is_better:
+            best = numeric.min()
+        else:
+            best = numeric.max()
+        return [
+            "background-color: rgba(45, 127, 131, 0.12)" if v == best else ""
+            for v in numeric
+        ]
+
+    styled = (
+        summary_df.style
+        .format({
+            "Accuracy": lambda x: f"{x:.1%}" if pd.notna(x) else "\u2014",
+            "AUROC": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
+            "ECE": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
+            "Avg queries (correct)": lambda x: f"{x:.1f}" if pd.notna(x) else "\u2014",
+            "Avg queries (incorrect)": lambda x: f"{x:.1f}" if pd.notna(x) else "\u2014",
+            "Avg conc. (correct)": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
+            "Avg conc. (incorrect)": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
+        })
+        .apply(_highlight_best)
+    )
+    st.dataframe(styled, width="stretch", hide_index=True)
+
+    st.markdown(
+        "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
+        unsafe_allow_html=True,
+    )
+
+    # --- Section 4: Posterior shape breakdown (rank-ordered) ---
+    st.markdown("#### Posterior shape breakdown")
+    st.caption(
+        "Rank-ordered alpha averages: each question's alphas are sorted "
+        "highest to lowest before averaging. Shows whether the model is "
+        "decisive (big gap between 1st and 2nd) or confused (close values)."
+    )
+
+    for run in runs_diag:
+        if multi:
+            st.markdown(f"**{run['display_name']}**")
+
+        rdf = run["df"]
+        valid = rdf[rdf["correct"].notna()].copy()
+
+        shape_rows = []
+        for label, mask in [
+            ("Correct", valid["correct"] == True),      # noqa: E712
+            ("Incorrect", valid["correct"] == False),    # noqa: E712
+        ]:
+            subset = valid[mask]
+            if len(subset) == 0:
+                shape_rows.append({
+                    "Group": label,
+                    "Count": 0,
+                    "1st choice": "\u2014",
+                    "2nd choice": "\u2014",
+                    "3rd choice": "\u2014",
+                    "4th choice": "\u2014",
+                    "Concentration": "\u2014",
+                })
+                continue
+
+            # Sort each question's alphas descending, then average by rank
+            alphas = np.array(subset["final_alpha"].tolist())
+            ranked = np.sort(alphas, axis=1)[:, ::-1]  # descending per row
+            mean_ranked = ranked.mean(axis=0)
+            mean_conc = float(subset["concentration"].mean())
+
+            row_data = {
+                "Group": label,
+                "Count": len(subset),
+            }
+            # Show up to 4 rank positions (handle variable choice counts)
+            rank_labels = ["1st choice", "2nd choice", "3rd choice", "4th choice"]
+            for ri, rl in enumerate(rank_labels):
+                if ri < mean_ranked.shape[0]:
+                    row_data[rl] = round(float(mean_ranked[ri]), 1)
+                else:
+                    row_data[rl] = "\u2014"
+            row_data["Concentration"] = round(mean_conc, 2)
+            shape_rows.append(row_data)
+
+        st.dataframe(
+            pd.DataFrame(shape_rows),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.markdown(
+        "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
+        unsafe_allow_html=True,
+    )
+
+    # --- Section 5: Calibration curve (checkpoint-based) ---
+    st.markdown("#### Calibration at query checkpoint")
+
+    # Slider to pick the checkpoint query number
+    max_budget = max(
+        run["config"].get("max_queries_per_question", 100) for run in runs_diag
+    )
+    _cal_max = max(2, min(max_budget, 100))
+    checkpoint = st.slider(
+        "Checkpoint query number",
+        min_value=1,
+        max_value=_cal_max,
+        value=min(5, _cal_max),
+        key="cal_checkpoint",
+    )
+
+    fig_cal = go.Figure()
+
+    # Perfect calibration diagonal
+    fig_cal.add_trace(go.Scatter(
+        x=[0, 1], y=[0, 1],
+        mode="lines",
+        line=dict(color=GRAY_LIGHT, width=1, dash="dot"),
+        name="Perfect calibration",
+    ))
+
+    for i, run in enumerate(runs_diag):
+        # Get exceedance at the checkpoint for each question
+        cp_rows = []
+        for qr in run["question_results"]:
+            qlog = qr.get("query_log", [])
+            if not qlog:
+                continue
+            # Find exceedance at or before the checkpoint (query_number is 0-indexed)
+            exc = None
+            for entry in qlog:
+                if entry["query_number"] < checkpoint:
+                    exc = entry["exceedance_after"]
+            if exc is None:
+                continue
+            cp_rows.append({
+                "checkpoint_exceedance": exc,
+                "correct": qr.get("correct"),
+            })
+
+        if not cp_rows:
+            continue
+        cp_df = pd.DataFrame(cp_rows)
+        valid = cp_df[cp_df["correct"].notna()].copy()
+        if len(valid) < 5:
+            continue
+
+        # Bin by checkpoint exceedance
+        n_bins = 8
+        bins = np.linspace(0, 1, n_bins + 1)
+        cal_rows = []
+        for b in range(n_bins):
+            lo, hi = bins[b], bins[b + 1]
+            if b == n_bins - 1:
+                mask = (valid["checkpoint_exceedance"] >= lo) & (valid["checkpoint_exceedance"] <= hi)
+            else:
+                mask = (valid["checkpoint_exceedance"] >= lo) & (valid["checkpoint_exceedance"] < hi)
+            bin_df = valid[mask]
+            if len(bin_df) < 2:
+                continue
+            cal_rows.append({
+                "mean_confidence": float(bin_df["checkpoint_exceedance"].mean()),
+                "accuracy": float(bin_df["correct"].astype(float).mean()),
+                "count": len(bin_df),
+            })
+
+        if not cal_rows:
+            continue
+        cal_df = pd.DataFrame(cal_rows)
+        sizes = cal_df["count"].apply(lambda c: max(5, min(c / 2, 18)))
+        fig_cal.add_trace(go.Scatter(
+            x=cal_df["mean_confidence"],
+            y=cal_df["accuracy"],
+            mode="lines+markers",
+            marker=dict(size=sizes, color=RUN_COLORS[i % len(RUN_COLORS)]),
+            line=dict(color=RUN_COLORS[i % len(RUN_COLORS)], width=2),
+            name=run["display_name"],
+        ))
+
+    fig_cal.update_layout(
+        title_text=f"Calibration at query {checkpoint}",
+        xaxis_title=f"Confidence at query {checkpoint}",
+        yaxis_title="Actual accuracy",
+        xaxis_range=[0, 1.05],
+        yaxis_range=[0, 1.05],
+    )
+    st.plotly_chart(apply_theme(fig_cal, height=400), width="stretch")
+
+    st.markdown(
+        "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
+        unsafe_allow_html=True,
+    )
+
+    # --- Section 6: Drill-through by convergence speed (moved to bottom) ---
     st.markdown("#### Explore questions by convergence speed")
 
-    # Use the first selected run for the drill-through (filters apply to it)
-    _drill_run = runs[0]
+    # Use the first selected run for the drill-through
+    _drill_run = runs_diag[0]
     _drill_df = _drill_run["df"].copy()
     _drill_qr_map = {qr["question_id"]: qr for qr in _drill_run["question_results"]}
 
-    # Range slider for queries used
+    # Range slider for queries used (guard against min == max)
     _q_min = int(_drill_df["queries_used"].min()) if len(_drill_df) > 0 else 1
     _q_max = int(_drill_df["queries_used"].max()) if len(_drill_df) > 0 else 100
+    if _q_min >= _q_max:
+        _q_max = _q_min + 1
     _q_range = st.slider(
         "Filter by queries used",
         min_value=_q_min,
@@ -971,7 +1308,7 @@ with tab2:
                     annotation_font=dict(size=10, color=GRAY_MID),
                 )
 
-                for ri, r in enumerate(runs):
+                for ri, r in enumerate(runs_diag):
                     qr = next(
                         (x for x in r["question_results"] if x["question_id"] == qid),
                         None,
@@ -995,232 +1332,9 @@ with tab2:
                 )
                 st.plotly_chart(
                     apply_theme(fig_drill, height=280),
-                    use_container_width=True,
+                    width="stretch",
                     key=f"drill_exc_{qid}",
                 )
-
-    st.markdown(
-        "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
-        unsafe_allow_html=True,
-    )
-
-    # --- Section 3: Summary metrics table ---
-    st.markdown("#### Summary metrics")
-
-    summary_rows = []
-    for run in runs:
-        rdf = run["df"]
-        valid = rdf[rdf["correct"].notna()]
-        correct_mask = valid["correct"] == True   # noqa: E712
-        incorrect_mask = valid["correct"] == False  # noqa: E712
-        n_correct = int(correct_mask.sum())
-        acc = n_correct / len(valid) if len(valid) > 0 else None
-
-        # Average queries split by correctness
-        avg_q_correct = float(valid.loc[correct_mask, "queries_used"].mean()) if correct_mask.any() else None
-        avg_q_incorrect = float(valid.loc[incorrect_mask, "queries_used"].mean()) if incorrect_mask.any() else None
-
-        # Average concentration split by correctness
-        avg_conc_correct = float(valid.loc[correct_mask, "concentration"].mean()) if correct_mask.any() else None
-        avg_conc_incorrect = float(valid.loc[incorrect_mask, "concentration"].mean()) if incorrect_mask.any() else None
-
-        summary_rows.append({
-            "Run": run["display_name"],
-            "Paraphrases": "on" if run["config"].get("use_paraphrases") else "off",
-            "Accuracy": acc,
-            "AUROC": compute_auroc(rdf),
-            "ECE": compute_ece(rdf),
-            "Avg queries (correct)": round(avg_q_correct, 1) if avg_q_correct is not None else None,
-            "Avg queries (incorrect)": round(avg_q_incorrect, 1) if avg_q_incorrect is not None else None,
-            "Avg conc. (correct)": round(avg_conc_correct, 3) if avg_conc_correct is not None else None,
-            "Avg conc. (incorrect)": round(avg_conc_incorrect, 3) if avg_conc_incorrect is not None else None,
-        })
-
-    summary_df = pd.DataFrame(summary_rows)
-
-    def _highlight_best(s: pd.Series) -> list[str]:
-        """Highlight the best value per column in teal."""
-        if s.name in ("Run", "Paraphrases"):
-            return [""] * len(s)
-        numeric = pd.to_numeric(s, errors="coerce")
-        if numeric.isna().all():
-            return [""] * len(s)
-        # Lower is better for ECE and query counts; higher is better for the rest
-        lower_is_better = ("ECE", "Avg queries (correct)", "Avg queries (incorrect)",
-                           "Avg conc. (incorrect)")
-        if s.name in lower_is_better:
-            best = numeric.min()
-        else:
-            best = numeric.max()
-        return [
-            "background-color: rgba(45, 127, 131, 0.12)" if v == best else ""
-            for v in numeric
-        ]
-
-    styled = (
-        summary_df.style
-        .format({
-            "Accuracy": lambda x: f"{x:.1%}" if pd.notna(x) else "\u2014",
-            "AUROC": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
-            "ECE": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
-            "Avg queries (correct)": lambda x: f"{x:.1f}" if pd.notna(x) else "\u2014",
-            "Avg queries (incorrect)": lambda x: f"{x:.1f}" if pd.notna(x) else "\u2014",
-            "Avg conc. (correct)": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
-            "Avg conc. (incorrect)": lambda x: f"{x:.3f}" if pd.notna(x) else "\u2014",
-        })
-        .apply(_highlight_best)
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    st.markdown(
-        "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
-        unsafe_allow_html=True,
-    )
-
-    # --- Section 4: Posterior shape breakdown ---
-    st.markdown("#### Posterior shape breakdown")
-    st.caption(
-        "Average alpha profile for correct vs incorrect answers. "
-        "High concentration = decisive. Low concentration = genuinely confused."
-    )
-
-    for run in runs:
-        if multi:
-            st.markdown(f"**{run['display_name']}**")
-
-        rdf = run["df"]
-        valid = rdf[rdf["correct"].notna()].copy()
-
-        shape_rows = []
-        for label, mask in [
-            ("Correct", valid["correct"] == True),      # noqa: E712
-            ("Incorrect", valid["correct"] == False),    # noqa: E712
-        ]:
-            subset = valid[mask]
-            if len(subset) == 0:
-                shape_rows.append({
-                    "Group": label,
-                    "Count": 0,
-                    "Avg alpha": "\u2014",
-                    "Avg concentration": "\u2014",
-                })
-                continue
-
-            # Compute mean alpha vector across all questions in this group
-            alphas = np.array(subset["final_alpha"].tolist())
-            mean_alpha = alphas.mean(axis=0)
-            mean_conc = float(subset["concentration"].mean())
-            alpha_str = "[" + ", ".join(f"{v:.1f}" for v in mean_alpha) + "]"
-
-            shape_rows.append({
-                "Group": label,
-                "Count": len(subset),
-                "Avg alpha": alpha_str,
-                "Avg concentration": f"{mean_conc:.3f}",
-            })
-
-        st.dataframe(
-            pd.DataFrame(shape_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown(
-        "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
-        unsafe_allow_html=True,
-    )
-
-    # --- Section 5: Calibration curve (checkpoint-based) ---
-    st.markdown("#### Calibration at query checkpoint")
-
-    # Slider to pick the checkpoint query number
-    max_budget = max(
-        run["config"].get("max_queries_per_question", 100) for run in runs
-    )
-    checkpoint = st.slider(
-        "Checkpoint query number",
-        min_value=1,
-        max_value=min(max_budget, 100),
-        value=5,
-        key="cal_checkpoint",
-    )
-
-    fig_cal = go.Figure()
-
-    # Perfect calibration diagonal
-    fig_cal.add_trace(go.Scatter(
-        x=[0, 1], y=[0, 1],
-        mode="lines",
-        line=dict(color=GRAY_LIGHT, width=1, dash="dot"),
-        name="Perfect calibration",
-    ))
-
-    for i, run in enumerate(runs):
-        # Get exceedance at the checkpoint for each question
-        cp_rows = []
-        for qr in run["question_results"]:
-            qlog = qr.get("query_log", [])
-            if not qlog:
-                continue
-            # Find exceedance at or before the checkpoint (query_number is 0-indexed)
-            exc = None
-            for entry in qlog:
-                if entry["query_number"] < checkpoint:
-                    exc = entry["exceedance_after"]
-            if exc is None:
-                continue
-            cp_rows.append({
-                "checkpoint_exceedance": exc,
-                "correct": qr.get("correct"),
-            })
-
-        if not cp_rows:
-            continue
-        cp_df = pd.DataFrame(cp_rows)
-        valid = cp_df[cp_df["correct"].notna()].copy()
-        if len(valid) < 5:
-            continue
-
-        # Bin by checkpoint exceedance
-        n_bins = 8
-        bins = np.linspace(0, 1, n_bins + 1)
-        cal_rows = []
-        for b in range(n_bins):
-            lo, hi = bins[b], bins[b + 1]
-            if b == n_bins - 1:
-                mask = (valid["checkpoint_exceedance"] >= lo) & (valid["checkpoint_exceedance"] <= hi)
-            else:
-                mask = (valid["checkpoint_exceedance"] >= lo) & (valid["checkpoint_exceedance"] < hi)
-            bin_df = valid[mask]
-            if len(bin_df) < 2:
-                continue
-            cal_rows.append({
-                "mean_confidence": float(bin_df["checkpoint_exceedance"].mean()),
-                "accuracy": float(bin_df["correct"].astype(float).mean()),
-                "count": len(bin_df),
-            })
-
-        if not cal_rows:
-            continue
-        cal_df = pd.DataFrame(cal_rows)
-        sizes = cal_df["count"].apply(lambda c: max(5, min(c / 2, 18)))
-        fig_cal.add_trace(go.Scatter(
-            x=cal_df["mean_confidence"],
-            y=cal_df["accuracy"],
-            mode="lines+markers",
-            marker=dict(size=sizes, color=RUN_COLORS[i % len(RUN_COLORS)]),
-            line=dict(color=RUN_COLORS[i % len(RUN_COLORS)], width=2),
-            name=run["display_name"],
-        ))
-
-    fig_cal.update_layout(
-        title_text=f"Calibration at query {checkpoint}",
-        xaxis_title=f"Confidence at query {checkpoint}",
-        yaxis_title="Actual accuracy",
-        xaxis_range=[0, 1.05],
-        yaxis_range=[0, 1.05],
-    )
-    st.plotly_chart(apply_theme(fig_cal, height=400), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1267,7 +1381,7 @@ with tab3:
                 x=pivot.columns.tolist(),
                 y=pivot.index.tolist(),
                 colorscale=[
-                    [0.0, ROSE],
+                    [0.0, GOLD],
                     [0.5, SLATE],
                     [1.0, TEAL],
                 ],
@@ -1278,7 +1392,7 @@ with tab3:
                 colorbar=dict(title="Acc %", ticksuffix="%"),
             ))
             fig_hm.update_layout(yaxis=dict(autorange="reversed"))
-            st.plotly_chart(apply_theme(fig_hm, height=350), use_container_width=True)
+            st.plotly_chart(apply_theme(fig_hm, height=350), width="stretch")
 
         st.markdown(
             "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
@@ -1302,8 +1416,12 @@ with tab3:
             avg_conc_correct = float(valid.loc[correct_mask, "concentration"].mean()) if correct_mask.any() else None
             avg_conc_incorrect = float(valid.loc[incorrect_mask, "concentration"].mean()) if incorrect_mask.any() else None
 
+            _pm = run["config"].get("prompt_mode", "direct")
+            _pm_label = {"direct": "direct", "cot": "CoT", "cot_structured": "CoT-struct"}.get(_pm, _pm)
+
             cmp_rows.append({
                 "Run": short_labels[run["display_name"]],
+                "Prompt": _pm_label,
                 "Paraphrases": "on" if run["config"].get("use_paraphrases") else "off",
                 "Accuracy": acc,
                 "AUROC": compute_auroc(rdf),
@@ -1318,7 +1436,7 @@ with tab3:
 
         def _highlight_best_cmp(s: pd.Series) -> list[str]:
             """Highlight the best value per column in teal."""
-            if s.name in ("Run", "Paraphrases"):
+            if s.name in ("Run", "Prompt", "Paraphrases"):
                 return [""] * len(s)
             numeric = pd.to_numeric(s, errors="coerce")
             if numeric.isna().all():
@@ -1347,7 +1465,7 @@ with tab3:
             })
             .apply(_highlight_best_cmp)
         )
-        st.dataframe(styled_cmp, use_container_width=True, hide_index=True)
+        st.dataframe(styled_cmp, width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,9 +1473,10 @@ with tab3:
 # ---------------------------------------------------------------------------
 
 def _extract_condition(cfg: dict) -> dict:
-    """Extract the three binary condition flags from a run config."""
+    """Extract the condition flags from a run config."""
     return {
         "think": bool(cfg.get("think")),
+        "prompt_mode": cfg.get("prompt_mode", "direct"),
         "shuffle": bool(cfg.get("shuffle_choices", False)),
         "para": bool(cfg.get("use_paraphrases", False)),
     }
@@ -1368,6 +1487,10 @@ def _condition_label(cond: dict, exclude_var: str | None = None) -> str:
     parts = []
     if exclude_var != "think":
         parts.append("think on" if cond["think"] else "think off")
+    if exclude_var != "prompt_mode":
+        pm = cond.get("prompt_mode", "direct")
+        pm_label = {"direct": "direct", "cot": "CoT", "cot_structured": "CoT-struct"}.get(pm, pm)
+        parts.append(pm_label)
     if exclude_var != "shuffle":
         parts.append("shuffle on" if cond["shuffle"] else "shuffle off")
     if exclude_var != "para":
@@ -1395,33 +1518,31 @@ with tab_effects:
     st.caption("What does each experimental variable actually do?")
 
     # --- Index runs by their condition tuple ---
+    # Key: (think, prompt_mode, shuffle, para)
     run_by_condition: dict[tuple, dict] = {}
     for run in runs:
         cond = _extract_condition(run["config"])
-        key = (cond["think"], cond["shuffle"], cond["para"])
+        key = (cond["think"], cond["prompt_mode"], cond["shuffle"], cond["para"])
         run_by_condition[key] = run
 
-    # --- Define the three variables and their matched pairs ---
-    VARIABLES = [
-        ("think", "Think on vs off"),
-        ("shuffle", "Shuffle on vs off"),
-        ("para", "Para on vs off"),
+    # --- Define variables and their matched pairs ---
+    # Binary variables use on/off flipping. prompt_mode compares against "direct".
+    BINARY_VARS = [
+        ("think", "Think on vs off", 0),
+        ("shuffle", "Shuffle on vs off", 2),
+        ("para", "Para on vs off", 3),
     ]
-    VAR_INDEX = {"think": 0, "shuffle": 1, "para": 2}
 
-    def _find_matched_pairs(var_name: str) -> list[tuple[dict, dict, dict]]:
-        """Find all matched pairs that differ only on var_name.
+    def _find_binary_matched_pairs(var_name: str, key_idx: int) -> list[tuple[dict, dict, dict]]:
+        """Find matched pairs that differ only on a binary variable.
 
-        Returns a list of (cond_off, run_off, run_on) tuples. cond_off is the
-        condition dict with the variable set to False.
+        Returns a list of (cond_off, run_off, run_on) tuples.
         """
-        idx = VAR_INDEX[var_name]
         pairs = []
         seen = set()
         for key, run in run_by_condition.items():
-            # Build the complementary key (flip the variable)
             flipped = list(key)
-            flipped[idx] = not flipped[idx]
+            flipped[key_idx] = not flipped[key_idx]
             flipped_key = tuple(flipped)
 
             pair_id = tuple(sorted([key, flipped_key]))
@@ -1430,8 +1551,7 @@ with tab_effects:
             seen.add(pair_id)
 
             if flipped_key in run_by_condition:
-                # Determine which is off and which is on
-                if key[idx]:
+                if key[key_idx]:
                     run_on, run_off = run, run_by_condition[flipped_key]
                     cond_off = _extract_condition(run_by_condition[flipped_key]["config"])
                 else:
@@ -1439,6 +1559,53 @@ with tab_effects:
                     cond_off = _extract_condition(run["config"])
                 pairs.append((cond_off, run_off, run_on))
         return pairs
+
+    def _find_prompt_matched_pairs(target_mode: str) -> list[tuple[dict, dict, dict]]:
+        """Find matched pairs: direct vs target_mode (cot or cot_structured).
+
+        Returns (cond_direct, run_direct, run_target) tuples where all other
+        variables are identical.
+        """
+        pairs = []
+        seen = set()
+        for key, run in run_by_condition.items():
+            if key[1] != "direct":
+                continue
+            # Build the target key (swap prompt_mode)
+            target_key = (key[0], target_mode, key[2], key[3])
+            pair_id = tuple(sorted([key, target_key]))
+            if pair_id in seen:
+                continue
+            seen.add(pair_id)
+            if target_key in run_by_condition:
+                cond_direct = _extract_condition(run["config"])
+                pairs.append((cond_direct, run, run_by_condition[target_key]))
+        return pairs
+
+    # Build a unified list: (var_name, label, finder_func)
+    VARIABLES: list[tuple[str, str]] = [
+        ("think", "Think on vs off"),
+        ("shuffle", "Shuffle on vs off"),
+        ("para", "Para on vs off"),
+    ]
+
+    def _find_matched_pairs(var_name: str) -> list[tuple[dict, dict, dict]]:
+        """Dispatch to the right pair-finder for a given variable."""
+        for bvar, _, kidx in BINARY_VARS:
+            if bvar == var_name:
+                return _find_binary_matched_pairs(var_name, kidx)
+        if var_name == "prompt_cot":
+            return _find_prompt_matched_pairs("cot")
+        if var_name == "prompt_cotstruct":
+            return _find_prompt_matched_pairs("cot_structured")
+        return []
+
+    # Add prompt mode comparisons if any CoT runs are present
+    _prompt_modes_present = {key[1] for key in run_by_condition}
+    if "cot" in _prompt_modes_present:
+        VARIABLES.append(("prompt_cot", "Direct vs CoT"))
+    if "cot_structured" in _prompt_modes_present:
+        VARIABLES.append(("prompt_cotstruct", "Direct vs CoT-struct"))
 
     # --- Section 1a: Main effects table ---
     st.markdown("#### Main effects")
@@ -1507,9 +1674,9 @@ with tab_effects:
             if pd.isna(val) or val is None:
                 return ""
             if higher_is_better:
-                return f"color: {TEAL}" if val > 0 else (f"color: {ROSE}" if val < 0 else "")
+                return f"color: {TEAL}" if val > 0 else (f"color: {GOLD}" if val < 0 else "")
             else:
-                return f"color: {TEAL}" if val < 0 else (f"color: {ROSE}" if val > 0 else "")
+                return f"color: {TEAL}" if val < 0 else (f"color: {GOLD}" if val > 0 else "")
 
         def _style_effects(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             styled = df.style.format({
@@ -1532,7 +1699,7 @@ with tab_effects:
 
         st.dataframe(
             _style_effects(eff_df),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -1575,7 +1742,7 @@ with tab_effects:
                     if d is not None:
                         labels.append(pd_item["label"])
                         values.append(d)
-                        colors.append(TEAL if d >= 0 else ROSE)
+                        colors.append(TEAL if d >= 0 else GOLD)
 
                 if not values:
                     st.caption(f"{var_label}: no data")
@@ -1611,7 +1778,7 @@ with tab_effects:
                 )
                 st.plotly_chart(
                     apply_theme(fig_bar, height=max(180, 60 * len(values))),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
     st.markdown(
@@ -1832,7 +1999,7 @@ with tab4:
         yaxis_title="Exceedance probability",
         yaxis_range=[0, 1.05],
     )
-    st.plotly_chart(apply_theme(fig_exc, height=350), use_container_width=True)
+    st.plotly_chart(apply_theme(fig_exc, height=350), width="stretch")
 
     # --- Comparison table ---
     table_rows = []
@@ -1871,7 +2038,7 @@ with tab4:
 
     if table_rows:
         tbl_df = pd.DataFrame(table_rows)
-        st.dataframe(tbl_df, use_container_width=True, hide_index=True)
+        st.dataframe(tbl_df, width="stretch", hide_index=True)
 
     st.markdown(
         "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
@@ -1939,6 +2106,6 @@ with tab4:
             yaxis_title="Posterior probability",
             yaxis_range=[0, 1],
         )
-        st.plotly_chart(apply_theme(fig_area, height=350), use_container_width=True)
+        st.plotly_chart(apply_theme(fig_area, height=350), width="stretch")
     else:
         st.caption("No query data available for this question in the selected run.")

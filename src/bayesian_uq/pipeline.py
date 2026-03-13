@@ -435,6 +435,7 @@ def run_experiment(
     probe_client = OllamaClient(
         model=config.model,
         think=config.think,
+        prompt_mode=config.prompt_mode,
         temperature=config.temperature,
     )
     if not probe_client.check_connection():
@@ -451,7 +452,7 @@ def run_experiment(
 
     workers = config.parallel_workers
     print(f"Starting experiment: {config.run_name}")
-    print(f"  Model: {config.model} | Think: {config.think} | Shuffle: {config.shuffle_choices} | Paraphrases: {config.use_paraphrases}")
+    print(f"  Model: {config.model} | Think: {config.think} | Prompt: {config.prompt_mode} | Shuffle: {config.shuffle_choices} | Paraphrases: {config.use_paraphrases}")
     print(f"  Questions: {len(questions)} | Max queries/question: {config.max_queries_per_question}")
     print(f"  Confidence threshold: {config.confidence_threshold} | Workers: {workers}")
     print(f"  Writing results to: {output_file}")
@@ -471,6 +472,7 @@ def run_experiment(
         client = OllamaClient(
             model=config.model,
             think=config.think,
+            prompt_mode=config.prompt_mode,
             temperature=config.temperature,
         )
 

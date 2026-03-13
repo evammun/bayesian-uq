@@ -40,6 +40,7 @@ class OllamaClient:
         model: str,
         base_url: str = DEFAULT_OLLAMA_URL,
         think: bool = False,
+        prompt_mode: str = "direct",
         temperature: float = 0.7,
         timeout: int = 120,
     ):
@@ -48,6 +49,10 @@ class OllamaClient:
             model: Ollama model name (e.g. "qwen3:8b-q4_K_M").
             base_url: Ollama server URL (default http://localhost:11434).
             think: Whether to enable the model's thinking/reasoning mode.
+            prompt_mode: One of "direct", "cot", "cot_structured".
+                "direct" — answer only (current baseline).
+                "cot" — reasoning field before answer in JSON schema.
+                "cot_structured" — per-option evaluation fields before answer.
             temperature: Sampling temperature (ignored when think=True).
             timeout: HTTP request timeout in seconds.
         """
@@ -55,6 +60,7 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
         self.chat_url = f"{self.base_url}/api/chat"
         self.think = think
+        self.prompt_mode = prompt_mode
         self.temperature = temperature
         self.timeout = timeout
         # Fewer retries in think mode — if a question triggers a runaway
@@ -66,7 +72,14 @@ class OllamaClient:
         # so it can't catch a model that thinks forever.
         # Think mode needs much more time — the model can reason for
         # minutes on harder questions. 300s (5 min) vs 90s for nothink.
-        self.max_stream_time = 300 if think else 90
+        # CoT modes also generate more tokens (reasoning text), so give
+        # them more time too.
+        if think:
+            self.max_stream_time = 300
+        elif prompt_mode in ("cot", "cot_structured"):
+            self.max_stream_time = 180
+        else:
+            self.max_stream_time = 90
 
     def check_connection(self) -> bool:
         """Check that Ollama is reachable."""
@@ -123,39 +136,76 @@ class OllamaClient:
             letter = ANSWER_LETTERS[display_pos]
             display_choices[letter] = choices[canonical_idx]
 
-        # Format the prompt
+        # Format the prompt — choice lines are shared across all modes
         choice_lines = "\n".join(
             f"  {letter}) {text}" for letter, text in display_choices.items()
         )
-        user_message = (
-            f"{question_text}\n\n"
-            f"{choice_lines}\n\n"
-            "Respond with the letter of the correct answer."
-        )
 
-        # JSON schema constraining the model to return exactly one answer letter
-        response_schema = {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "string",
-                    "enum": ANSWER_LETTERS[:num_choices],
-                }
-            },
-            "required": ["answer"],
-        }
+        # Build the user message and JSON schema based on prompt_mode.
+        # The order of fields in the schema matters for autoregressive models:
+        # reasoning/evaluation fields MUST come before the answer field so
+        # the model generates its thinking before committing to an answer.
+        answer_enum = ANSWER_LETTERS[:num_choices]
 
+        if self.prompt_mode == "cot":
+            # CoT: free-form reasoning field before answer
+            user_message = (
+                f"{question_text}\n\n"
+                f"{choice_lines}\n\n"
+                "Consider each option, then give your answer."
+            )
+            response_schema = {
+                "type": "object",
+                "properties": {
+                    "reasoning": {"type": "string"},
+                    "answer": {"type": "string", "enum": answer_enum},
+                },
+                "required": ["reasoning", "answer"],
+            }
+
+        elif self.prompt_mode == "cot_structured":
+            # Structured CoT: per-option evaluation fields before answer.
+            # Fields use display letters (A/B/C/D) — these correspond to
+            # the shuffled positions, not canonical indices.
+            user_message = (
+                f"{question_text}\n\n"
+                f"{choice_lines}\n\n"
+                "Evaluate each option, then give your answer."
+            )
+            option_props = {
+                f"option_{letter.lower()}": {"type": "string"}
+                for letter in answer_enum
+            }
+            option_keys = list(option_props.keys())
+            response_schema = {
+                "type": "object",
+                "properties": {
+                    **option_props,
+                    "answer": {"type": "string", "enum": answer_enum},
+                },
+                "required": option_keys + ["answer"],
+            }
+
+        else:
+            # Direct mode: answer only (baseline)
+            user_message = (
+                f"{question_text}\n\n"
+                f"{choice_lines}\n\n"
+                "Respond with the letter of the correct answer."
+            )
+            response_schema = {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "enum": answer_enum},
+                },
+                "required": ["answer"],
+            }
+
+        # No system message — follows the standard MMLU evaluation protocol
+        # (EleutherAI lm-eval-harness uses no system prompt)
         payload = {
             "model": self.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant answering multiple-choice "
-                        "questions. Return ONLY the letter of the correct answer "
-                        "in the required JSON format."
-                    ),
-                },
                 {"role": "user", "content": user_message},
             ],
             "format": response_schema,
@@ -163,9 +213,15 @@ class OllamaClient:
             "stream": True,  # Stream to avoid timeout on long think chains
         }
 
-        # Only set temperature when not in thinking mode
-        # (Ollama may override temperature when think=True)
-        if not self.think:
+        # Set model options: context window and temperature.
+        # Think mode and CoT modes generate substantial text before the
+        # answer, so they need a larger context window. Default Ollama
+        # num_ctx is 2048, which is too small for these modes.
+        # Direct nothink mode only outputs a few tokens, so 2048 is fine.
+        needs_large_ctx = self.think or self.prompt_mode in ("cot", "cot_structured")
+        if needs_large_ctx:
+            payload["options"] = {"num_ctx": 8192}
+        else:
             payload["options"] = {"temperature": self.temperature}
 
         # Retry loop handles network errors and empty/unparseable responses
