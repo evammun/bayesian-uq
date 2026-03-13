@@ -63,6 +63,7 @@ class OllamaClient:
         self.prompt_mode = prompt_mode
         self.temperature = temperature
         self.timeout = timeout
+        self._logged_first_query = False
         # Fewer retries in think mode — if a question triggers a runaway
         # think chain once, retrying identical input will likely do the same
         self.max_retries = 3 if think else 5
@@ -213,16 +214,18 @@ class OllamaClient:
             "stream": True,  # Stream to avoid timeout on long think chains
         }
 
-        # Set model options: context window and temperature.
-        # Think mode and CoT modes generate substantial text before the
-        # answer, so they need a larger context window. Default Ollama
-        # num_ctx is 2048, which is too small for these modes.
-        # Direct nothink mode only outputs a few tokens, so 2048 is fine.
-        needs_large_ctx = self.think or self.prompt_mode in ("cot", "cot_structured")
-        if needs_large_ctx:
-            payload["options"] = {"num_ctx": 8192}
-        else:
-            payload["options"] = {"temperature": self.temperature}
+        # Set model options: temperature always set; think and CoT modes
+        # additionally get a larger context window for reasoning traces.
+        options = {"temperature": self.temperature}
+        if self.think or self.prompt_mode in ("cot", "cot_structured"):
+            options["num_ctx"] = 8192
+        payload["options"] = options
+
+        # Log schema fields once per experiment to confirm correct setup
+        if not self._logged_first_query:
+            schema_keys = list(response_schema.get("properties", {}).keys())
+            print(f"\n  [INFO] Prompt mode: {self.prompt_mode} | Schema fields: {schema_keys}", flush=True)
+            self._logged_first_query = True
 
         # Retry loop handles network errors and empty/unparseable responses
         last_error: Exception | None = None
@@ -292,6 +295,11 @@ class OllamaClient:
             try:
                 parsed = json.loads(raw_content)
                 display_letter = parsed["answer"]
+                # Warn if CoT schema enforcement silently failed
+                if self.prompt_mode == "cot" and "reasoning" not in parsed:
+                    print(f"\n    [WARN] CoT mode but no 'reasoning' field in response", end="", flush=True)
+                elif self.prompt_mode == "cot_structured" and "option_a" not in parsed:
+                    print(f"\n    [WARN] CoT-structured mode but no 'option_a' field in response", end="", flush=True)
             except (json.JSONDecodeError, KeyError):
                 # Fallback: look for a single letter A-D in the raw text
                 for letter in ANSWER_LETTERS[:num_choices]:

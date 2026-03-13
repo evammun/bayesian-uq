@@ -113,6 +113,7 @@ class QueryResult(BaseModel):
     """
 
     query_number: int
+    query_text: str = ""  # the exact question text sent to the model
     paraphrase_index: int = Field(
         description="Index into the paraphrase list, or -1 for the original question",
     )

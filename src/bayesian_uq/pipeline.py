@@ -337,6 +337,7 @@ def run_single_question(
         # Record everything about this query
         query_log.append(QueryResult(
             query_number=query_num,
+            query_text=query_texts[query_num],
             paraphrase_index=paraphrase_indices[query_num],
             answer_permutation=permutation,
             raw_model_response=raw_response,
@@ -455,6 +456,17 @@ def run_experiment(
     print(f"  Model: {config.model} | Think: {config.think} | Prompt: {config.prompt_mode} | Shuffle: {config.shuffle_choices} | Paraphrases: {config.use_paraphrases}")
     print(f"  Questions: {len(questions)} | Max queries/question: {config.max_queries_per_question}")
     print(f"  Confidence threshold: {config.confidence_threshold} | Workers: {workers}")
+    if config.use_paraphrases:
+        questions_with_paras = sum(1 for q in questions if q.question_id in paraphrases)
+        print(f"  Paraphrases loaded for {questions_with_paras}/{len(questions)} questions")
+        if questions:
+            first_q = questions[0]
+            first_paras = paraphrases.get(first_q.question_id, [])
+            pool_size = len(first_paras) + 1
+            print(f"  Paraphrase pool per question: ~{pool_size} unique texts (original + paraphrases)")
+            print(f"  With max_queries={config.max_queries_per_question}, each text used ~{config.max_queries_per_question // pool_size} times")
+    else:
+        print(f"  Paraphrases: disabled")
     print(f"  Writing results to: {output_file}")
     print()
 
@@ -503,9 +515,13 @@ def run_experiment(
         correct_str = ""
         if result.correct is not None:
             correct_str = f" | {'CORRECT' if result.correct else 'WRONG'}"
-        para_note = ""
-        if not paraphrases.get(question.question_id):
-            para_note = "[no paraphrases] "
+        q_paras = paraphrases.get(question.question_id, [])
+        if config.use_paraphrases and q_paras:
+            para_note = f"[{len(q_paras)} paraphrases] "
+        elif config.use_paraphrases and not q_paras:
+            para_note = "[no paraphrases, using original] "
+        else:
+            para_note = "[no paraphrases, using original] "
 
         # Thread-safe progress print
         with print_lock:
