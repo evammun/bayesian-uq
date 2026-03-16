@@ -1,9 +1,0 @@
-run_name: "pilot_think"
-model: "qwen3:8b-q4_K_M"
-think: true
-question_set: "pilot"
-confidence_threshold: 0.95
-max_queries_per_question: 6
-monte_carlo_samples: 10000
-temperature: 0.7
-parallel_workers: 4

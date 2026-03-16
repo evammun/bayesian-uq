@@ -1,0 +1,14 @@
+# Experiment 1 100q: Direct prompt, with shuffle, with paraphrases
+run_name: "exp1_100q_direct_shuffle_para"
+
+model: "qwen3:8b-q4_K_M"
+question_set: "mmlu_standard"
+max_questions: 100
+seed: 2024
+temperature: 0.7
+num_paraphrases: 10
+
+think: false
+prompt_mode: "direct"
+shuffle_choices: true
+use_paraphrases: true

@@ -1,14 +1,23 @@
 """
-Ollama client wrapper for querying local LLMs with structured output.
+Ollama client wrapper for querying local LLMs with logprob extraction.
+
+v2 changes from v1:
+  - No JSON schema enforcement (format parameter removed)
+  - Uses /api/generate with raw: True for direct mode (completion-style)
+  - Uses /api/chat for CoT modes (needs chat template for reasoning)
+  - Extracts answer probability distribution from logprobs
+  - top_logprobs: 20 to maximise chance of capturing all four answer letters
+  - Streaming for CoT modes to avoid timeouts on long reasoning
 
 Handles:
-  - Sending multiple-choice questions to Ollama's chat API
-  - Enforcing structured JSON output (answer must be one of A/B/C/D)
+  - Sending multiple-choice questions to Ollama's API
+  - Extracting raw logprobs for answer letters (A/B/C/D) from the response
   - Randomising answer order to control for position bias
-  - Mapping responses back to canonical answer indices
+  - Mapping logprobs back to canonical answer indices (without normalisation)
 """
 
 import json
+import math
 import random
 import time
 
@@ -16,19 +25,32 @@ import requests
 
 from .config import ANSWER_LETTERS, NUM_CHOICES
 
+
 # Default Ollama endpoint (local)
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
+# Answer tokens may have a leading space in the generate endpoint's tokenisation.
+# We match both "A" and " A" (and similarly for B, C, D).
+ANSWER_TOKENS = set(ANSWER_LETTERS) | {f" {l}" for l in ANSWER_LETTERS}
+
+
+def _token_to_letter(token: str) -> str | None:
+    """Map a token like 'B' or ' B' to the canonical letter 'B'. Returns None if not a match."""
+    stripped = token.strip()
+    if stripped in ANSWER_LETTERS:
+        return stripped
+    return None
+
 
 class OllamaClient:
-    """Client for querying models via the Ollama API with structured output.
+    """Client for querying models via the Ollama API with logprob extraction.
 
     Usage:
         client = OllamaClient(model="qwen3:8b-q4_K_M")
         if not client.check_connection():
             raise ConnectionError("Ollama not reachable")
 
-        raw_json, canonical_idx = client.send_query(
+        response, logprobs, thinking = client.send_query(
             question_text="What is 2+2?",
             choices=["3", "4", "5", "6"],
             answer_permutation=[2, 0, 3, 1],
@@ -50,37 +72,28 @@ class OllamaClient:
             base_url: Ollama server URL (default http://localhost:11434).
             think: Whether to enable the model's thinking/reasoning mode.
             prompt_mode: One of "direct", "cot", "cot_structured".
-                "direct" — answer only (current baseline).
-                "cot" — reasoning field before answer in JSON schema.
-                "cot_structured" — per-option evaluation fields before answer.
-            temperature: Sampling temperature (ignored when think=True).
-            timeout: HTTP request timeout in seconds.
+            temperature: Sampling temperature.
+            timeout: HTTP request timeout in seconds (per-chunk for streaming).
         """
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self.generate_url = f"{self.base_url}/api/generate"
         self.chat_url = f"{self.base_url}/api/chat"
         self.think = think
         self.prompt_mode = prompt_mode
         self.temperature = temperature
         self.timeout = timeout
         self._logged_first_query = False
-        # Fewer retries in think mode — if a question triggers a runaway
-        # think chain once, retrying identical input will likely do the same
-        self.max_retries = 3 if think else 5
-        # Total wall-clock limit per generation attempt — catches runaway
-        # think chains that keep producing tokens but never finish.
-        # Per-chunk timeout (self.timeout) only fires when NO data flows,
-        # so it can't catch a model that thinks forever.
-        # Think mode needs much more time — the model can reason for
-        # minutes on harder questions. 300s (5 min) vs 90s for nothink.
-        # CoT modes also generate more tokens (reasoning text), so give
-        # them more time too.
+        self._query_count = 0  # tracks total queries for diagnostic logging
+        # Fewer retries in think mode — runaway think chains will likely repeat
+        self.max_retries = 3
+        # Total wall-clock limit per generation attempt
         if think:
             self.max_stream_time = 300
         elif prompt_mode in ("cot", "cot_structured"):
             self.max_stream_time = 180
         else:
-            self.max_stream_time = 90
+            self.max_stream_time = 30
 
     def check_connection(self) -> bool:
         """Check that Ollama is reachable."""
@@ -96,24 +109,16 @@ class OllamaClient:
         question_text: str,
         choices: list[str],
         answer_permutation: list[int],
-    ) -> tuple[str, int, str]:
+    ) -> tuple[str, list[dict], str]:
         """
-        Send a multiple-choice question to the model with shuffled answer order.
+        Send a multiple-choice question to the model and extract logprobs.
 
-        Uses streaming so the connection stays alive during long think-mode
-        generations. The timeout applies per-chunk (not total), so even a
-        10-minute reasoning chain won't timeout as long as tokens keep flowing.
+        For direct mode: uses /api/generate with raw=True (completion-style,
+        no chat template) and num_predict=1. The prompt ends with "Answer:"
+        and the model completes with a single letter token.
 
-        The answer_permutation controls which canonical choice appears in each
-        display slot. For example, permutation [2, 0, 3, 1] means:
-          - Display slot A shows canonical choice 2
-          - Display slot B shows canonical choice 0
-          - Display slot C shows canonical choice 3
-          - Display slot D shows canonical choice 1
-
-        The model sees the shuffled version and picks a letter (A/B/C/D).
-        We then map that letter back through the permutation to get the
-        canonical answer index.
+        For CoT modes: uses /api/chat so the chat template is applied. The
+        model reasons freely and we find the answer token in the output.
 
         Args:
             question_text: The question stem (original or paraphrased).
@@ -121,9 +126,10 @@ class OllamaClient:
             answer_permutation: Mapping from display position to canonical index.
 
         Returns:
-            Tuple of (raw_response_json_string, canonical_answer_index,
-            thinking_trace). The thinking_trace is the model's reasoning
-            tokens (empty string when think=False).
+            Tuple of (raw_response_text, logprobs_list, thinking_trace).
+            - raw_response_text: the full text the model generated
+            - logprobs_list: the complete logprobs array from Ollama (all token positions)
+            - thinking_trace: the model's reasoning tokens (empty for direct mode)
 
         Raises:
             requests.RequestException: If the Ollama API call fails after retries.
@@ -137,113 +143,72 @@ class OllamaClient:
             letter = ANSWER_LETTERS[display_pos]
             display_choices[letter] = choices[canonical_idx]
 
-        # Format the prompt — choice lines are shared across all modes
+        # Format the choice lines (shared across all modes)
         choice_lines = "\n".join(
             f"  {letter}) {text}" for letter, text in display_choices.items()
         )
 
-        # Build the user message and JSON schema based on prompt_mode.
-        # The order of fields in the schema matters for autoregressive models:
-        # reasoning/evaluation fields MUST come before the answer field so
-        # the model generates its thinking before committing to an answer.
-        answer_enum = ANSWER_LETTERS[:num_choices]
-
-        if self.prompt_mode == "cot":
-            # CoT: free-form reasoning field before answer
+        # Build the prompt/message based on prompt_mode
+        if self.prompt_mode == "direct":
+            # Direct mode: completion-style via /api/generate with raw=True.
+            # Prompt ends with "Answer:" — model completes with " B" etc.
+            prompt_text = (
+                f"{question_text}\n\n"
+                f"{choice_lines}\n\n"
+                "Answer:"
+            )
+            payload = {
+                "model": self.model,
+                "prompt": prompt_text,
+                "raw": True,  # skip chat template — pure text completion
+                "stream": False,  # single token, no need to stream
+                "logprobs": True,
+                "top_logprobs": 20,
+                "options": {
+                    "temperature": self.temperature,
+                    "num_predict": 1,
+                },
+            }
+        elif self.prompt_mode == "cot":
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Consider each option, then give your answer."
+                "Consider each option, then state your answer as a single letter."
             )
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    "reasoning": {"type": "string"},
-                    "answer": {"type": "string", "enum": answer_enum},
-                },
-                "required": ["reasoning", "answer"],
-            }
-
+            payload = self._build_chat_payload(user_message)
         elif self.prompt_mode == "cot_structured":
-            # Structured CoT: per-option evaluation fields before answer.
-            # Fields use display letters (A/B/C/D) — these correspond to
-            # the shuffled positions, not canonical indices.
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Evaluate each option, then give your answer."
+                "Briefly evaluate each option, then state your final answer "
+                "as a single letter (A, B, C, or D)."
             )
-            option_props = {
-                f"option_{letter.lower()}": {"type": "string"}
-                for letter in answer_enum
-            }
-            option_keys = list(option_props.keys())
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    **option_props,
-                    "answer": {"type": "string", "enum": answer_enum},
-                },
-                "required": option_keys + ["answer"],
-            }
-
+            payload = self._build_chat_payload(user_message)
         else:
-            # Direct mode: answer only (baseline)
-            user_message = (
-                f"{question_text}\n\n"
-                f"{choice_lines}\n\n"
-                "Respond with the letter of the correct answer."
-            )
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    "answer": {"type": "string", "enum": answer_enum},
-                },
-                "required": ["answer"],
-            }
+            raise ValueError(f"Unknown prompt_mode: {self.prompt_mode}")
 
-        # No system message — follows the standard MMLU evaluation protocol
-        # (EleutherAI lm-eval-harness uses no system prompt)
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "user", "content": user_message},
-            ],
-            "format": response_schema,
-            "think": self.think,
-            "stream": True,  # Stream to avoid timeout on long think chains
-        }
-
-        # Set model options: temperature always set; think and CoT modes
-        # additionally get a larger context window for reasoning traces.
-        options = {"temperature": self.temperature}
-        if self.think or self.prompt_mode in ("cot", "cot_structured"):
-            options["num_ctx"] = 8192
-        payload["options"] = options
-
-        # Log schema fields once per experiment to confirm correct setup
+        # Log prompt setup once per experiment
         if not self._logged_first_query:
-            schema_keys = list(response_schema.get("properties", {}).keys())
-            print(f"\n  [INFO] Prompt mode: {self.prompt_mode} | Schema fields: {schema_keys}", flush=True)
+            api = "generate (raw)" if self.prompt_mode == "direct" else "chat"
+            num_pred = payload.get("options", {}).get("num_predict", "default")
+            print(
+                f"\n  [INFO] Prompt mode: {self.prompt_mode} | API: {api} | "
+                f"num_predict: {num_pred} | top_logprobs: 20 | think: {self.think}",
+                flush=True,
+            )
             self._logged_first_query = True
 
-        # Retry loop handles network errors and empty/unparseable responses
+        # Retry loop for network errors and empty responses
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
-            # --- Step 1: Open the streaming connection ---
             try:
-                resp = requests.post(
-                    self.chat_url,
-                    json=payload,
-                    # (connect_timeout, read_timeout_per_chunk)
-                    # read timeout is per-chunk, not total — so long generations
-                    # won't timeout as long as tokens keep flowing
-                    timeout=(30, self.timeout),
-                    stream=True,
-                )
-                resp.raise_for_status()
+                if self.prompt_mode == "direct":
+                    raw_content, raw_thinking, all_logprobs = self._send_generate(payload)
+                else:
+                    raw_content, raw_thinking, all_logprobs = self._stream_chat(payload)
             except (requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError) as e:
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError) as e:
                 last_error = e
                 wait = 10 * (attempt + 1)
                 print(
@@ -254,89 +219,267 @@ class OllamaClient:
                 time.sleep(wait)
                 continue
 
-            # --- Step 2: Accumulate streamed chunks ---
-            raw_content = ""
-            raw_thinking = ""
-            stream_start = time.monotonic()
-            try:
-                for line in resp.iter_lines(decode_unicode=True):
-                    # Total elapsed check — kills runaway think chains
-                    elapsed = time.monotonic() - stream_start
-                    if elapsed > self.max_stream_time:
-                        raise requests.exceptions.ReadTimeout(
-                            f"Total stream time exceeded "
-                            f"{self.max_stream_time}s"
-                        )
-                    if not line:
-                        continue
-                    chunk = json.loads(line)
-                    # Accumulate answer content and thinking tokens separately
-                    raw_content += chunk.get("message", {}).get("content", "")
-                    raw_thinking += chunk.get("message", {}).get("thinking", "")
-                    if chunk.get("done", False):
-                        break
-            except (requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError,
-                    requests.exceptions.ChunkedEncodingError) as e:
-                last_error = e
-                wait = 10 * (attempt + 1)
-                print(
-                    f"\n    [retry {attempt + 1}/{self.max_retries}] "
-                    f"stream interrupted, waiting {wait}s...",
-                    end="", flush=True,
-                )
-                time.sleep(wait)
-                continue
-            finally:
-                resp.close()
+            if raw_content.strip() or all_logprobs:
+                self._query_count += 1
+                # Diagnostic logging for first 3 queries only
+                if self._query_count <= 3 and all_logprobs:
+                    self._log_first_token_diagnostics(all_logprobs)
+                return raw_content, all_logprobs, raw_thinking
 
-            # --- Step 3: Parse the answer ---
-            display_letter = None
-            try:
-                parsed = json.loads(raw_content)
-                display_letter = parsed["answer"]
-                # Warn if CoT schema enforcement silently failed
-                if self.prompt_mode == "cot" and "reasoning" not in parsed:
-                    print(f"\n    [WARN] CoT mode but no 'reasoning' field in response", end="", flush=True)
-                elif self.prompt_mode == "cot_structured" and "option_a" not in parsed:
-                    print(f"\n    [WARN] CoT-structured mode but no 'option_a' field in response", end="", flush=True)
-            except (json.JSONDecodeError, KeyError):
-                # Fallback: look for a single letter A-D in the raw text
-                for letter in ANSWER_LETTERS[:num_choices]:
-                    if letter in raw_content:
-                        display_letter = letter
-                        break
-
-            if display_letter is not None:
-                break  # Success — got a valid answer
-
-            # Empty or unparseable response — retry
-            last_error = ValueError(
-                f"Could not parse model response: {raw_content!r}"
-            )
-            # Debug: show what the model actually returned so we can
-            # diagnose whether it's malformed JSON, empty, or leaked
-            # thinking tokens in the content field
-            print(
-                f"\n    [debug] raw_content: {raw_content[:200]!r}",
-                end="", flush=True,
-            )
+            # Empty response — retry
+            last_error = ValueError("Empty response from model")
             wait = 5 * (attempt + 1)
             print(
                 f"\n    [retry {attempt + 1}/{self.max_retries}] "
-                f"empty/bad response, waiting {wait}s...",
+                f"empty response, waiting {wait}s...",
                 end="", flush=True,
             )
             time.sleep(wait)
-        else:
-            # All retries exhausted
-            raise last_error  # type: ignore[misc]
 
-        # Map the display letter back to a canonical answer index
-        display_pos = ANSWER_LETTERS.index(display_letter)
-        canonical_idx = answer_permutation[display_pos]
+        # All retries exhausted
+        raise last_error  # type: ignore[misc]
 
-        return raw_content, canonical_idx, raw_thinking
+    def _build_chat_payload(self, user_message: str) -> dict:
+        """Build a /api/chat payload for CoT modes."""
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": user_message},
+            ],
+            "think": self.think,
+            "stream": True,
+            "logprobs": True,
+            "top_logprobs": 20,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": 500,
+                "num_ctx": 8192,
+            },
+        }
+
+    def _send_generate(self, payload: dict) -> tuple[str, str, list[dict]]:
+        """Send a non-streaming /api/generate request and extract logprobs.
+
+        For direct mode: single token, non-streaming. The logprobs are
+        returned as a top-level field in the response JSON.
+
+        Returns:
+            Tuple of (content_text, thinking_text, logprobs_list).
+        """
+        resp = requests.post(
+            self.generate_url,
+            json=payload,
+            timeout=(30, self.timeout),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        raw_content = data.get("response", "")
+        # /api/generate doesn't have a separate thinking field
+        raw_thinking = ""
+        # logprobs is a top-level list in the generate response
+        all_logprobs = data.get("logprobs", [])
+
+        return raw_content, raw_thinking, all_logprobs
+
+    def _stream_chat(self, payload: dict) -> tuple[str, str, list[dict]]:
+        """Open a streaming /api/chat connection and accumulate content, thinking, and logprobs.
+
+        For CoT modes: streaming to avoid timeouts on long reasoning.
+        logprobs and top_logprobs are top-level params in the payload.
+
+        Returns:
+            Tuple of (content_text, thinking_text, logprobs_list).
+        """
+        resp = requests.post(
+            self.chat_url,
+            json=payload,
+            timeout=(30, self.timeout),
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        raw_content = ""
+        raw_thinking = ""
+        all_logprobs: list[dict] = []
+        stream_start = time.monotonic()
+
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                # Total elapsed check — kills runaway generations
+                elapsed = time.monotonic() - stream_start
+                if elapsed > self.max_stream_time:
+                    raise requests.exceptions.ReadTimeout(
+                        f"Total stream time exceeded {self.max_stream_time}s"
+                    )
+                if not line:
+                    continue
+
+                chunk = json.loads(line)
+                msg = chunk.get("message", {})
+
+                # Accumulate content and thinking tokens separately
+                content_token = msg.get("content", "")
+                raw_content += content_token
+                raw_thinking += msg.get("thinking", "")
+
+                # Collect logprobs for content tokens.
+                # In the chat streaming API, logprobs may be in the chunk
+                # at the top level or inside the message.
+                if content_token:
+                    if "logprobs" in chunk:
+                        all_logprobs.append(chunk["logprobs"])
+                    elif "logprobs" in msg:
+                        all_logprobs.append(msg["logprobs"])
+
+                if chunk.get("done", False):
+                    break
+        finally:
+            resp.close()
+
+        return raw_content, raw_thinking, all_logprobs
+
+    def _log_first_token_diagnostics(self, all_logprobs: list[dict]) -> None:
+        """Log the first content token and its top 5 logprobs for debugging.
+
+        Called for the first ~33 queries (first 3 questions) so we can
+        verify what the model is actually outputting.
+        """
+        if not all_logprobs:
+            return
+        top = _get_top_logprobs(all_logprobs[0])
+        if not top:
+            print(f"\n      [DIAG] No top_logprobs in first token", flush=True)
+            return
+        first_token = top[0].get("token", "?")
+        top5 = top[:5]
+        top5_str = " | ".join(
+            f"{e.get('token', '?')!r}: {e.get('logprob', 0):.3f}"
+            for e in top5
+        )
+        is_answer = _token_to_letter(first_token) is not None
+        marker = "" if is_answer else " [NOT A/B/C/D]"
+        print(
+            f"\n      [DIAG] First token: {first_token!r}{marker} | "
+            f"Top 5: [{top5_str}]",
+            flush=True,
+        )
+
+
+def extract_answer_logprobs(
+    all_logprobs: list[dict],
+    answer_permutation: list[int],
+    prompt_mode: str = "direct",
+) -> tuple[dict[str, float], dict[int, float], str, int]:
+    """Extract per-letter logprobs from the Ollama logprobs data.
+
+    For direct mode: uses the first token position. Matches both "A" and " A"
+    style tokens (the generate endpoint may add a leading space).
+
+    For CoT modes: finds the LAST token that is exactly one of A/B/C/D
+    (single-character tokens only — "Based" doesn't count as "B").
+
+    Returns raw logprobs without normalisation. If a letter doesn't appear
+    in the top_logprobs for the selected token, it is simply absent from
+    the returned dict.
+
+    Args:
+        all_logprobs: Complete logprobs list from Ollama (one entry per token).
+        answer_permutation: Mapping from display position to canonical index.
+        prompt_mode: "direct", "cot", or "cot_structured".
+
+    Returns:
+        Tuple of:
+        - display_letter_logprobs: {"A": -0.12, "B": -3.21, ...} raw logprobs
+          (always keyed by canonical letter, not the raw token)
+        - canonical_logprobs: {0: -3.21, 1: -0.12, ...} mapped via permutation
+        - display_answer: the letter with the highest logprob (e.g. "B")
+        - canonical_answer: the canonical index of that letter
+    """
+    # Find the right token position to inspect
+    if prompt_mode == "direct":
+        # Direct mode: use the first content token position.
+        # Even if the top token isn't A/B/C/D, the answer letters may still
+        # appear in top_logprobs with meaningful probabilities.
+        if not all_logprobs:
+            raise ValueError("No logprobs data returned for direct mode query")
+        target_logprobs = all_logprobs[0]
+    else:
+        # CoT modes: find the LAST single-character A/B/C/D token
+        target_logprobs = _find_last_answer_token_logprobs(all_logprobs)
+        if target_logprobs is None:
+            raise ValueError(
+                "No standalone A/B/C/D token found in CoT response logprobs"
+            )
+
+    # Extract logprobs for each answer letter from the target token's top_logprobs.
+    # Tokens may be "A", " A", "B", " B" etc. — we normalise to just the letter.
+    display_letter_logprobs: dict[str, float] = {}
+    top_logprobs_list = _get_top_logprobs(target_logprobs)
+
+    for entry in top_logprobs_list:
+        token = entry.get("token", "")
+        logprob = entry.get("logprob", None)
+        letter = _token_to_letter(token)
+        if letter is not None and logprob is not None:
+            # If we see both "A" and " A", keep the one with the higher logprob
+            if letter not in display_letter_logprobs or logprob > display_letter_logprobs[letter]:
+                display_letter_logprobs[letter] = logprob
+
+    # Map display letters to canonical indices via the permutation
+    canonical_logprobs: dict[int, float] = {}
+    for display_pos, letter in enumerate(ANSWER_LETTERS):
+        if letter in display_letter_logprobs:
+            canonical_idx = answer_permutation[display_pos]
+            canonical_logprobs[canonical_idx] = display_letter_logprobs[letter]
+
+    # Determine the model's answer: the letter with the highest logprob
+    if display_letter_logprobs:
+        display_answer = max(display_letter_logprobs, key=display_letter_logprobs.get)  # type: ignore[arg-type]
+        display_pos = ANSWER_LETTERS.index(display_answer)
+        canonical_answer = answer_permutation[display_pos]
+    else:
+        raise ValueError(
+            f"No answer letters found in top_logprobs. "
+            f"Available tokens: {[e.get('token', '?') for e in top_logprobs_list]}"
+        )
+
+    return display_letter_logprobs, canonical_logprobs, display_answer, canonical_answer
+
+
+def _find_last_answer_token_logprobs(all_logprobs: list[dict]) -> dict | None:
+    """Find the logprobs entry for the last standalone A/B/C/D token in a CoT response.
+
+    Scans the logprobs list from the end, looking for a token position where
+    the top token (highest probability) is exactly one of A, B, C, D as a
+    single character (with or without leading space).
+
+    Returns the logprobs dict for that token position, or None if not found.
+    """
+    for entry in reversed(all_logprobs):
+        top_logprobs = _get_top_logprobs(entry)
+        if not top_logprobs:
+            continue
+        # Check the top token at this position
+        top_token = top_logprobs[0].get("token", "")
+        if _token_to_letter(top_token) is not None:
+            return entry
+    return None
+
+
+def _get_top_logprobs(logprobs_entry: dict) -> list[dict]:
+    """Extract the top_logprobs list from a logprobs entry.
+
+    Handles different possible Ollama response formats:
+    - {"top_logprobs": [...]}  (standard format)
+    - {"token": ..., "top_logprobs": [...]}  (generate endpoint)
+    - Direct list (if the entry itself is the list)
+    """
+    if isinstance(logprobs_entry, list):
+        return logprobs_entry
+    if "top_logprobs" in logprobs_entry:
+        return logprobs_entry["top_logprobs"]
+    return []
 
 
 def generate_permutation(

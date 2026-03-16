@@ -1,0 +1,14 @@
+{
+    "python.terminal.activateEnvironment": false,
+    "terminal.integrated.profiles.windows": {
+        "PowerShell": {
+            "source": "PowerShell",
+            "args": [
+                "-NoExit",
+                "-Command",
+                "& 'C:\\Users\\evama\\Dropbox\\Family Room\\Projects\\bayesian-uq\\.venv\\Scripts\\Activate.ps1'"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell"
+}

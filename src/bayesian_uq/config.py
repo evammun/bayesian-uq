@@ -1,5 +1,5 @@
 """
-Data models for the Bayesian UQ framework.
+Data models for the Bayesian UQ framework (v2 — logprob-based).
 
 All data structures used across the project are defined here using Pydantic
 models. This provides validation, JSON serialisation, and clear type contracts
@@ -9,6 +9,13 @@ Three layers:
   1. Data layer   — QuestionRecord, ParaphraseRecord (what we're evaluating)
   2. Config layer — ExperimentConfig (how we're evaluating it)
   3. Result layer — QueryResult, QuestionResult, ExperimentResult (what happened)
+
+v2 changes from v1:
+  - No more Dirichlet posterior, exceedance, or stopping criteria
+  - QueryResult stores raw logprobs from Ollama (no normalisation)
+  - QuestionResult stores raw answer counts (no computed metrics yet)
+  - ExperimentConfig drops confidence_threshold, max_queries_per_question,
+    monte_carlo_samples, parallel_workers; adds num_paraphrases
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ NUM_CHOICES = 4
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Question database and paraphrase bank
+# Data layer: Question database and paraphrase bank
 # ---------------------------------------------------------------------------
 
 class QuestionRecord(BaseModel):
@@ -73,7 +80,7 @@ class ParaphraseRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Experiment configuration
+# Config layer: Experiment configuration
 # ---------------------------------------------------------------------------
 
 class ExperimentConfig(BaseModel):
@@ -83,72 +90,103 @@ class ExperimentConfig(BaseModel):
     The question_set field determines which questions from the database
     to include: "broken_pairs", "mmlu_standard", "pilot", "all",
     or a comma-separated list of question_ids.
+
+    v2 simplification: every paraphrase is queried exactly once. No stopping
+    criteria, no Dirichlet, no Monte Carlo. The query budget is fixed at
+    num_paraphrases + 1 (original + paraphrases).
     """
 
     run_name: str
     model: str
     think: bool = False
     prompt_mode: Literal["direct", "cot", "cot_structured"] = "direct"
-    question_set: str
-    confidence_threshold: float = 0.95
-    max_queries_per_question: int = 12
-    max_questions: int | None = None  # if set, take a stratified sample of N questions across subjects
-    seed: int = 42                    # random seed for stratified sampling and experiment RNGs
-    shuffle_choices: bool = True      # if False, answer order stays A/B/C/D (no permutation)
-    use_paraphrases: bool = True      # if False, re-ask original question text every query
-    monte_carlo_samples: int = 10_000
+    question_set: str = "mmlu_standard"
+    max_questions: int | None = None
+    seed: int = 42
+    shuffle_choices: bool = True
+    use_paraphrases: bool = True
     temperature: float = 0.7
-    parallel_workers: int = 1  # concurrent question workers (1 = sequential)
+    num_paraphrases: int = 10  # max paraphrases to use per question
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Result recording (one per query, one per question, one per run)
+# Result layer: Raw data recording (one per query, one per question, one per run)
 # ---------------------------------------------------------------------------
 
 class QueryResult(BaseModel):
     """Record of a single model query within a question's evaluation.
 
-    Stores everything needed to replay the posterior evolution without
-    re-querying the model.
+    Stores both raw logprob data (audit trail) and normalised probabilities
+    (what analysis uses). The raw values are kept exactly as Ollama returns
+    them; the normalised values are derived from them in the pipeline.
     """
 
     query_number: int
-    query_text: str = ""  # the exact question text sent to the model
     paraphrase_index: int = Field(
         description="Index into the paraphrase list, or -1 for the original question",
     )
+    query_text: str  # the actual text sent to the model
     answer_permutation: list[int] = Field(
         description=(
             "Mapping from display position to canonical index. "
             "e.g. [2, 0, 3, 1] means display slot A shows canonical choice 2."
         ),
     )
-    raw_model_response: str  # the exact JSON string returned by the model
-    thinking_trace: str = ""  # model's reasoning tokens (empty when think=False)
-    canonical_answer: int = Field(
-        ge=0, lt=NUM_CHOICES,
-        description="Answer mapped back to canonical index (0-3)",
+    raw_response: str  # the full text the model output
+    raw_logprobs: list[dict]  # the ENTIRE logprobs array from Ollama, unmodified
+
+    # Per-letter raw data BEFORE any normalisation.
+    # Keys are display letters ("A", "B", "C", "D"), values are raw logprobs from Ollama.
+    # If a letter wasn't in top_logprobs, it's absent from the dict (NOT filled with a default).
+    display_letter_logprobs: dict[str, float]
+
+    # Same data mapped to canonical positions via answer_permutation.
+    # Keys are canonical indices (0, 1, 2, 3), values are raw logprobs.
+    canonical_logprobs: dict[int, float]
+
+    # Normalised probabilities in canonical order [P(0), P(1), P(2), P(3)].
+    # Derived from canonical_logprobs: exp(logprob) for each position,
+    # exp(-30) for missing positions, then normalised to sum to 1.0.
+    canonical_probs: list[float] = Field(
+        default_factory=list,
+        description="Normalised P(A), P(B), P(C), P(D) in canonical order, summing to ~1.0",
     )
-    alpha_after: list[float]      # Dirichlet pseudo-counts after this update
-    exceedance_after: float       # exceedance probability after this update
-    entropy_after: float          # posterior entropy after this update
+
+    # What the model actually picked (highest prob token among A/B/C/D)
+    display_answer: str  # the letter as displayed ("B")
+    canonical_answer: int  # mapped to canonical index
+
+    thinking_trace: str = ""
 
 
 class QuestionResult(BaseModel):
-    """Full result for one question across all its queries."""
+    """Full result for one question across all its queries.
+
+    Stores raw query logs plus lightweight aggregation (mean probabilities).
+    Full uncertainty decomposition (entropy, JSD, epistemic) is deferred
+    to analysis.py.
+    """
 
     question_id: str
     query_log: list[QueryResult]
-    final_answer: int = Field(
-        ge=0, lt=NUM_CHOICES,
-        description="Posterior mode — the answer with the highest pseudo-count",
-    )
-    final_alpha: list[float]
-    final_exceedance: float
-    final_entropy: float
-    queries_used: int
-    stopped_early: bool  # True if exceedance hit the threshold before budget ran out
+    num_queries: int
     correct: bool | None = None  # None for broken-premise questions
+
+    # Aggregated probabilities: element-wise mean of canonical_probs across all queries.
+    # mean_probs[i] = average probability assigned to canonical answer i.
+    mean_probs: list[float] = Field(
+        default_factory=list,
+        description="Mean of canonical_probs across all queries",
+    )
+
+    # Final answer = argmax(mean_probs). Better than majority vote because
+    # it accounts for confidence: a 60/40 query contributes less certainty
+    # than a 99/1 query.
+    final_answer: int
+
+    # Vote counts kept for quick reference (how many times each canonical
+    # answer was the argmax of an individual query's distribution)
+    answer_counts: dict[int, int]
 
 
 class ExperimentResult(BaseModel):

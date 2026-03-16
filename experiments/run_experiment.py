@@ -1,11 +1,11 @@
 """
-CLI entry point for running Bayesian UQ experiments.
+CLI entry point for running Bayesian UQ v2 experiments.
 
 Usage:
-    python experiments/run_experiment.py --config experiments/configs/pilot_nothink.yaml
+    python experiments/run_experiment.py --config experiments/configs/exp1_100q_direct_shuffle_para.yaml
 
 Loads the experiment config, question database, and paraphrase bank,
-then runs the Bayesian UQ pipeline and saves results to results/.
+then runs the logprob extraction pipeline and saves results to results/.
 """
 
 import argparse
@@ -29,11 +29,11 @@ from bayesian_uq.pipeline import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a Bayesian UQ experiment against a local Ollama model",
+        description="Run a Bayesian UQ v2 experiment against a local Ollama model",
     )
     parser.add_argument(
         "--config", type=Path, required=True,
-        help="Path to experiment config YAML (e.g. experiments/configs/pilot_nothink.yaml)",
+        help="Path to experiment config YAML (e.g. experiments/configs/exp1_100q_direct_shuffle_para.yaml)",
     )
     parser.add_argument(
         "--questions", type=Path, default=None,
@@ -70,7 +70,6 @@ def main() -> None:
     if config.max_questions is not None:
         total_filtered = len(filtered)
         filtered = stratified_sample(filtered, config.max_questions, seed=config.seed)
-        # Count subjects in the sample for the log message
         subjects_in_sample = len({q.subject for q in filtered})
         print(f"Loaded {len(questions)} questions total, "
               f"{total_filtered} match question_set='{config.question_set}'")
