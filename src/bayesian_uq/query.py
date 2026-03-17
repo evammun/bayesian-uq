@@ -187,8 +187,18 @@ class OllamaClient:
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Briefly evaluate each option, then state your final answer "
-                "as a single letter (A, B, C, or D)."
+                "Which option is correct? Use this format:\n\n"
+                "A) \u2713/\u2717 reason\n"
+                "B) \u2713/\u2717 reason\n"
+                "C) \u2713/\u2717 reason\n"
+                "D) \u2713/\u2717 reason\n\n"
+                "Answer: X\n\n"
+                "Example:\n"
+                "A) \u2717 confuses mass with weight\n"
+                "B) \u2713 matches Newton's second law\n"
+                "C) \u2717 ignores friction\n"
+                "D) \u2717 wrong units\n\n"
+                "Answer: B"
             )
             payload = self._build_chat_payload(user_message)
         else:

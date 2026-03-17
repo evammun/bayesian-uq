@@ -794,10 +794,10 @@ def _print_verbose_query(
 
     # For CoT modes, show first 200 chars of reasoning
     if prompt_mode in ("cot", "cot_structured"):
-        reasoning_preview = raw_response[:200].replace("\n", " ")
+        reasoning_preview = raw_response[:200].replace("\n", " ").encode("ascii", "replace").decode()
         print(f"      Reasoning: {reasoning_preview}...", flush=True)
     if thinking_trace:
-        think_preview = thinking_trace[:200].replace("\n", " ")
+        think_preview = thinking_trace[:200].replace("\n", " ").encode("ascii", "replace").decode()
         print(f"      Thinking: {think_preview}...", flush=True)
 
 
