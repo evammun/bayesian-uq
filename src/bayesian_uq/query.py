@@ -267,35 +267,60 @@ class OllamaClient:
                 done_reason == "stop"
                 and self.prompt_mode in ("cot", "cot_structured")
             ):
-                try:
-                    # Ollama includes the stop text in the output, so
-                    # raw_content ends with "\nAnswer: X". Strip that
-                    # trailing "Answer:..." line before Pass 2 so we
-                    # don't duplicate it in the final response.
-                    reasoning = raw_content
-                    last_nl = reasoning.rfind("\nAnswer:")
-                    if last_nl != -1:
-                        reasoning = reasoning[:last_nl]
+                # Ollama includes the stop text in the output, so
+                # raw_content ends with "\nAnswer: X". Strip that
+                # trailing "Answer:..." line before Pass 2 so we
+                # don't duplicate it in the final response.
+                reasoning = raw_content
+                last_nl = reasoning.rfind("\nAnswer:")
+                if last_nl != -1:
+                    reasoning = reasoning[:last_nl]
 
+                try:
                     answer_token, answer_logprobs = self._complete_answer_token(
                         question_text, choice_lines, reasoning,
                     )
+                except (requests.exceptions.RequestException, ValueError):
+                    answer_logprobs = []
+
+                # Check if Pass 2 logprobs contain any answer letters.
+                # Even if the top token is "\" or "$", the answer letters
+                # may still appear in top_logprobs with valid probabilities.
+                pass2_usable = False
+                if answer_logprobs:
+                    top = _get_top_logprobs(answer_logprobs[0])
+                    has_answer_letter = any(
+                        _token_to_letter(e.get("token", "")) is not None
+                        for e in top
+                    )
+                    if has_answer_letter:
+                        pass2_usable = True
+
+                if pass2_usable:
                     full_response = reasoning + "\nAnswer:" + answer_token
                     if self._query_count <= 3:
                         self._log_first_token_diagnostics(answer_logprobs)
                         print(
-                            f"      [two-pass] stop fired, Pass 2 logprobs extracted",
+                            f"      [two-pass] stop fired, Pass 2 logprobs OK",
                             flush=True,
                         )
                     return full_response, answer_logprobs, raw_thinking
-                except (requests.exceptions.RequestException, ValueError):
-                    # Pass 2 failed — fall back to single-pass extraction
+                else:
+                    # Pass 2 has no answer letters — fall back to Pass 1
+                    # stream logprobs (existing CoT extraction will find
+                    # the last A/B/C/D token in the reasoning)
                     if self._query_count <= 3:
+                        top_tok = "?"
+                        if answer_logprobs:
+                            t = _get_top_logprobs(answer_logprobs[0])
+                            if t:
+                                top_tok = t[0].get("token", "?")
                         print(
-                            f"      [two-pass] Pass 2 failed, falling back to "
-                            f"single-pass",
+                            f"      [two-pass] Pass 2 top token {top_tok!r} "
+                            f"has no answer letters, falling back to Pass 1",
                             flush=True,
                         )
+                    return raw_content, all_logprobs, raw_thinking
 
             # Single-pass: return streamed logprobs as-is (direct mode,
             # think mode, or CoT fallback when stop didn't fire)
@@ -540,19 +565,15 @@ def extract_answer_logprobs(
         answer_token_idx = 0
     else:
         # CoT modes: check if this is a two-pass result (single logprobs entry
-        # from /api/generate, where the top token is an answer letter). If so,
-        # use direct-mode extraction. Otherwise fall back to searching for the
-        # last answer token in the streamed logprobs.
+        # from /api/generate). If so, use direct-mode extraction (scan all
+        # top_logprobs for answer letters, even if the #1 token isn't one).
+        # Otherwise fall back to searching for the last answer token in the
+        # streamed logprobs from Pass 1.
         if len(all_logprobs) == 1:
-            top = _get_top_logprobs(all_logprobs[0])
-            if top and _token_to_letter(top[0].get("token", "")) is not None:
-                # Two-pass result — treat like direct mode
-                target_logprobs = all_logprobs[0]
-                answer_token_idx = 0
-            else:
-                raise ValueError(
-                    "Single logprobs entry but top token is not A/B/C/D"
-                )
+            # Two-pass result — treat like direct mode (the answer letters
+            # may not be the top token but should appear in top_logprobs)
+            target_logprobs = all_logprobs[0]
+            answer_token_idx = 0
         else:
             # Multi-entry: find the LAST single-character A/B/C/D token
             result = _find_last_answer_token_logprobs(all_logprobs)

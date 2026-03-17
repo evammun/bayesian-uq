@@ -493,8 +493,10 @@ def _run_queries_sequential(
             )
         except (ValueError, requests.exceptions.RequestException) as e:
             consecutive_failures += 1
-            if verbose:
-                print(f"\n    [SKIP] query {query_num}: {e}", end="", flush=True)
+            print(
+                f"\n    [QUERY_FAIL] {question.question_id} q{query_num}: {e}",
+                end="", flush=True,
+            )
             if consecutive_failures >= max_consecutive_failures:
                 if verbose:
                     print(
@@ -517,17 +519,16 @@ def _run_queries_sequential(
             )
         except ValueError as e:
             extraction_failures += 1
-            if verbose:
-                first_token = "?"
-                if all_logprobs:
-                    top = _peek_top_token(all_logprobs[0])
-                    if top:
-                        first_token = top
-                print(
-                    f"\n    [WARN] {question.question_id} query {query_num}: {e} "
-                    f"(first token: {first_token!r})",
-                    end="", flush=True,
-                )
+            first_token = "?"
+            if all_logprobs:
+                top = _peek_top_token(all_logprobs[0])
+                if top:
+                    first_token = top
+            print(
+                f"\n    [EXTRACT_FAIL] {question.question_id} q{query_num}: {e} "
+                f"(top_token={first_token!r}, n_logprobs={len(all_logprobs)})",
+                end="", flush=True,
+            )
             continue
 
         # Track missing letters
