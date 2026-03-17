@@ -268,10 +268,19 @@ class OllamaClient:
                 and self.prompt_mode in ("cot", "cot_structured")
             ):
                 try:
+                    # Ollama includes the stop text in the output, so
+                    # raw_content ends with "\nAnswer: X". Strip that
+                    # trailing "Answer:..." line before Pass 2 so we
+                    # don't duplicate it in the final response.
+                    reasoning = raw_content
+                    last_nl = reasoning.rfind("\nAnswer:")
+                    if last_nl != -1:
+                        reasoning = reasoning[:last_nl]
+
                     answer_token, answer_logprobs = self._complete_answer_token(
-                        question_text, choice_lines, raw_content,
+                        question_text, choice_lines, reasoning,
                     )
-                    full_response = raw_content + "\nAnswer:" + answer_token
+                    full_response = reasoning + "\nAnswer:" + answer_token
                     if self._query_count <= 3:
                         self._log_first_token_diagnostics(answer_logprobs)
                         print(
