@@ -348,8 +348,13 @@ def _process_single_query(
     # storage overhead (CoT responses have 100-300 token positions, but we
     # only need the one where the model states its answer).
     # Direct mode already stores just 1 entry (num_predict=1).
+    # The streaming chat endpoint may return raw lists instead of dicts
+    # with a "top_logprobs" key — wrap if needed for Pydantic validation.
     if config.prompt_mode != "direct":
-        all_logprobs = [all_logprobs[answer_idx]]
+        entry = all_logprobs[answer_idx]
+        if isinstance(entry, list):
+            entry = {"top_logprobs": entry}
+        all_logprobs = [entry]
 
     canonical_probs = _logprobs_to_canonical_probs(canonical_logprobs, num_choices)
 
@@ -542,10 +547,15 @@ def _run_queries_sequential(
         # For CoT modes, keep only the answer token's logprobs entry to reduce
         # storage overhead (CoT responses have 100-300 token positions, but we
         # only need the one where the model states its answer).
-        stored_logprobs = (
-            [all_logprobs[answer_idx]] if config.prompt_mode != "direct"
-            else all_logprobs
-        )
+        # The streaming chat endpoint may return raw lists instead of dicts
+        # with a "top_logprobs" key — wrap if needed for Pydantic validation.
+        if config.prompt_mode != "direct":
+            entry = all_logprobs[answer_idx]
+            if isinstance(entry, list):
+                entry = {"top_logprobs": entry}
+            stored_logprobs = [entry]
+        else:
+            stored_logprobs = all_logprobs
 
         canonical_probs = _logprobs_to_canonical_probs(canonical_logprobs, num_choices)
 
