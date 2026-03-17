@@ -1,0 +1,13 @@
+# Experiment 1 full: cot prompt, shuffle, para
+run_name: "exp1_full_cot_shuffle_para"
+
+model: "qwen3:8b-q4_K_M"
+question_set: "mmlu_standard"
+seed: 2024
+temperature: 0.7
+num_paraphrases: 10
+
+think: false
+prompt_mode: "cot"
+shuffle_choices: true
+use_paraphrases: true

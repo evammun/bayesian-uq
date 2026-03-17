@@ -51,6 +51,10 @@ def main() -> None:
         "--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--resume", type=Path, default=None,
+        help="Path to a partial results JSON file to resume from",
+    )
     args = parser.parse_args()
 
     # Resolve paths relative to project root
@@ -84,6 +88,27 @@ def main() -> None:
         print("ERROR: No questions matched the filter. Check your question_set value.")
         sys.exit(1)
 
+    # Load partial results if resuming
+    completed_ids: set[str] | None = None
+    carried_over_results = None
+    if args.resume:
+        import json
+        from bayesian_uq.config import QuestionResult
+
+        if not args.resume.exists():
+            print(f"ERROR: Resume file not found: {args.resume}")
+            sys.exit(1)
+
+        with open(args.resume, encoding="utf-8") as f:
+            partial_data = json.load(f)
+
+        raw_results = partial_data.get("question_results", [])
+        carried_over_results = [QuestionResult(**r) for r in raw_results]
+        completed_ids = {r.question_id for r in carried_over_results}
+        print(f"Resuming from {args.resume.name}: "
+              f"{len(carried_over_results)} completed questions loaded")
+        print()
+
     # Run the experiment (use config seed, CLI --seed overrides if provided)
     seed = args.seed if args.seed != 42 else config.seed
     run_experiment(
@@ -92,6 +117,8 @@ def main() -> None:
         paraphrases=paraphrases,
         output_dir=output_dir,
         seed=seed,
+        completed_ids=completed_ids,
+        carried_over_results=carried_over_results,
     )
 
 

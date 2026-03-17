@@ -7,4 +7,7 @@ __pycache__/
 .ipynb_checkpoints/
 *.lock
 .claude/
-Power settings.docx.vscode/
+.vscode/
+Power settings.docx
+results/
+results_test/

@@ -2,64 +2,118 @@
 
 ## Project Overview
 
-This is a research project developing a black-box Bayesian framework for uncertainty quantification (UQ) in LLM outputs. The framework combines paraphrase-based input diversification with sequential adaptive stopping using Dirichlet posterior updating. It is being developed as an academic paper and potential foundation for an AI consulting offering.
+This is a research project developing a framework for uncertainty quantification (UQ) in LLM outputs. The framework combines paraphrase-based input diversification with logprob extraction to build probability distributions over answer choices without requiring model internals beyond token logprobs. It is being developed as an academic paper and potential foundation for an AI consulting offering.
 
 **Authors:** Eva Martin (lead researcher) and Professor Luigi (supervisor, Bayesian inference and computational neuroscience background).
 
-## Core Concept
+## Architecture History
+
+**v1 (Dirichlet sampling)** — the original design treated the LLM as a black box returning categorical votes. Each query returned a single answer choice (via JSON schema enforcement), which incremented a Dirichlet posterior. Exceedance probability was computed via Monte Carlo (Gamma sampling trick) and used for adaptive stopping: stop early when confident, keep querying when uncertain. This worked but had a fundamental limitation: with temperature=0 or structured output, the same prompt always gives the same answer, so repeating identical prompts adds no information. The v1 code is fully preserved in `v1_sampling_archive/` (including its own dashboard).
+
+**v2 (logprob extraction)** — the current architecture. Instead of treating each query as a categorical vote, we extract the full logprob distribution over answer tokens from each query. This gives us a rich probability vector per query rather than a single vote. Since logprobs are deterministic per prompt, the signal comes entirely from varying the input (paraphrases + answer reordering) and observing how the distribution shifts. No Dirichlet, no Monte Carlo, no adaptive stopping — every paraphrase is queried exactly once with a fixed budget.
+
+## Core Concept (v2)
 
 - Query LLMs with paraphrased versions of the same question (+ answer reordering for multiple-choice)
-- Each response updates a Dirichlet posterior over the answer choices (increment pseudo-count by 1)
-- After each update, compute exceedance probability via Monte Carlo (Gamma sampling trick)
-- Stop when confidence threshold is met; continue querying if not
-- Black-box only: text-in, text-out, no logits or model internals required
-- Structured output enforced via JSON schema (enum of valid answer choices)
+- Extract logprobs for each answer token (A/B/C/D) from each query
+- Convert logprobs to normalised probability distributions per query
+- Aggregate across queries: mean of per-query probability vectors → final distribution
+- Final answer = argmax(mean_probs), not majority vote — accounts for confidence magnitude
+- Answer shuffling on every query integrates out position bias
+- Every paraphrase is queried exactly once (fixed budget, no adaptive stopping)
+- Uncertainty metrics (entropy, JSD, epistemic uncertainty) computed post-hoc in analysis.py
 
 ## Two Experiments
 
-**Experiment 1 (Standard benchmarks):** Run framework on MMLU and TruthfulQA. Compare efficiency and calibration against baselines: single query, fixed-budget same-prompt, fixed-budget with paraphrasing, Adaptive-Consistency.
+**Experiment 1 (Standard benchmarks — MMLU Redux 2.0):** Run framework on 5,330 verified-correct MMLU questions. Factorial design: 3 prompt modes × 2 shuffle settings × 2 paraphrase settings = 12 conditions. Compare accuracy, AUROC (does confidence separate correct from incorrect?), and uncertainty metrics across conditions.
 
-**Experiment 2 (Broken-premise detection):** Novel contribution. A paired dataset of ~100-200 MMLU questions, each with a matched broken-premise variant. The broken version modifies one element to invalidate the premise while keeping answer options identical. Six types of breaks: invalid premise, contradictory setup, category error, temporal violation, mathematical impossibility, entity-framing mismatch. We analyse whether the posterior distribution (convergence speed, entropy, exceedance probability) differs between well-formed and broken-premise versions.
+**Experiment 2 (Broken-premise detection):** Novel contribution. Paired dataset of MMLU questions, each with a matched broken-premise variant. The broken version modifies one element to invalidate the premise while keeping answer options identical. Six break types: existence violations, contradictory setups, category errors, temporal violations, mathematical impossibilities, entity-framing mismatches. Hypothesis: broken-premise questions show higher entropy, lower agreement, and lower confidence than matched valid questions.
 
 ## Tech Stack
 
-- **Python** with uv for package management
-- **Ollama** for local model inference (primary model: Qwen 3 8B Q4)
-- **NumPy/SciPy** for Dirichlet posterior computation
-- **Structured output** via Ollama's JSON schema support
-- **Target models:** Small local models — Qwen 3 8B, Gemma 3 4B/12B, Phi-4, Ministral 8B (all quantised)
+- **Python** with Pydantic for data models, NumPy/SciPy for analysis
+- **Ollama** for local model inference via HTTP API
+- **Primary model:** Qwen 3 8B Q4 (`qwen3:8b-q4_K_M`)
+- **Streamlit** dashboard for live monitoring and post-hoc analysis
+- **YAML** configs for experiment definitions
 
 ## Project Structure
 
 ```
 src/bayesian_uq/          Core library
-  dirichlet.py             Posterior updates, exceedance probability computation
-  paraphrase.py            Paraphrase generation and quality filtering
-  query.py                 LLM query wrapper with structured output enforcement
-  stopping.py              Stopping criteria (exceedance, entropy, credible interval)
-  pipeline.py              Main sequential sampling loop
+  config.py                Pydantic data models (QueryResult, ExperimentConfig, etc.)
+  query.py                 OllamaClient — logprob extraction, token matching, API calls
+  pipeline.py              Experiment runner — parallel/sequential query loop, incremental save
+  analysis.py              Post-hoc metrics — entropy, JSD, epistemic uncertainty
+
+dashboard/
+  app.py                   Streamlit dashboard (5 tabs: Progress, Distributions, Comparison, Effects, Explorer)
 
 experiments/
-  exp1_mmlu/               Standard benchmark experiment scripts
-  exp2_broken_premise/     Broken-premise paired dataset experiments
+  configs/                 YAML experiment configs (100q pilot + full 5330q, 12 conditions each)
+  run_experiment.py        CLI entry point for running experiments
 
 data/
-  mmlu/                    MMLU test set (test.csv)
-  broken_pairs/            Paired broken-premise dataset (our novel contribution)
-  paraphrases/             Pre-generated paraphrases per question
+  questions.json           Master question database (MMLU Redux + broken-premise pairs)
+  paraphrases.json         Pre-generated paraphrases (5,330 questions × 10 paraphrases)
+  mmlu/                    Raw MMLU Redux 2.0 source data
+  broken_pairs/            Broken-premise paired dataset
 
-notebooks/                 Exploratory analysis and visualisation
-results/                   Experiment outputs (git-ignored)
+results/                   Experiment output JSON files (git-ignored, can be 100MB+)
 paper/                     LaTeX/manuscript drafts
+v1_sampling_archive/       Archived v1 Dirichlet sampling code
 ```
+
+## How It Works Mechanically (v2)
+
+1. Load a question (4 options: A, B, C, D) and its pre-generated paraphrases
+2. For each query variant (original + up to 10 paraphrases):
+   - Shuffle the answer order (if shuffle enabled) to control for position bias
+   - Query the model via Ollama API, extracting logprobs for answer tokens
+   - Direct mode: `/api/generate` with `raw: true` (completion-style, no chat template)
+   - CoT modes: `/api/chat` with streaming (needs chat template for reasoning)
+   - Match tokens " A"/"A" (space-prefixed from generate endpoint) to answer letters
+   - Convert raw logprobs to normalised probability vector [P(A), P(B), P(C), P(D)]
+   - Map back to canonical answer ordering via the permutation
+3. Aggregate: mean of all per-query probability vectors → `mean_probs`
+4. Final answer: `argmax(mean_probs)` — better than majority vote because it weights by confidence
+5. Save results incrementally to JSON after each question
+
+**Query budget:** With paraphrases off + shuffle off = 1 query per question. With either on = 11 queries (1 original + 10 paraphrases). Direct mode uses 3 parallel workers; CoT modes run sequentially.
 
 ## Key Design Decisions
 
-- All LLM queries return exactly one of K fixed choices via structured output (JSON schema with enum). No free-text responses.
-- Paraphrases are generated offline by a strong external model (Claude or GPT-4o), filtered by embedding similarity (meaning preservation) and lexical distance (surface diversity), and stored for reuse.
-- Answer choice ordering is shuffled on every query to integrate out position bias.
-- The Dirichlet prior is initialised as Dirichlet(1,1,...,1) — uniform, one pseudo-count per option.
-- Exceedance probability is computed via Monte Carlo: draw 10,000 samples from the Dirichlet (using the Gamma normalisation trick), count how often the leading answer's component is the largest.
+- Raw logprobs stored unmodified alongside normalised `canonical_probs` for full audit trail
+- Token matching handles both "B" and " B" (space-prefixed from generate endpoint)
+- Missing answer tokens (not in top 20 logprobs) get `exp(-30)` floor before normalisation
+- `answer_permutation` maps display positions to canonical indices, stored per query for reproducibility
+- Paraphrases generated offline by Claude API, filtered by embedding similarity and lexical distance
+- Results saved as detailed JSON so analysis can be re-run without re-querying models
+- Use `127.0.0.1` not `localhost` in Ollama URL — Windows IPv6 DNS adds ~2s per request
+
+## Experimental Design
+
+3 prompt modes × 2 shuffle × 2 paraphrase = **12 conditions**:
+
+| Prompt Mode    | Description |
+|----------------|-------------|
+| `direct`       | Completion-style via `/api/generate` with `raw: true` |
+| `cot`          | Chain-of-thought via `/api/chat`, free-form reasoning then answer |
+| `cot_structured` | CoT with structured output format |
+
+Each condition has a YAML config in `experiments/configs/`. Naming convention: `exp1_{scale}_{prompt}_{shuffle}_{para}.yaml` (e.g. `exp1_full_direct_shuffle_nopara.yaml`).
+
+## Dashboard
+
+Streamlit dashboard (`dashboard/app.py`) with 5 tabs:
+
+1. **Progress** — per-run status cards, accuracy, timing estimates
+2. **Probability Distributions** — per-query confidence histograms, agreement distributions, mean prob analysis
+3. **Condition Comparison** — accuracy heatmap by subject category, key metrics table
+4. **Effect Analysis** — matched-pair main effects (accuracy Δ, AUROC Δ, confidence Δ, agreement Δ), effect consistency bar charts, interaction spotlight
+5. **Question Explorer** — drill into individual questions, per-query probability breakdowns
+
+Auto-refresh (30s) available for monitoring live experiments. Result files can be 100MB+; the sidebar uses lightweight 4KB config extraction to avoid re-parsing full files on every refresh.
 
 ## Coding Style
 
@@ -73,55 +127,36 @@ paper/                     LaTeX/manuscript drafts
 
 - Eva has strong Python skills (MSc in Data Science & AI) but is newer to Bayesian statistics — prefer clear variable names and comments over terse mathematical notation in code.
 - The project targets local models on a laptop with an NVIDIA RTX 3070 (8GB VRAM). Performance and memory constraints matter.
-- The primary baseline paper is Adaptive-Consistency (Aggarwal et al., EMNLP 2023) — we extend their approach with paraphrase-based input diversification.
+- The primary baseline paper is Adaptive-Consistency (Aggarwal et al., EMNLP 2023) — we extend their approach with paraphrase-based input diversification and logprob extraction.
 - This is a real research project aimed at publication. Code quality matters because experiments need to be reproducible.
-
-
-Copy
 
 # Experiment Context
 
 ## What we're investigating
 
-LLMs give single answers with no confidence measure. When you ask a question, you don't know if the model is certain, guessing, or confidently wrong. We're building a framework that wraps around any LLM (black-box, text-in text-out, no logits needed) and produces calibrated uncertainty estimates.
+LLMs give single answers with no confidence measure. When you ask a question, you don't know if the model is certain, guessing, or confidently wrong. We're building a framework that wraps around any LLM and produces calibrated uncertainty estimates by combining logprob extraction with input diversification (paraphrases + answer reordering).
 
-The key insight: if you ask the same question multiple ways (paraphrases + answer reordering) and the model gives consistent answers, it's probably right. If it gives inconsistent answers, it's uncertain — and that inconsistency is a useful signal.
-
-## How it works mechanically
-
-1. Start with a multiple-choice question (4 options: A, B, C, D)
-2. Initialise a Dirichlet(1,1,1,1) prior over the four answer choices
-3. For each query: pick a paraphrase of the question, shuffle the answer order, query the model with structured output (JSON schema forcing one of A/B/C/D), map the response back to canonical answer ordering
-4. Update the Dirichlet posterior by incrementing the pseudo-count for the chosen answer
-5. Compute exceedance probability: draw 10,000 samples from the Dirichlet (via Gamma trick), count how often the leading answer wins. This is our confidence measure.
-6. If exceedance exceeds threshold (e.g. 0.95), stop — we're confident enough. Otherwise query again with a different paraphrase.
-7. Result: a posterior distribution over answers, a confidence level, and a count of how many queries were needed.
-
-Easy questions converge in 3-5 queries. Hard or ambiguous questions use the full paraphrase budget without converging — which is itself a useful signal.
+The key insight: if you ask the same question multiple ways and the model's logprob distributions stay consistent, it's probably right. If the distributions shift — different answer gets highest probability depending on phrasing — the model is uncertain, and that inconsistency is a useful signal.
 
 ## Two experiments
 
-**Experiment 1 — Standard benchmarks (MMLU Redux 2.0):** Run the framework on verified-correct multiple-choice questions. Measure: does it get the right answer? Is the confidence well-calibrated? How many queries does it save compared to a fixed budget? Baselines: single query, same-prompt resampling (Adaptive-Consistency), fixed-budget paraphrasing.
+**Experiment 1 — Standard benchmarks (MMLU Redux 2.0):** Run the framework on 5,330 verified-correct multiple-choice questions across 12 factorial conditions. Measure: does it get the right answer? Does confidence (max mean prob) separate correct from incorrect answers (AUROC)? How do the experimental variables (prompt mode, shuffling, paraphrasing) affect accuracy and uncertainty calibration?
 
-**Experiment 2 — Broken-premise detection (novel contribution):** We created paired questions: each pair has a valid MMLU question and a matched broken-premise variant. The broken version modifies one element to invalidate the premise while keeping the four answer options identical. Example:
+**Experiment 2 — Broken-premise detection (novel contribution):** Paired questions where each pair has a valid MMLU question and a matched broken-premise variant. Example:
 
 - Valid: "What is the primary function of the mitochondria in a cell?" → Answer: Energy production
 - Broken: "What is the primary function of the mitochondria in a Monocercomonoides cell?" → Monocercomonoides has no mitochondria. No answer is correct, but the model is forced to pick one.
 
-Six types of premise breaks: existence violations, contradictory setups, category errors, temporal violations, mathematical impossibilities, entity-framing mismatches.
+The hypothesis: on broken-premise questions, the probability distributions will be less consistent across paraphrases (higher entropy, lower agreement, lower confidence) than on matched valid questions. This inconsistency is invisible from a single query but visible when you aggregate across diverse inputs.
 
-The hypothesis: on broken-premise questions, the posterior will converge more slowly, have lower exceedance, and higher entropy than on matched valid questions — because different paraphrases activate different reasoning pathways and the model becomes inconsistent. This inconsistency is invisible from a single query but visible through the Dirichlet posterior.
-
-We've already confirmed this manually: Qwen 3 8B answers "B" (Energy production) consistently for the valid mitochondria question, but when the broken version is paraphrased as "Monocercomonoides, the first known eukaryote to completely lack certain organelles..." it switches to "A" (Protein synthesis). Different phrasing, different answer — exactly the signal the framework detects.
-
-Key methodological point (from Luigi): we only analyse broken-premise results for pairs where the model confidently gets the valid version RIGHT. This rules out the alternative explanation that the model is just confused because it doesn't know the topic. We're specifically testing: does the model know the domain but fail to detect the broken premise?
+Key methodological point (from Luigi): we only analyse broken-premise results for pairs where the model confidently gets the valid version RIGHT. This rules out the alternative explanation that the model is just confused because it doesn't know the topic.
 
 ## Technical constraints
 
-- Black-box only: structured output via JSON schema, no logits, no hidden states
 - Local models via Ollama on an NVIDIA RTX 3070 (8GB VRAM)
 - Primary test model: Qwen 3 8B Q4 quantisation
-- Paraphrases pre-generated offline by a strong model (Claude API), stored and reused
+- Logprob extraction via Ollama API (`top_logprobs: 20`)
+- Paraphrases pre-generated offline by Claude API, stored and reused
 - All results stored as detailed JSON logs so analysis can be re-run without re-querying models
 
 ## Performance and Runtime Considerations

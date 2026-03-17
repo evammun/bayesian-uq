@@ -26,12 +26,19 @@ import requests
 from .config import ANSWER_LETTERS, NUM_CHOICES
 
 
-# Default Ollama endpoint (local)
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
+# Default Ollama endpoint — use 127.0.0.1 instead of localhost to avoid
+# Windows IPv6 DNS resolution delay (~2s per request on some systems)
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 
 # Answer tokens may have a leading space in the generate endpoint's tokenisation.
 # We match both "A" and " A" (and similarly for B, C, D).
 ANSWER_TOKENS = set(ANSWER_LETTERS) | {f" {l}" for l in ANSWER_LETTERS}
+
+# Context sizes for CoT modes. MCQ prompts are ~150 tokens and CoT responses
+# ~300 tokens, so 2048 gives a comfortable 4x margin. Think mode generates
+# long hidden reasoning chains that need significantly more headroom.
+COT_CONTEXT_SIZE = 2048
+THINK_CONTEXT_SIZE = 8192
 
 
 def _token_to_letter(token: str) -> str | None:
@@ -241,6 +248,7 @@ class OllamaClient:
 
     def _build_chat_payload(self, user_message: str) -> dict:
         """Build a /api/chat payload for CoT modes."""
+        ctx_size = THINK_CONTEXT_SIZE if self.think else COT_CONTEXT_SIZE
         return {
             "model": self.model,
             "messages": [
@@ -253,7 +261,7 @@ class OllamaClient:
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 500,
-                "num_ctx": 8192,
+                "num_ctx": ctx_size,
             },
         }
 
@@ -370,7 +378,7 @@ def extract_answer_logprobs(
     all_logprobs: list[dict],
     answer_permutation: list[int],
     prompt_mode: str = "direct",
-) -> tuple[dict[str, float], dict[int, float], str, int]:
+) -> tuple[dict[str, float], dict[int, float], str, int, int]:
     """Extract per-letter logprobs from the Ollama logprobs data.
 
     For direct mode: uses the first token position. Matches both "A" and " A"
@@ -395,6 +403,7 @@ def extract_answer_logprobs(
         - canonical_logprobs: {0: -3.21, 1: -0.12, ...} mapped via permutation
         - display_answer: the letter with the highest logprob (e.g. "B")
         - canonical_answer: the canonical index of that letter
+        - answer_token_idx: index into all_logprobs of the answer token
     """
     # Find the right token position to inspect
     if prompt_mode == "direct":
@@ -404,13 +413,15 @@ def extract_answer_logprobs(
         if not all_logprobs:
             raise ValueError("No logprobs data returned for direct mode query")
         target_logprobs = all_logprobs[0]
+        answer_token_idx = 0
     else:
         # CoT modes: find the LAST single-character A/B/C/D token
-        target_logprobs = _find_last_answer_token_logprobs(all_logprobs)
-        if target_logprobs is None:
+        result = _find_last_answer_token_logprobs(all_logprobs)
+        if result is None:
             raise ValueError(
                 "No standalone A/B/C/D token found in CoT response logprobs"
             )
+        target_logprobs, answer_token_idx = result
 
     # Extract logprobs for each answer letter from the target token's top_logprobs.
     # Tokens may be "A", " A", "B", " B" etc. — we normalise to just the letter.
@@ -444,26 +455,29 @@ def extract_answer_logprobs(
             f"Available tokens: {[e.get('token', '?') for e in top_logprobs_list]}"
         )
 
-    return display_letter_logprobs, canonical_logprobs, display_answer, canonical_answer
+    return display_letter_logprobs, canonical_logprobs, display_answer, canonical_answer, answer_token_idx
 
 
-def _find_last_answer_token_logprobs(all_logprobs: list[dict]) -> dict | None:
+def _find_last_answer_token_logprobs(
+    all_logprobs: list[dict],
+) -> tuple[dict, int] | None:
     """Find the logprobs entry for the last standalone A/B/C/D token in a CoT response.
 
     Scans the logprobs list from the end, looking for a token position where
     the top token (highest probability) is exactly one of A, B, C, D as a
     single character (with or without leading space).
 
-    Returns the logprobs dict for that token position, or None if not found.
+    Returns (logprobs_entry, index) for that token position, or None if not found.
     """
-    for entry in reversed(all_logprobs):
+    for i in range(len(all_logprobs) - 1, -1, -1):
+        entry = all_logprobs[i]
         top_logprobs = _get_top_logprobs(entry)
         if not top_logprobs:
             continue
         # Check the top token at this position
         top_token = top_logprobs[0].get("token", "")
         if _token_to_letter(top_token) is not None:
-            return entry
+            return entry, i
     return None
 
 

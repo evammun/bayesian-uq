@@ -18,6 +18,7 @@ import json
 import math
 import random
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +37,96 @@ from .config import (
     QuestionResult,
 )
 from .query import OllamaClient, extract_answer_logprobs, generate_permutation
+
+
+# ---------------------------------------------------------------------------
+# Atomic file writes
+# ---------------------------------------------------------------------------
+
+class _IncrementalWriter:
+    """Efficiently writes ExperimentResult JSON by appending, not rewriting.
+
+    The naive approach (model_dump_json on every save) re-serializes all
+    question results each time. At 5,000 questions × 11 queries this takes
+    ~160 seconds per save — O(n²) total serialization and O(n) I/O per save,
+    completely dominating the actual inference time.
+
+    This writer takes a different approach:
+      1. On the first call, writes the full JSON header and opening bracket.
+      2. On each subsequent call, seeks to just before the closing ']\n}'
+         and appends only the new QuestionResult JSON.
+      3. Each save is O(size_of_one_result) in both CPU and I/O.
+
+    The output file is always valid JSON, readable by the dashboard at any
+    point. The format is semantically identical to model_dump_json(indent=2).
+    """
+
+    def __init__(self) -> None:
+        self._n_written: int = 0
+        self._tail_len: int = 0  # byte length of the closing '\n  ]\n}'
+
+    @staticmethod
+    def _indent_result(json_str: str) -> str:
+        """Indent a result JSON block by 4 spaces (matching indent=2 nesting)."""
+        lines = json_str.split("\n")
+        return "\n".join("    " + line for line in lines)
+
+    def write(self, path: Path, data: ExperimentResult) -> None:
+        """Append new question results to the JSON file on disk."""
+        new_results = data.question_results[self._n_written:]
+        if not new_results:
+            return
+
+        if self._n_written == 0:
+            # First write: build full file from scratch
+            # Serialize header (config, metadata) via an empty-results shell
+            shell = data.model_copy(update={"question_results": []})
+            shell_json = shell.model_dump_json(indent=2)
+            marker = '"question_results": []'
+            idx = shell_json.find(marker)
+            if idx == -1:
+                raise ValueError("Could not find question_results in serialized JSON")
+            header_end = idx + len('"question_results": ')
+            header = shell_json[:header_end]
+
+            # Serialize all initial results
+            parts = []
+            for qr in new_results:
+                parts.append(self._indent_result(qr.model_dump_json(indent=2)))
+
+            tail = "\n  ]\n}"
+            full_json = header + "[\n" + ",\n".join(parts) + tail
+            self._tail_len = len(tail.encode("utf-8"))
+
+            # Write atomically
+            tmp_path = path.with_suffix(".tmp")
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(full_json)
+                tmp_path.replace(path)
+            except OSError:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(full_json)
+        else:
+            # Subsequent writes: in-place seek to overwrite the closing tail,
+            # then append new results + new tail. Only writes the new bytes,
+            # regardless of how large the file already is.
+            new_parts = []
+            for qr in new_results:
+                new_parts.append(self._indent_result(qr.model_dump_json(indent=2)))
+
+            tail = "\n  ]\n}"
+            append_str = ",\n" + ",\n".join(new_parts) + tail
+            append_bytes = append_str.encode("utf-8")
+
+            with open(path, "r+b") as f:
+                f.seek(-self._tail_len, 2)
+                f.write(append_bytes)
+                f.truncate()
+
+            self._tail_len = len(tail.encode("utf-8"))
+
+        self._n_written = len(data.question_results)
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +305,277 @@ def _logprobs_to_canonical_probs(
     return [p / total for p in raw_probs]
 
 
+# ---------------------------------------------------------------------------
+# Query execution strategies: parallel (direct mode) and sequential (CoT)
+# ---------------------------------------------------------------------------
+
+# Number of concurrent requests for direct mode. Matches OLLAMA_NUM_PARALLEL
+# default (which is typically 1-4). 3 is a good balance: enough to keep the
+# GPU busy between round-trips, not so many that we overwhelm the server.
+DIRECT_MODE_WORKERS = 3
+
+
+def _process_single_query(
+    query_num: int,
+    query_text: str,
+    paraphrase_index: int,
+    permutation: list[int],
+    question: QuestionRecord,
+    client: OllamaClient,
+    config: ExperimentConfig,
+    num_choices: int,
+) -> QueryResult | None:
+    """Send one query and process the result. Returns None on failure."""
+    try:
+        raw_response, all_logprobs, thinking_text = client.send_query(
+            question_text=query_text,
+            choices=question.choices,
+            answer_permutation=permutation,
+        )
+    except (ValueError, requests.exceptions.RequestException):
+        return None
+
+    try:
+        display_logprobs, canonical_logprobs, display_answer, canonical_answer, answer_idx = (
+            extract_answer_logprobs(
+                all_logprobs, permutation, prompt_mode=config.prompt_mode,
+            )
+        )
+    except ValueError:
+        return None
+
+    # For CoT modes, keep only the answer token's logprobs entry to reduce
+    # storage overhead (CoT responses have 100-300 token positions, but we
+    # only need the one where the model states its answer).
+    # Direct mode already stores just 1 entry (num_predict=1).
+    if config.prompt_mode != "direct":
+        all_logprobs = [all_logprobs[answer_idx]]
+
+    canonical_probs = _logprobs_to_canonical_probs(canonical_logprobs, num_choices)
+
+    return QueryResult(
+        query_number=query_num,
+        paraphrase_index=paraphrase_index,
+        query_text=query_text,
+        answer_permutation=permutation,
+        raw_response=raw_response,
+        raw_logprobs=all_logprobs,
+        display_letter_logprobs=display_logprobs,
+        canonical_logprobs=canonical_logprobs,
+        canonical_probs=canonical_probs,
+        display_answer=display_answer,
+        canonical_answer=canonical_answer,
+        thinking_trace=thinking_text,
+    )
+
+
+def _run_queries_parallel(
+    query_texts: list[str],
+    paraphrase_indices: list[int],
+    permutations: list[list[int]],
+    question: QuestionRecord,
+    client: OllamaClient,
+    config: ExperimentConfig,
+    num_choices: int,
+    global_query_count: list[int],
+) -> tuple[list[QueryResult], int, int, bool]:
+    """Run all queries for a question in parallel using ThreadPoolExecutor.
+
+    Used for direct mode only (non-streaming, single-token responses).
+    Sends up to DIRECT_MODE_WORKERS concurrent requests to Ollama.
+
+    Returns:
+        Tuple of (query_log, missing_letter_count, extraction_failures, any_verbose).
+    """
+    query_log: list[QueryResult] = []
+    missing_letter_count = 0
+    extraction_failures = 0
+    any_verbose = False
+
+    # Submit all queries concurrently
+    results_by_num: dict[int, QueryResult | None] = {}
+
+    with ThreadPoolExecutor(max_workers=DIRECT_MODE_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _process_single_query,
+                qn, query_texts[qn], paraphrase_indices[qn], permutations[qn],
+                question, client, config, num_choices,
+            ): qn
+            for qn in range(len(query_texts))
+        }
+        for future in as_completed(futures):
+            qn = futures[future]
+            try:
+                results_by_num[qn] = future.result()
+            except Exception:
+                results_by_num[qn] = None
+
+    # Process results in query order (preserves deterministic ordering)
+    for query_num in range(len(query_texts)):
+        result = results_by_num.get(query_num)
+        if result is None:
+            extraction_failures += 1
+            continue
+
+        # Track missing letters
+        missing = [
+            l for l in ANSWER_LETTERS[:num_choices]
+            if l not in result.display_letter_logprobs
+        ]
+        if missing:
+            missing_letter_count += 1
+
+        # Verbose output for first 3 queries globally
+        verbose = global_query_count[0] < 3
+        global_query_count[0] += 1
+
+        if verbose:
+            any_verbose = True
+            if missing:
+                print(
+                    f"\n    [WARN] Letters {missing} not in top_logprobs "
+                    f"for {question.question_id} query {query_num}",
+                    end="", flush=True,
+                )
+            _print_verbose_query(
+                query_num, result.display_letter_logprobs,
+                result.canonical_logprobs, result.canonical_probs,
+                result.answer_permutation, result.display_answer,
+                result.canonical_answer, config.prompt_mode,
+                result.raw_response, result.thinking_trace,
+            )
+
+        query_log.append(result)
+
+    return query_log, missing_letter_count, extraction_failures, any_verbose
+
+
+def _run_queries_sequential(
+    query_texts: list[str],
+    paraphrase_indices: list[int],
+    permutations: list[list[int]],
+    question: QuestionRecord,
+    client: OllamaClient,
+    config: ExperimentConfig,
+    num_choices: int,
+    global_query_count: list[int],
+) -> tuple[list[QueryResult], int, int, bool]:
+    """Run all queries for a question sequentially.
+
+    Used for CoT modes (streaming, longer generations) and single-query cases.
+
+    Returns:
+        Tuple of (query_log, missing_letter_count, extraction_failures, any_verbose).
+    """
+    query_log: list[QueryResult] = []
+    missing_letter_count = 0
+    extraction_failures = 0
+    any_verbose = False
+    consecutive_failures = 0
+    max_consecutive_failures = 3
+
+    for query_num in range(len(query_texts)):
+        permutation = permutations[query_num]
+        verbose = global_query_count[0] < 3
+
+        # Query the model
+        try:
+            raw_response, all_logprobs, thinking_text = client.send_query(
+                question_text=query_texts[query_num],
+                choices=question.choices,
+                answer_permutation=permutation,
+            )
+        except (ValueError, requests.exceptions.RequestException) as e:
+            consecutive_failures += 1
+            if verbose:
+                print(f"\n    [SKIP] query {query_num}: {e}", end="", flush=True)
+            if consecutive_failures >= max_consecutive_failures:
+                if verbose:
+                    print(
+                        f"\n    [BAIL] giving up after {consecutive_failures} "
+                        "consecutive failures",
+                        end="", flush=True,
+                    )
+                break
+            continue
+
+        consecutive_failures = 0
+        global_query_count[0] += 1
+
+        # Extract answer logprobs
+        try:
+            display_logprobs, canonical_logprobs, display_answer, canonical_answer, answer_idx = (
+                extract_answer_logprobs(
+                    all_logprobs, permutation, prompt_mode=config.prompt_mode,
+                )
+            )
+        except ValueError as e:
+            extraction_failures += 1
+            if verbose:
+                first_token = "?"
+                if all_logprobs:
+                    top = _peek_top_token(all_logprobs[0])
+                    if top:
+                        first_token = top
+                print(
+                    f"\n    [WARN] {question.question_id} query {query_num}: {e} "
+                    f"(first token: {first_token!r})",
+                    end="", flush=True,
+                )
+            continue
+
+        # Track missing letters
+        missing_letters = [
+            l for l in ANSWER_LETTERS[:num_choices]
+            if l not in display_logprobs
+        ]
+        if missing_letters:
+            missing_letter_count += 1
+            if verbose:
+                print(
+                    f"\n    [WARN] Letters {missing_letters} not in top_logprobs "
+                    f"for {question.question_id} query {query_num}",
+                    end="", flush=True,
+                )
+
+        # For CoT modes, keep only the answer token's logprobs entry to reduce
+        # storage overhead (CoT responses have 100-300 token positions, but we
+        # only need the one where the model states its answer).
+        stored_logprobs = (
+            [all_logprobs[answer_idx]] if config.prompt_mode != "direct"
+            else all_logprobs
+        )
+
+        canonical_probs = _logprobs_to_canonical_probs(canonical_logprobs, num_choices)
+
+        query_log.append(QueryResult(
+            query_number=query_num,
+            paraphrase_index=paraphrase_indices[query_num],
+            query_text=query_texts[query_num],
+            answer_permutation=permutation,
+            raw_response=raw_response,
+            raw_logprobs=stored_logprobs,
+            display_letter_logprobs=display_logprobs,
+            canonical_logprobs=canonical_logprobs,
+            canonical_probs=canonical_probs,
+            display_answer=display_answer,
+            canonical_answer=canonical_answer,
+            thinking_trace=thinking_text,
+        ))
+
+        if verbose:
+            any_verbose = True
+            _print_verbose_query(
+                query_num, display_logprobs, canonical_logprobs,
+                canonical_probs, permutation, display_answer,
+                canonical_answer, config.prompt_mode,
+                raw_response, thinking_text,
+            )
+
+    return query_log, missing_letter_count, extraction_failures, any_verbose
+
+
 def run_single_question(
     question: QuestionRecord,
     paraphrases: list[ParaphraseRecord],
@@ -298,104 +660,34 @@ def run_single_question(
         paraphrase_indices = [-1]
         schedule_description = "1 query (no variation sources)"
 
-    consecutive_failures = 0
-    max_consecutive_failures = 3
     missing_letter_count = 0  # accumulate for compact summary
     extraction_failures = 0
     any_verbose = False  # track if any query in this question was verbose
 
-    for query_num in range(len(query_texts)):
-        # Generate answer permutation
-        permutation = generate_permutation(
-            num_choices, rng_shuffle, shuffle=config.shuffle_choices,
+    # Pre-generate all permutations deterministically (same seed = same result)
+    permutations = [
+        generate_permutation(num_choices, rng_shuffle, shuffle=config.shuffle_choices)
+        for _ in range(len(query_texts))
+    ]
+
+    # Direct mode: parallelise queries (Ollama can batch up to OLLAMA_NUM_PARALLEL).
+    # CoT modes: keep sequential (streaming + longer generations).
+    if config.prompt_mode == "direct" and len(query_texts) > 1:
+        query_log, missing_letter_count, extraction_failures, any_verbose = (
+            _run_queries_parallel(
+                query_texts, paraphrase_indices, permutations,
+                question, client, config, num_choices,
+                global_query_count,
+            )
         )
-
-        # Per-query verbose: only for the first 3 queries globally
-        verbose = global_query_count[0] < 3
-
-        # Query the model
-        try:
-            raw_response, all_logprobs, thinking_text = client.send_query(
-                question_text=query_texts[query_num],
-                choices=question.choices,
-                answer_permutation=permutation,
+    else:
+        query_log, missing_letter_count, extraction_failures, any_verbose = (
+            _run_queries_sequential(
+                query_texts, paraphrase_indices, permutations,
+                question, client, config, num_choices,
+                global_query_count,
             )
-        except (ValueError, requests.exceptions.RequestException) as e:
-            consecutive_failures += 1
-            if verbose:
-                print(f"\n    [SKIP] query {query_num}: {e}", end="", flush=True)
-            if consecutive_failures >= max_consecutive_failures:
-                if verbose:
-                    print(
-                        f"\n    [BAIL] giving up after {consecutive_failures} "
-                        "consecutive failures",
-                        end="", flush=True,
-                    )
-                break
-            continue
-
-        consecutive_failures = 0
-        global_query_count[0] += 1
-
-        # Extract answer logprobs from the raw data
-        try:
-            display_logprobs, canonical_logprobs, display_answer, canonical_answer = (
-                extract_answer_logprobs(
-                    all_logprobs, permutation, prompt_mode=config.prompt_mode,
-                )
-            )
-        except ValueError as e:
-            extraction_failures += 1
-            if verbose:
-                first_token = "?"
-                if all_logprobs:
-                    top = _peek_top_token(all_logprobs[0])
-                    if top:
-                        first_token = top
-                print(
-                    f"\n    [WARN] {question.question_id} query {query_num}: {e} "
-                    f"(first token: {first_token!r})",
-                    end="", flush=True,
-                )
-            continue
-
-        # Track missing answer letters
-        missing_letters = [l for l in ANSWER_LETTERS[:num_choices] if l not in display_logprobs]
-        if missing_letters:
-            missing_letter_count += 1
-            if verbose:
-                print(
-                    f"\n    [WARN] Letters {missing_letters} not in top_logprobs "
-                    f"for {question.question_id} query {query_num}",
-                    end="", flush=True,
-                )
-
-        # Compute normalised probabilities from raw logprobs
-        canonical_probs = _logprobs_to_canonical_probs(canonical_logprobs, num_choices)
-
-        # Store the result
-        query_log.append(QueryResult(
-            query_number=query_num,
-            paraphrase_index=paraphrase_indices[query_num],
-            query_text=query_texts[query_num],
-            answer_permutation=permutation,
-            raw_response=raw_response,
-            raw_logprobs=all_logprobs,
-            display_letter_logprobs=display_logprobs,
-            canonical_logprobs=canonical_logprobs,
-            canonical_probs=canonical_probs,
-            display_answer=display_answer,
-            canonical_answer=canonical_answer,
-            thinking_trace=thinking_text,
-        ))
-
-        # Verbose output for first 3 queries globally
-        if verbose:
-            any_verbose = True
-            _print_verbose_query(query_num, display_logprobs, canonical_logprobs,
-                                 canonical_probs, permutation, display_answer,
-                                 canonical_answer, config.prompt_mode,
-                                 raw_response, thinking_text)
+        )
 
     # Aggregate: mean probability vector across all queries
     if query_log:
@@ -558,6 +850,8 @@ def run_experiment(
     paraphrases: dict[str, list[ParaphraseRecord]],
     output_dir: Path,
     seed: int = 42,
+    completed_ids: set[str] | None = None,
+    carried_over_results: list[QuestionResult] | None = None,
 ) -> ExperimentResult:
     """
     Run a complete experiment: iterate over all questions, query the model,
@@ -572,6 +866,10 @@ def run_experiment(
         paraphrases: Paraphrase bank keyed by question_id.
         output_dir: Directory to save the result JSON file.
         seed: Random seed for reproducibility.
+        completed_ids: Question IDs already completed (for --resume). These
+            questions will be skipped in the main loop.
+        carried_over_results: QuestionResult objects from the partial file.
+            Included in the output so the final file contains everything.
 
     Returns:
         The complete ExperimentResult (also saved to disk).
@@ -598,6 +896,15 @@ def run_experiment(
     filename = f"{config.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     output_file = output_dir / filename
 
+    # Resume support: filter out already-completed questions
+    if completed_ids:
+        original_count = len(questions)
+        questions = [q for q in questions if q.question_id not in completed_ids]
+        skipped = original_count - len(questions)
+        print(f"Resuming: skipping {skipped} already-completed questions, "
+              f"{len(questions)} remaining")
+        print(flush=True)
+
     # Print experiment header — compute expected queries per question
     if config.use_paraphrases:
         queries_per_q = config.num_paraphrases + 1
@@ -613,7 +920,8 @@ def run_experiment(
     print(f"  Model: {config.model} | Think: {config.think} | "
           f"Prompt: {config.prompt_mode} | Shuffle: {config.shuffle_choices} | "
           f"Paraphrases: {config.use_paraphrases}")
-    print(f"  Questions: {len(questions)} | Queries/question: {queries_per_q} ({schedule_note})")
+    parallel_note = f" | Workers: {DIRECT_MODE_WORKERS}" if config.prompt_mode == "direct" else ""
+    print(f"  Questions: {len(questions)} | Queries/question: {queries_per_q} ({schedule_note}){parallel_note}")
     print(f"  Temperature: {config.temperature} | Seed: {seed}")
     if config.use_paraphrases:
         questions_with_paras = sum(
@@ -623,9 +931,10 @@ def run_experiment(
     print(f"  Writing results to: {output_file}")
     print(flush=True)
 
-    # Run each question sequentially
-    question_results: list[QuestionResult] = []
+    # Run each question sequentially — seed with carried-over results from resume
+    question_results: list[QuestionResult] = list(carried_over_results or [])
     global_query_count = [0]  # mutable counter — first 3 queries get verbose output
+    writer = _IncrementalWriter()
 
     for idx, question in enumerate(questions):
         rng_shuffle = _make_question_rngs(seed, idx)
@@ -643,25 +952,25 @@ def run_experiment(
         )
         question_results.append(result)
 
-        # Incremental save after every question
-        experiment_result = ExperimentResult(
-            run_name=config.run_name,
-            config=config,
-            timestamp=timestamp,
-            question_results=question_results,
-        )
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(experiment_result.model_dump_json(indent=2))
+        # Incremental save every 20 questions (skip Pydantic re-validation
+        # via model_construct — the data was just built by us, not user input)
+        if (idx + 1) % 20 == 0:
+            experiment_result = ExperimentResult.model_construct(
+                run_name=config.run_name,
+                config=config,
+                timestamp=timestamp,
+                question_results=question_results,
+            )
+            writer.write(output_file, experiment_result)
 
-    # Final write
+    # Final write with full validation as a safety check
     experiment_result = ExperimentResult(
         run_name=config.run_name,
         config=config,
         timestamp=timestamp,
         question_results=question_results,
     )
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(experiment_result.model_dump_json(indent=2))
+    writer.write(output_file, experiment_result)
 
     print(f"\nResults saved to {output_file}")
     _print_summary(config.run_name, question_results)
