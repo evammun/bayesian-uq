@@ -34,9 +34,11 @@ DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 # We match both "A" and " A" (and similarly for B, C, D).
 ANSWER_TOKENS = set(ANSWER_LETTERS) | {f" {l}" for l in ANSWER_LETTERS}
 
-# Context sizes for CoT modes. MCQ prompts are ~150 tokens and CoT responses
-# ~300 tokens, so 2048 gives a comfortable 4x margin. Think mode generates
-# long hidden reasoning chains that need significantly more headroom.
+# Context sizes for CoT modes. The structured prompt keeps most responses
+# under 300 tokens. num_predict is set high (4000) so it never truncates
+# a genuine answer — the context window itself acts as the circuit breaker.
+# With ~150 token prompts, 2048 context allows ~1900 tokens of generation,
+# far more than needed but enough to catch runaway loops.
 COT_CONTEXT_SIZE = 2048
 THINK_CONTEXT_SIZE = 8192
 
@@ -180,24 +182,27 @@ class OllamaClient:
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Consider each option, then state your answer as a single letter."
+                "Think briefly about each option, then state your final answer.\n\n"
+                "End with: Answer: X"
             )
             payload = self._build_chat_payload(user_message)
         elif self.prompt_mode == "cot_structured":
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Which option is correct? Use this format:\n\n"
+                "Which option is correct? Use this exact format:\n\n"
                 "A) \u2713/\u2717 reason\n"
                 "B) \u2713/\u2717 reason\n"
                 "C) \u2713/\u2717 reason\n"
                 "D) \u2713/\u2717 reason\n\n"
                 "Answer: X\n\n"
                 "Example:\n"
-                "A) \u2717 confuses mass with weight\n"
-                "B) \u2713 matches Newton's second law\n"
-                "C) \u2717 ignores friction\n"
-                "D) \u2717 wrong units\n\n"
+                "Q: Find all c in Z_3 such that Z_3[x]/(x^2 + c) is a field.\n"
+                "  A) 0  B) 2  C) 1  D) 3\n"
+                "A) \u2717 x\u00b2+0 = x\u00b2 is reducible\n"
+                "B) \u2713 x\u00b2+2 has no roots in Z_3\n"
+                "C) \u2717 x\u00b2+1 = (x+1)(x+2) in Z_3\n"
+                "D) \u2717 3 \u2209 Z_3\n"
                 "Answer: B"
             )
             payload = self._build_chat_payload(user_message)
@@ -221,8 +226,11 @@ class OllamaClient:
             try:
                 if self.prompt_mode == "direct":
                     raw_content, raw_thinking, all_logprobs = self._send_generate(payload)
+                    done_reason = ""
                 else:
-                    raw_content, raw_thinking, all_logprobs = self._stream_chat(payload)
+                    raw_content, raw_thinking, all_logprobs, done_reason = (
+                        self._stream_chat(payload)
+                    )
             except (requests.exceptions.ReadTimeout,
                     requests.exceptions.ConnectionError,
                     requests.exceptions.ChunkedEncodingError) as e:
@@ -236,22 +244,61 @@ class OllamaClient:
                 time.sleep(wait)
                 continue
 
-            if raw_content.strip() or all_logprobs:
-                self._query_count += 1
-                # Diagnostic logging for first 3 queries only
-                if self._query_count <= 3 and all_logprobs:
-                    self._log_first_token_diagnostics(all_logprobs)
-                return raw_content, all_logprobs, raw_thinking
+            if not (raw_content.strip() or all_logprobs):
+                # Empty response — retry
+                last_error = ValueError("Empty response from model")
+                wait = 5 * (attempt + 1)
+                print(
+                    f"\n    [retry {attempt + 1}/{self.max_retries}] "
+                    f"empty response, waiting {wait}s...",
+                    end="", flush=True,
+                )
+                time.sleep(wait)
+                continue
 
-            # Empty response — retry
-            last_error = ValueError("Empty response from model")
-            wait = 5 * (attempt + 1)
-            print(
-                f"\n    [retry {attempt + 1}/{self.max_retries}] "
-                f"empty response, waiting {wait}s...",
-                end="", flush=True,
-            )
-            time.sleep(wait)
+            self._query_count += 1
+
+            # Two-pass CoT: if stop sequence fired, do a second pass to
+            # extract answer logprobs via single-token completion. This
+            # gives a real probability distribution instead of the near-
+            # certain [1,0,0,0] you get from the answer token in a CoT
+            # response where the model has already committed.
+            if (
+                done_reason == "stop"
+                and self.prompt_mode in ("cot", "cot_structured")
+            ):
+                try:
+                    answer_token, answer_logprobs = self._complete_answer_token(
+                        question_text, choice_lines, raw_content,
+                    )
+                    full_response = raw_content + "\nAnswer:" + answer_token
+                    if self._query_count <= 3:
+                        self._log_first_token_diagnostics(answer_logprobs)
+                        print(
+                            f"      [two-pass] stop fired, Pass 2 logprobs extracted",
+                            flush=True,
+                        )
+                    return full_response, answer_logprobs, raw_thinking
+                except (requests.exceptions.RequestException, ValueError):
+                    # Pass 2 failed — fall back to single-pass extraction
+                    if self._query_count <= 3:
+                        print(
+                            f"      [two-pass] Pass 2 failed, falling back to "
+                            f"single-pass",
+                            flush=True,
+                        )
+
+            # Single-pass: return streamed logprobs as-is (direct mode,
+            # think mode, or CoT fallback when stop didn't fire)
+            if self._query_count <= 3 and all_logprobs:
+                self._log_first_token_diagnostics(all_logprobs)
+                if self.prompt_mode in ("cot", "cot_structured") and done_reason != "stop":
+                    print(
+                        f"      [single-pass] stop did not fire "
+                        f"(done_reason={done_reason!r})",
+                        flush=True,
+                    )
+            return raw_content, all_logprobs, raw_thinking
 
         # All retries exhausted
         raise last_error  # type: ignore[misc]
@@ -259,9 +306,15 @@ class OllamaClient:
     def _build_chat_payload(self, user_message: str) -> dict:
         """Build a /api/chat payload for CoT modes."""
         ctx_size = THINK_CONTEXT_SIZE if self.think else COT_CONTEXT_SIZE
-        return {
+        payload = {
             "model": self.model,
             "messages": [
+                {"role": "system", "content": (
+                    "You are a concise exam grader. For each MCQ, state "
+                    "\u2713 or \u2717 with a few words per option, then "
+                    "Answer: X. Never write derivations, proofs, or "
+                    "step-by-step working."
+                )},
                 {"role": "user", "content": user_message},
             ],
             "think": self.think,
@@ -270,10 +323,16 @@ class OllamaClient:
             "top_logprobs": 20,
             "options": {
                 "temperature": self.temperature,
-                "num_predict": 500,
+                "num_predict": 4000,
                 "num_ctx": ctx_size,
             },
         }
+        # Stop sequence for two-pass: Ollama stops generation when the model
+        # writes "\nAnswer:", then we do a separate completion for the answer
+        # token to get clean logprobs. Not used in think mode.
+        if not self.think:
+            payload["stop"] = ["\nAnswer:"]
+        return payload
 
     def _send_generate(self, payload: dict) -> tuple[str, str, list[dict]]:
         """Send a non-streaming /api/generate request and extract logprobs.
@@ -300,14 +359,15 @@ class OllamaClient:
 
         return raw_content, raw_thinking, all_logprobs
 
-    def _stream_chat(self, payload: dict) -> tuple[str, str, list[dict]]:
+    def _stream_chat(self, payload: dict) -> tuple[str, str, list[dict], str]:
         """Open a streaming /api/chat connection and accumulate content, thinking, and logprobs.
 
         For CoT modes: streaming to avoid timeouts on long reasoning.
         logprobs and top_logprobs are top-level params in the payload.
 
         Returns:
-            Tuple of (content_text, thinking_text, logprobs_list).
+            Tuple of (content_text, thinking_text, logprobs_list, done_reason).
+            done_reason is "stop" when a stop sequence fired, "" otherwise.
         """
         resp = requests.post(
             self.chat_url,
@@ -320,6 +380,7 @@ class OllamaClient:
         raw_content = ""
         raw_thinking = ""
         all_logprobs: list[dict] = []
+        done_reason = ""
         stream_start = time.monotonic()
 
         try:
@@ -351,11 +412,55 @@ class OllamaClient:
                         all_logprobs.append(msg["logprobs"])
 
                 if chunk.get("done", False):
+                    done_reason = chunk.get("done_reason", "")
                     break
         finally:
             resp.close()
 
-        return raw_content, raw_thinking, all_logprobs
+        return raw_content, raw_thinking, all_logprobs, done_reason
+
+    def _complete_answer_token(
+        self,
+        question_text: str,
+        choice_lines: str,
+        reasoning: str,
+    ) -> tuple[str, list[dict]]:
+        """Pass 2: extract answer logprobs via single-token completion.
+
+        Sends the full context (question + choices + reasoning + 'Answer:')
+        to /api/generate with raw=True and num_predict=1. Returns the
+        answer token and its logprobs, identical to direct mode extraction.
+        """
+        prompt = (
+            f"{question_text}\n\n"
+            f"{choice_lines}\n\n"
+            f"{reasoning}\n\n"
+            "Answer:"
+        )
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "raw": True,
+            "stream": False,
+            "logprobs": True,
+            "top_logprobs": 20,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": 1,
+            },
+        }
+        resp = requests.post(
+            self.generate_url,
+            json=payload,
+            timeout=(30, self.timeout),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        raw_content = data.get("response", "")
+        all_logprobs = data.get("logprobs", [])
+
+        return raw_content, all_logprobs
 
     def _log_first_token_diagnostics(self, all_logprobs: list[dict]) -> None:
         """Log the first content token and its top 5 logprobs for debugging.
@@ -425,13 +530,28 @@ def extract_answer_logprobs(
         target_logprobs = all_logprobs[0]
         answer_token_idx = 0
     else:
-        # CoT modes: find the LAST single-character A/B/C/D token
-        result = _find_last_answer_token_logprobs(all_logprobs)
-        if result is None:
-            raise ValueError(
-                "No standalone A/B/C/D token found in CoT response logprobs"
-            )
-        target_logprobs, answer_token_idx = result
+        # CoT modes: check if this is a two-pass result (single logprobs entry
+        # from /api/generate, where the top token is an answer letter). If so,
+        # use direct-mode extraction. Otherwise fall back to searching for the
+        # last answer token in the streamed logprobs.
+        if len(all_logprobs) == 1:
+            top = _get_top_logprobs(all_logprobs[0])
+            if top and _token_to_letter(top[0].get("token", "")) is not None:
+                # Two-pass result — treat like direct mode
+                target_logprobs = all_logprobs[0]
+                answer_token_idx = 0
+            else:
+                raise ValueError(
+                    "Single logprobs entry but top token is not A/B/C/D"
+                )
+        else:
+            # Multi-entry: find the LAST single-character A/B/C/D token
+            result = _find_last_answer_token_logprobs(all_logprobs)
+            if result is None:
+                raise ValueError(
+                    "No standalone A/B/C/D token found in CoT response logprobs"
+                )
+            target_logprobs, answer_token_idx = result
 
     # Extract logprobs for each answer letter from the target token's top_logprobs.
     # Tokens may be "A", " A", "B", " B" etc. — we normalise to just the letter.
