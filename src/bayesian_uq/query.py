@@ -182,7 +182,8 @@ class OllamaClient:
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "BE CONCISE. Bullet points, not sentences. 3-4 MAX.\n\n"
+                "BE CONCISE. 3-4 bullet points of reasoning only "
+                "\u2014 do NOT name the answer letter in your reasoning.\n\n"
                 "End with: Answer: X"
             )
             payload = self._build_chat_payload(user_message, system_message=False)
