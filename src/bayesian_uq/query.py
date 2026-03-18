@@ -182,8 +182,7 @@ class OllamaClient:
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Consider each option and how they relate to each other, "
-                "then state your final answer.\n\n"
+                "BE CONCISE. Bullet points, not sentences. 3-4 MAX.\n\n"
                 "End with: Answer: X"
             )
             payload = self._build_chat_payload(user_message, system_message=False)
@@ -465,20 +464,25 @@ class OllamaClient:
     ) -> tuple[str, list[dict]]:
         """Pass 2: extract answer logprobs via single-token completion.
 
-        Sends the full context (question + choices + reasoning + 'Answer:')
-        to /api/generate with raw=True and num_predict=1. Returns the
-        answer token and its logprobs, identical to direct mode extraction.
+        Uses /api/chat (not /api/generate) to avoid a ~3s model reload
+        that Ollama triggers when switching between endpoints. The assistant
+        prefill contains the reasoning from Pass 1 + "Answer:", and
+        num_predict=1 forces a single token completion.
         """
-        prompt = (
-            f"{question_text}\n\n"
-            f"{choice_lines}\n\n"
-            f"{reasoning}\n\n"
-            "Answer:"
-        )
+        # Use chat endpoint with assistant prefill to stay on the same
+        # Ollama context slot as Pass 1 (avoids model reload)
         payload = {
             "model": self.model,
-            "prompt": prompt,
-            "raw": True,
+            "messages": [
+                {"role": "user", "content": (
+                    f"{question_text}\n\n"
+                    f"{choice_lines}\n\n"
+                    "Answer concisely, then state your answer."
+                )},
+                {"role": "assistant", "content": (
+                    f"{reasoning}\n\nAnswer:"
+                )},
+            ],
             "stream": False,
             "logprobs": True,
             "top_logprobs": 20,
@@ -488,14 +492,14 @@ class OllamaClient:
             },
         }
         resp = requests.post(
-            self.generate_url,
+            self.chat_url,
             json=payload,
             timeout=(30, self.timeout),
         )
         resp.raise_for_status()
         data = resp.json()
 
-        raw_content = data.get("response", "")
+        raw_content = data.get("message", {}).get("content", "")
         all_logprobs = data.get("logprobs", [])
 
         return raw_content, all_logprobs
