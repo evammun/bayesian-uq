@@ -182,10 +182,11 @@ class OllamaClient:
             user_message = (
                 f"{question_text}\n\n"
                 f"{choice_lines}\n\n"
-                "Think briefly about each option, then state your final answer.\n\n"
+                "Consider each option and how they relate to each other, "
+                "then state your final answer.\n\n"
                 "End with: Answer: X"
             )
-            payload = self._build_chat_payload(user_message)
+            payload = self._build_chat_payload(user_message, system_message=False)
         elif self.prompt_mode == "cot_structured":
             user_message = (
                 f"{question_text}\n\n"
@@ -337,20 +338,23 @@ class OllamaClient:
         # All retries exhausted
         raise last_error  # type: ignore[misc]
 
-    def _build_chat_payload(self, user_message: str) -> dict:
+    def _build_chat_payload(
+        self, user_message: str, system_message: bool = True,
+    ) -> dict:
         """Build a /api/chat payload for CoT modes."""
         ctx_size = THINK_CONTEXT_SIZE if self.think else COT_CONTEXT_SIZE
+        messages = []
+        if system_message:
+            messages.append({"role": "system", "content": (
+                "You are a concise exam grader. For each MCQ, state "
+                "\u2713 or \u2717 with a few words per option, then "
+                "Answer: X. Never write derivations, proofs, or "
+                "step-by-step working."
+            )})
+        messages.append({"role": "user", "content": user_message})
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": (
-                    "You are a concise exam grader. For each MCQ, state "
-                    "\u2713 or \u2717 with a few words per option, then "
-                    "Answer: X. Never write derivations, proofs, or "
-                    "step-by-step working."
-                )},
-                {"role": "user", "content": user_message},
-            ],
+            "messages": messages,
             "think": self.think,
             "stream": True,
             "logprobs": True,
