@@ -152,7 +152,7 @@ def _strip_unused_fields(data: dict) -> dict:
     For an 11-query × 5,000-question run this cuts in-memory size from ~280MB
     to roughly ~15MB.
     """
-    _KEEP_QUERY_KEYS = {"canonical_probs", "canonical_answer", "query_text"}
+    _KEEP_QUERY_KEYS = {"canonical_probs", "canonical_answer", "query_text", "raw_response"}
     for qr in data.get("question_results", []):
         qr.pop("answer_counts", None)
         for ql in qr.get("query_log", []):
@@ -575,26 +575,9 @@ def compute_timing(run_data: dict, file_path: str | None = None) -> dict:
                 elapsed_str = _fmt_sec(elapsed)
                 if pct >= 1:
                     remaining_str = "Done"
-                elif elapsed > 0 and done_q > 0:
-                    # To estimate remaining time, we need the rate of questions
-                    # produced during THIS run, not the total in the file
-                    # (which includes carried-over results from --resume).
-                    # Track the first-observed count in session state so we
-                    # can compute how many were added since the run started.
-                    first_key = f"_first_count_{file_path}"
-                    if first_key not in st.session_state:
-                        st.session_state[first_key] = done_q
-                    first_count = st.session_state[first_key]
-                    produced = done_q - first_count
-
-                    if produced > 0:
-                        q_per_sec = produced / elapsed
-                        remaining_q = max(total_q - done_q, 0)
-                        remaining = remaining_q / q_per_sec
-                        remaining_str = _fmt_sec(remaining)
-                    else:
-                        # First observation — can't estimate yet
-                        remaining_str = "estimating…"
+                elif 0 < pct < 1 and elapsed > 0:
+                    remaining = elapsed / pct * (1 - pct)
+                    remaining_str = _fmt_sec(remaining)
         except Exception:
             pass
 
@@ -1470,6 +1453,19 @@ with tab5:
                 width="stretch", hide_index=True,
                 column_config={"Query text": st.column_config.TextColumn(width="large")},
             )
+
+            # Show reasoning for CoT runs (raw_response contains the
+            # model's chain-of-thought; for direct mode it's just " A")
+            prompt_mode = run.get("config", {}).get("prompt_mode", "direct")
+            if prompt_mode in ("cot", "cot_structured"):
+                for qi, ql in enumerate(query_log):
+                    reasoning = ql.get("raw_response", "")
+                    if reasoning and len(reasoning) > 5:
+                        with st.expander(
+                            f"Query {qi} reasoning",
+                            expanded=(len(query_log) == 1),
+                        ):
+                            st.text(reasoning)
 
         # Stacked bar chart of probabilities across queries
         if query_log and len(query_log) > 1:
