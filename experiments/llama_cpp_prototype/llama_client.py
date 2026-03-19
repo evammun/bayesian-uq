@@ -110,7 +110,7 @@ class LlamaCppClient:
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             verbose=verbose,
-            # logits_all=True is NOT needed — we only use top_logprobs
+            logits_all=True,  # Required for logprobs to be returned
         )
         elapsed = time.monotonic() - start
         print(f"[INFO] Model loaded in {elapsed:.2f}s")
@@ -266,7 +266,7 @@ class LlamaCppClient:
             prompt=prompt,
             max_tokens=1,
             temperature=self.temperature,
-            top_logprobs=20,
+            logprobs=20,
         )
 
         response_text = output.get("choices", [{}])[0].get("text", "")
@@ -290,7 +290,7 @@ class LlamaCppClient:
             max_tokens=300,
             temperature=self.temperature,
             stop=["\nAnswer:"],
-            top_logprobs=20,
+            logprobs=20,
         )
 
         reasoning_text = output.get("choices", [{}])[0].get("text", "")
