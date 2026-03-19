@@ -603,6 +603,7 @@ class OllamaClient:
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 1,
+                "num_ctx": THINK_CONTEXT_SIZE if self.think else COT_CONTEXT_SIZE,
             },
         }
         resp = requests.post(
