@@ -1,6 +1,6 @@
-# Experiment 1 full: direct + think mode, noshuffle, nopara
+# Experiment 1 full: direct + think mode, shuffle, nopara
 # Hidden <think> reasoning via /api/chat, then short visible answer.
-run_name: "exp1_full_direct_noshuffle_nopara_think"
+run_name: "exp1_full_direct_shuffle_nopara_think"
 
 model: "qwen3:8b-q4_K_M"
 question_set: "mmlu_standard"
@@ -10,5 +10,5 @@ num_paraphrases: 10
 
 think: true
 prompt_mode: "direct"
-shuffle_choices: false
+shuffle_choices: true
 use_paraphrases: false
