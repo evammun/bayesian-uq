@@ -312,7 +312,7 @@ def _logprobs_to_canonical_probs(
 # Number of concurrent requests for direct mode. Matches OLLAMA_NUM_PARALLEL
 # default (which is typically 1-4). 3 is a good balance: enough to keep the
 # GPU busy between round-trips, not so many that we overwhelm the server.
-PARALLEL_WORKERS = 8
+DIRECT_MODE_WORKERS = 3
 
 
 def _process_single_query(
@@ -391,7 +391,7 @@ def _run_queries_parallel(
     """Run all queries for a question in parallel using ThreadPoolExecutor.
 
     Used for direct mode only (non-streaming, single-token responses).
-    Sends up to PARALLEL_WORKERS concurrent requests to Ollama.
+    Sends up to DIRECT_MODE_WORKERS concurrent requests to Ollama.
 
     Returns:
         Tuple of (query_log, missing_letter_count, extraction_failures, any_verbose).
@@ -404,7 +404,7 @@ def _run_queries_parallel(
     # Submit all queries concurrently
     results_by_num: dict[int, QueryResult | None] = {}
 
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=DIRECT_MODE_WORKERS) as executor:
         futures = {
             executor.submit(
                 _process_single_query,
@@ -690,9 +690,9 @@ def run_single_question(
         for _ in range(len(query_texts))
     ]
 
-    # Parallelise queries for all non-think modes (direct, cot, cot_structured).
-    # Think mode stays sequential (long streaming think chains would overwhelm GPU).
-    if len(query_texts) > 1 and not config.think:
+    # Direct mode (no think): parallelise queries (Ollama can batch).
+    # CoT modes and think: keep sequential (streaming, contention at scheduler).
+    if config.prompt_mode == "direct" and not config.think and len(query_texts) > 1:
         query_log, missing_letter_count, extraction_failures, any_verbose = (
             _run_queries_parallel(
                 query_texts, paraphrase_indices, permutations,
@@ -940,7 +940,7 @@ def run_experiment(
     print(f"  Model: {config.model} | Think: {config.think} | "
           f"Prompt: {config.prompt_mode} | Shuffle: {config.shuffle_choices} | "
           f"Paraphrases: {config.use_paraphrases}")
-    parallel_note = f" | Workers: {PARALLEL_WORKERS}" if not config.think else ""
+    parallel_note = f" | Workers: {DIRECT_MODE_WORKERS}" if config.prompt_mode == "direct" else ""
     print(f"  Questions: {len(questions)} | Queries/question: {queries_per_q} ({schedule_note}){parallel_note}")
     print(f"  Temperature: {config.temperature} | Seed: {seed}")
     if config.use_paraphrases:
