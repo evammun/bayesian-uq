@@ -40,7 +40,7 @@ ANSWER_TOKENS = set(ANSWER_LETTERS) | {f" {l}" for l in ANSWER_LETTERS}
 # With ~150 token prompts, 2048 context allows ~1900 tokens of generation,
 # far more than needed but enough to catch runaway loops.
 COT_CONTEXT_SIZE = 2048
-THINK_CONTEXT_SIZE = 8192
+THINK_CONTEXT_SIZE = 12288  # ~150 token prompt + up to ~4000 think tokens + visible answer
 
 
 def _token_to_letter(token: str) -> str | None:
@@ -232,7 +232,7 @@ class OllamaClient:
 
         # Log prompt setup once per experiment
         if not self._logged_first_query:
-            api = "generate (raw)" if self.prompt_mode == "direct" else "chat"
+            api = "generate (raw)" if (self.prompt_mode == "direct" and not self.think) else "chat"
             num_pred = payload.get("options", {}).get("num_predict", "default")
             print(
                 f"\n  [INFO] Prompt mode: {self.prompt_mode} | API: {api} | "

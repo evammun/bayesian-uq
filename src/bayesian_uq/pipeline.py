@@ -335,10 +335,16 @@ def _process_single_query(
     except (ValueError, requests.exceptions.RequestException):
         return None
 
+    # direct+think uses /api/chat, so extract logprobs like CoT (find last
+    # answer token) rather than direct (first token)
+    extraction_mode = config.prompt_mode
+    if config.think and config.prompt_mode == "direct":
+        extraction_mode = "cot"
+
     try:
         display_logprobs, canonical_logprobs, display_answer, canonical_answer, answer_idx = (
             extract_answer_logprobs(
-                all_logprobs, permutation, prompt_mode=config.prompt_mode,
+                all_logprobs, permutation, prompt_mode=extraction_mode,
             )
         )
     except ValueError:
@@ -508,11 +514,15 @@ def _run_queries_sequential(
         consecutive_failures = 0
         global_query_count[0] += 1
 
-        # Extract answer logprobs
+        # Extract answer logprobs — direct+think uses chat, extract like CoT
+        extraction_mode = config.prompt_mode
+        if config.think and config.prompt_mode == "direct":
+            extraction_mode = "cot"
+
         try:
             display_logprobs, canonical_logprobs, display_answer, canonical_answer, answer_idx = (
                 extract_answer_logprobs(
-                    all_logprobs, permutation, prompt_mode=config.prompt_mode,
+                    all_logprobs, permutation, prompt_mode=extraction_mode,
                 )
             )
         except ValueError as e:
