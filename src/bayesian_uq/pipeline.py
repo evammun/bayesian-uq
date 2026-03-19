@@ -327,7 +327,7 @@ def _process_single_query(
 ) -> QueryResult | None:
     """Send one query and process the result. Returns None on failure."""
     try:
-        raw_response, all_logprobs, thinking_text = client.send_query(
+        raw_response, all_logprobs, thinking_text, committed = client.send_query(
             question_text=query_text,
             choices=question.choices,
             answer_permutation=permutation,
@@ -344,13 +344,10 @@ def _process_single_query(
     except ValueError:
         return None
 
-    # For CoT modes, keep only the answer token's logprobs entry to reduce
-    # storage overhead (CoT responses have 100-300 token positions, but we
-    # only need the one where the model states its answer).
-    # Direct mode already stores just 1 entry (num_predict=1).
-    # The streaming chat endpoint may return raw lists instead of dicts
-    # with a "top_logprobs" key — wrap if needed for Pydantic validation.
-    if config.prompt_mode != "direct":
+    # For streaming chat responses (CoT modes + direct+think), keep only
+    # the answer token's logprobs entry. Wrap lists as dicts for Pydantic.
+    uses_chat = config.prompt_mode != "direct" or config.think
+    if uses_chat:
         entry = all_logprobs[answer_idx]
         if isinstance(entry, list):
             entry = {"top_logprobs": entry}
@@ -371,6 +368,7 @@ def _process_single_query(
         display_answer=display_answer,
         canonical_answer=canonical_answer,
         thinking_trace=thinking_text,
+        **(committed or {}),
     )
 
 
@@ -486,7 +484,7 @@ def _run_queries_sequential(
 
         # Query the model
         try:
-            raw_response, all_logprobs, thinking_text = client.send_query(
+            raw_response, all_logprobs, thinking_text, committed = client.send_query(
                 question_text=query_texts[query_num],
                 choices=question.choices,
                 answer_permutation=permutation,
@@ -545,12 +543,12 @@ def _run_queries_sequential(
                     end="", flush=True,
                 )
 
-        # For CoT modes, keep only the answer token's logprobs entry to reduce
-        # storage overhead (CoT responses have 100-300 token positions, but we
-        # only need the one where the model states its answer).
-        # The streaming chat endpoint may return raw lists instead of dicts
-        # with a "top_logprobs" key — wrap if needed for Pydantic validation.
-        if config.prompt_mode != "direct":
+        # For streaming chat responses (CoT modes + direct+think), keep only
+        # the answer token's logprobs entry. The streaming chat endpoint may
+        # return raw lists instead of dicts — wrap if needed for Pydantic.
+        # For direct mode (no think), logprobs are already a single dict.
+        uses_chat = config.prompt_mode != "direct" or config.think
+        if uses_chat:
             entry = all_logprobs[answer_idx]
             if isinstance(entry, list):
                 entry = {"top_logprobs": entry}
@@ -573,6 +571,7 @@ def _run_queries_sequential(
             display_answer=display_answer,
             canonical_answer=canonical_answer,
             thinking_trace=thinking_text,
+            **(committed or {}),
         ))
 
         if verbose:
@@ -681,9 +680,9 @@ def run_single_question(
         for _ in range(len(query_texts))
     ]
 
-    # Direct mode: parallelise queries (Ollama can batch up to OLLAMA_NUM_PARALLEL).
-    # CoT modes: keep sequential (streaming + longer generations).
-    if config.prompt_mode == "direct" and len(query_texts) > 1:
+    # Direct mode (no think): parallelise queries (Ollama can batch).
+    # CoT modes and direct+think: keep sequential (streaming).
+    if config.prompt_mode == "direct" and not config.think and len(query_texts) > 1:
         query_log, missing_letter_count, extraction_failures, any_verbose = (
             _run_queries_parallel(
                 query_texts, paraphrase_indices, permutations,

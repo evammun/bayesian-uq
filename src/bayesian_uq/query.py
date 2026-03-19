@@ -118,7 +118,7 @@ class OllamaClient:
         question_text: str,
         choices: list[str],
         answer_permutation: list[int],
-    ) -> tuple[str, list[dict], str]:
+    ) -> tuple[str, list[dict], str, dict | None]:
         """
         Send a multiple-choice question to the model and extract logprobs.
 
@@ -129,16 +129,21 @@ class OllamaClient:
         For CoT modes: uses /api/chat so the chat template is applied. The
         model reasons freely and we find the answer token in the output.
 
+        For direct + think: uses /api/chat with think=True. Hidden reasoning,
+        then dual logprob extraction (committed from stream + pre-commitment
+        from Pass 2 completion).
+
         Args:
             question_text: The question stem (original or paraphrased).
             choices: Answer texts in canonical order (index 0=A, 1=B, 2=C, 3=D).
             answer_permutation: Mapping from display position to canonical index.
 
         Returns:
-            Tuple of (raw_response_text, logprobs_list, thinking_trace).
+            Tuple of (raw_response_text, logprobs_list, thinking_trace, committed).
             - raw_response_text: the full text the model generated
-            - logprobs_list: the complete logprobs array from Ollama (all token positions)
+            - logprobs_list: the primary logprobs (Pass 2 for two-pass, streamed otherwise)
             - thinking_trace: the model's reasoning tokens (empty for direct mode)
+            - committed: dict with post-commitment extraction for think mode, or None
 
         Raises:
             requests.RequestException: If the Ollama API call fails after retries.
@@ -158,7 +163,7 @@ class OllamaClient:
         )
 
         # Build the prompt/message based on prompt_mode
-        if self.prompt_mode == "direct":
+        if self.prompt_mode == "direct" and not self.think:
             # Direct mode: completion-style via /api/generate with raw=True.
             # Prompt ends with "Answer:" — model completes with " B" etc.
             prompt_text = (
@@ -178,6 +183,21 @@ class OllamaClient:
                     "num_predict": 1,
                 },
             }
+        elif self.prompt_mode == "direct" and self.think:
+            # Direct + think: use /api/chat so the model can reason in a
+            # hidden <think> block, then give a short visible answer.
+            # Dual extraction: single-pass (post-commitment) from streamed
+            # logprobs, plus Pass 2 (pre-commitment) via completion.
+            user_message = (
+                f"{question_text}\n\n"
+                f"{choice_lines}\n\n"
+                "Answer with a single letter.\n\n"
+                "End with: Answer: X"
+            )
+            payload = self._build_chat_payload(user_message, system_message=False)
+            # Think tokens count toward num_predict in Ollama, so keep it
+            # high — the context window (THINK_CONTEXT_SIZE) is the real limit
+            payload["options"]["num_predict"] = 4000
         elif self.prompt_mode == "cot":
             user_message = (
                 f"{question_text}\n\n"
@@ -225,7 +245,7 @@ class OllamaClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                if self.prompt_mode == "direct":
+                if self.prompt_mode == "direct" and not self.think:
                     raw_content, raw_thinking, all_logprobs = self._send_generate(payload)
                     done_reason = ""
                 else:
@@ -305,7 +325,7 @@ class OllamaClient:
                             f"      [two-pass] stop fired, Pass 2 logprobs OK",
                             flush=True,
                         )
-                    return full_response, answer_logprobs, raw_thinking
+                    return full_response, answer_logprobs, raw_thinking, None
                 else:
                     # Pass 2 has no answer letters — fall back to Pass 1
                     # stream logprobs (existing CoT extraction will find
@@ -321,10 +341,94 @@ class OllamaClient:
                             f"has no answer letters, falling back to Pass 1",
                             flush=True,
                         )
-                    return raw_content, all_logprobs, raw_thinking
+                    return raw_content, all_logprobs, raw_thinking, None
+
+            # Direct + think: dual extraction.
+            # 1) Try single-pass (committed) from streamed logprobs
+            # 2) Strip answer from context, do Pass 2 (pre-commitment)
+            # Return Pass 2 as primary, committed as extra dict.
+            if self.prompt_mode == "direct" and self.think:
+                # Step 1: committed extraction from streamed logprobs
+                committed = None
+                try:
+                    (c_disp_lp, c_canon_lp, c_disp_ans, c_canon_ans,
+                     _) = extract_answer_logprobs(
+                        all_logprobs, answer_permutation, prompt_mode="cot",
+                    )
+                    from .pipeline import _logprobs_to_canonical_probs
+                    c_probs = _logprobs_to_canonical_probs(
+                        c_canon_lp, len(choices),
+                    )
+                    committed = {
+                        "committed_display_letter_logprobs": c_disp_lp,
+                        "committed_canonical_logprobs": c_canon_lp,
+                        "committed_canonical_probs": c_probs,
+                        "committed_display_answer": c_disp_ans,
+                        "committed_canonical_answer": c_canon_ans,
+                    }
+                except ValueError:
+                    pass  # single-pass failed, committed stays None
+
+                # Step 2: Strip answer from context for Pass 2
+                reasoning = raw_content
+                last_answer = reasoning.rfind("\nAnswer:")
+                if last_answer != -1:
+                    reasoning = reasoning[:last_answer]
+
+                # Step 3: Pass 2 (pre-commitment)
+                try:
+                    answer_token, answer_logprobs = self._complete_answer_token(
+                        question_text, choice_lines, reasoning,
+                    )
+                except (requests.exceptions.RequestException, ValueError):
+                    answer_logprobs = []
+
+                pass2_usable = False
+                if answer_logprobs:
+                    top = _get_top_logprobs(answer_logprobs[0])
+                    if any(_token_to_letter(e.get("token", "")) is not None
+                           for e in top):
+                        pass2_usable = True
+
+                # Diagnostics for first 3 queries
+                if self._query_count <= 3:
+                    if pass2_usable:
+                        self._log_first_token_diagnostics(answer_logprobs)
+                    if committed:
+                        c_top = f"{committed['committed_display_answer']} " \
+                                f"({max(committed['committed_canonical_probs']):.3f})"
+                    else:
+                        c_top = "FAILED"
+                    if pass2_usable:
+                        p2_top_lp = _get_top_logprobs(answer_logprobs[0])
+                        p2_letter = _token_to_letter(
+                            p2_top_lp[0].get("token", "")) if p2_top_lp else "?"
+                        p2_top = f"{p2_letter} ({math.exp(p2_top_lp[0].get('logprob', -30)):.3f})" if p2_top_lp else "?"
+                    else:
+                        p2_top = "FAILED"
+                    # Check agreement
+                    if (committed and pass2_usable
+                            and committed["committed_display_answer"] != p2_letter):
+                        print(
+                            f"      [think] DISAGREE: Pass 1 says {c_top} "
+                            f"but Pass 2 says {p2_top}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"      [think] Pass 1 (committed): {c_top} | "
+                            f"Pass 2 (pre-commit): {p2_top}",
+                            flush=True,
+                        )
+
+                if pass2_usable:
+                    return raw_content, answer_logprobs, raw_thinking, committed
+
+                # Pass 2 failed — fall back to streamed logprobs
+                return raw_content, all_logprobs, raw_thinking, committed
 
             # Single-pass: return streamed logprobs as-is (direct mode,
-            # think mode, or CoT fallback when stop didn't fire)
+            # or CoT fallback when stop didn't fire)
             if self._query_count <= 3 and all_logprobs:
                 self._log_first_token_diagnostics(all_logprobs)
                 if self.prompt_mode in ("cot", "cot_structured") and done_reason != "stop":
@@ -333,7 +437,7 @@ class OllamaClient:
                         f"(done_reason={done_reason!r})",
                         flush=True,
                     )
-            return raw_content, all_logprobs, raw_thinking
+            return raw_content, all_logprobs, raw_thinking, None
 
         # All retries exhausted
         raise last_error  # type: ignore[misc]
@@ -484,6 +588,7 @@ class OllamaClient:
                     f"{reasoning}\n\nAnswer:"
                 )},
             ],
+            "think": False,  # Pass 2 is always a simple completion
             "stream": False,
             "logprobs": True,
             "top_logprobs": 20,

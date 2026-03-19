@@ -1,0 +1,14 @@
+# Experiment 1 full: direct prompt with think mode, noshuffle, nopara
+# Hidden <think> reasoning via /api/chat, then short visible answer.
+run_name: "exp1_full_direct_noshuffle_nopara_think"
+
+model: "qwen3:8b-q4_K_M"
+question_set: "mmlu_standard"
+seed: 2024
+temperature: 0.7
+num_paraphrases: 10
+
+think: true
+prompt_mode: "direct"
+shuffle_choices: false
+use_paraphrases: false

@@ -158,6 +158,16 @@ class QueryResult(BaseModel):
 
     thinking_trace: str = ""
 
+    # Post-commitment logprobs (think mode only): extracted from the streamed
+    # response AFTER the model has already stated its answer. Compared with
+    # canonical_probs (pre-commitment, from Pass 2) to quantify how much
+    # stating the answer collapses the probability distribution.
+    committed_canonical_probs: list[float] | None = None
+    committed_display_letter_logprobs: dict[str, float] | None = None
+    committed_canonical_logprobs: dict[int, float] | None = None
+    committed_display_answer: str | None = None
+    committed_canonical_answer: int | None = None
+
 
 class QuestionResult(BaseModel):
     """Full result for one question across all its queries.
