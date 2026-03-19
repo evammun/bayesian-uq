@@ -400,12 +400,20 @@ class OllamaClient:
                     else:
                         c_top = "FAILED"
                     if pass2_usable:
+                        # Find the best answer letter in Pass 2 logprobs
                         p2_top_lp = _get_top_logprobs(answer_logprobs[0])
-                        p2_letter = _token_to_letter(
-                            p2_top_lp[0].get("token", "")) if p2_top_lp else "?"
-                        p2_top = f"{p2_letter} ({math.exp(p2_top_lp[0].get('logprob', -30)):.3f})" if p2_top_lp else "?"
+                        p2_letter = None
+                        p2_prob = 0.0
+                        for e in p2_top_lp:
+                            l = _token_to_letter(e.get("token", ""))
+                            if l is not None:
+                                p2_letter = l
+                                p2_prob = math.exp(e.get("logprob", -30))
+                                break
+                        p2_top = f"{p2_letter} ({p2_prob:.3f})" if p2_letter else "?"
                     else:
                         p2_top = "FAILED"
+                        p2_letter = None
                     # Check agreement
                     if (committed and pass2_usable
                             and committed["committed_display_answer"] != p2_letter):
