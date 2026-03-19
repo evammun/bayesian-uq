@@ -1,0 +1,25 @@
+PROTOTYPE FILE PATHS (Absolute)
+================================
+
+Base Directory:
+/sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/
+
+Core Implementation:
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/llama_client.py
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/__init__.py
+
+Test & Benchmark Scripts:
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/test_pilot.py
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/benchmark.py
+
+Documentation:
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/README.md
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/QUICKSTART.md
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/MANIFEST.md
+  /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/experiments/llama_cpp_prototype/PATHS.txt
+
+Related Project Files:
+  Questions database: /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/data/questions.json
+  OllamaClient ref:   /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/src/bayesian_uq/query.py
+  Config models:      /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/src/bayesian_uq/config.py
+  Pipeline:           /sessions/wizardly-epic-brahmagupta/mnt/bayesian-uq/src/bayesian_uq/pipeline.py
