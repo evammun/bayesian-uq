@@ -20,6 +20,21 @@
 
 # NOTE: no set -e — if one experiment fails, continue with the rest
 
+# --- Lock file to prevent duplicate instances ---
+LOCKFILE="/tmp/run_all_pilots.lock"
+if [ -f "$LOCKFILE" ]; then
+    OLD_PID=$(cat "$LOCKFILE" 2>/dev/null)
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[$(date)] Another instance already running (PID $OLD_PID). Exiting."
+        exit 0
+    else
+        echo "[$(date)] Stale lock file (PID $OLD_PID dead). Removing."
+        rm -f "$LOCKFILE"
+    fi
+fi
+echo $$ > "$LOCKFILE"
+trap 'rm -f "$LOCKFILE"' EXIT
+
 RESULTS_DIR="results"
 mkdir -p "$RESULTS_DIR"
 
