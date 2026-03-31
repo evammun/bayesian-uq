@@ -184,6 +184,68 @@ Smoke test: sufficient context → correct (B, p=0.80). Insufficient context (sw
 
 ---
 
+## March 31, 2026 — Full Experiment Runs + CSC Mahti
+
+### Experiment design finalised
+- **Factorial:** prompt_mode (direct/cot) x shuffle (on/off) x context (sufficient/insufficient) = 8 conditions
+- `num_paraphrases` renamed to `num_permutations` for clarity. Shuffle=on → 10 permutations per question. Shuffle=off → 1 (identical prompt = identical logprobs, no point repeating)
+- `n_ctx` bumped from 8192 to 12288 on vast.ai (42% of articles overflowed at 8192, 0% at 12288). 32768 on Mahti A100 (plenty of headroom)
+
+### Running experiments on two platforms simultaneously
+- **vast.ai RTX 5090** ($0.50-0.80/hr): Direct mode experiments. 3 of 4 direct conditions complete (~24MB results each). Shuffle+sufficient still running (~2000/4609 done)
+- **CSC Mahti A100 40GB** (university allocation, 1000 BU): CoT experiments. Two noshuffle CoT jobs running in parallel on separate A100 nodes
+
+### CoT two-pass: answer leaking fixed
+Initial CoT runs showed all logprobs at exactly 1.000 — the model was writing "The correct answer is C" in its reasoning, so Pass 2 just confirmed what the reasoning already committed to. This is the scaffolding absorption problem from v2.
+
+**Fix:** Added v2's anti-leak instruction to the CoT prompt: `"BE CONCISE. 3-4 bullet points of reasoning only -- do NOT name the answer letter in your reasoning."` After fix, reasoning traces are clean bullet points without answer letters, and Pass 1/Pass 2 answers can now disagree (the interesting case).
+
+### CoT Pass 1 answer capture
+`generate_cot()` now lets the model generate freely (no stop sequence), parses the answer letter from the last `"Answer: X"` pattern, then strips everything from "Answer:" onwards before feeding reasoning to Pass 2. This gives us two signals per CoT question: what the model freely chose (Pass 1) and the pre-commitment probability distribution (Pass 2 logprobs).
+
+### Interruptible GPU resume system (vast.ai)
+Built a resume system for vast.ai interruptible instances. Key bugs found and fixed:
+- **CRLF in YAML configs** caused `run_name` to include `\r`, breaking all file matching (script always started fresh instead of resuming)
+- **No PID lock file** meant autorun.sh launched duplicate instances on every resume, creating fragment result files
+- **`json.load` on truncated files** crashed the resume logic. Fixed with partial JSON recovery
+- **Fix:** `grep -c` byte-counting for completion detection, PID lock at `/tmp/`, CRLF stripping via `tr -d '\r'`
+
+### CSC Mahti deployment
+Ported pipeline to the university supercomputer. Key differences from vast.ai: SLURM batch jobs instead of long-running containers, no internet on compute nodes, model copied to NVMe per-job.
+
+Issues hit (all solved):
+1. `module` command not available in SLURM batch scripts — need `source /appl/profile/zz-csc-env.sh` first
+2. llama-cpp-python CPU-only wheel installed by default (CUDA 11.5 has no pre-built wheel). Had to build from source on a compute node (login node fails because `libcuda.so` only exists on GPU nodes)
+3. YAML files with Windows em-dash byte (0x97) crash Python's YAML parser on Linux
+4. `srun` doesn't inherit the bash environment (modules, venv) — removed, just call `python3` directly
+
+### Dashboard rebuilt
+New Streamlit dashboard with: progress+timing per run, per-run distribution histograms (2 per row), dynamic accuracy table with grouped headers (Overall/Easy/Hard x Accuracy/Confidence), calibration reliability diagrams, effect analysis with matched-pair comparisons, question explorer with per-run results and CoT reasoning traces.
+
+---
+
+## Decision Log (updated)
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-03-25 | Pivot to pre-action UQ | MMLU results not compelling; new direction = real unsolved problem |
+| 2026-03-25 | Archive v2, fresh structure | Clean slate for new direction |
+| 2026-03-25 | BFCL for tool-calling component (RQ3) | Irrelevance detection + missing params = proceed/clarify/escalate labels |
+| 2026-03-25 | Reconsidered MuSiQue — not a great fit | Tests multi-hop reasoning chains, not comprehension of input |
+| 2026-03-25 | RGB as starting dataset for RQ2 | Negative rejection testbed = exactly our scenario |
+| 2026-03-25 | RQ2 (context sufficiency) is the load-bearing RQ | Cleanest operationalisation, strongest motivation |
+| 2026-03-30 | RGB dropped, replaced by QuALITY | See March 30 dataset notes above |
+| 2026-03-30 | `logits_all=False` + low-level extraction | Saves ~4.7GB VRAM. Required to run on 8GB GPUs |
+| 2026-03-30 | Chat template with "Answer:" as assistant prefill | Without it, model produces garbage logprobs (top token "GSM") |
+| 2026-03-30 | `memory_clear(True)` for KV cache reset | `reset()` doesn't actually clear the cache — causes batch decode failures |
+| 2026-03-30 | Remove threading from pipeline | Lock makes parallelism fake. GPU is the bottleneck, not CPU |
+| 2026-03-31 | 8 factorial configs: direct/cot x shuffle/noshuffle x suf/insuf | Full experimental design covering prompt mode, answer variation, context quality |
+| 2026-03-31 | n_ctx=12288 (vast.ai) / 32768 (Mahti) | 42% overflow at 8192. 12288 covers all articles. 32768 for CoT headroom on A100 |
+| 2026-03-31 | CoT anti-leak prompt instruction | Model was writing "The correct answer is C" in reasoning, contaminating Pass 2 |
+| 2026-03-31 | Dual-platform execution (vast.ai + Mahti) | Direct experiments on rented GPU, CoT on university cluster. Run in parallel |
+
+---
+
 ## Next Steps
 - [x] ~~Download RGB dataset~~ (dropped)
 - [x] Dataset change: RGB → QuALITY
@@ -192,8 +254,13 @@ Smoke test: sufficient context → correct (B, p=0.80). Insufficient context (sw
 - [x] Port experiment pipeline for QuALITY MCQ format
 - [x] Build insufficient context condition (article swapping, same-topic preferred)
 - [x] Fix chat template, n_batch, model discovery, remove fake threading
-- [ ] Run 4 pilot experiments (50q each): direct nothink/think × sufficient/insufficient
-- [ ] Compute signals on pilot results, validate format matches v2
-- [ ] Track how many questions get skipped due to n_ctx overflow
+- [x] Port/rewrite Streamlit dashboard for QuALITY
+- [x] Run direct noshuffle experiments (sufficient + insufficient) — DONE on vast.ai
+- [x] Deploy pipeline to CSC Mahti, smoke test passes
+- [ ] **IN PROGRESS:** Direct shuffle sufficient — vast.ai (~2000/4609)
+- [ ] **IN PROGRESS:** CoT noshuffle sufficient + insufficient — Mahti (just started)
+- [ ] Direct shuffle insufficient — vast.ai (next after shuffle suf finishes)
+- [ ] Compute signals on completed results, validate discriminative power
+- [ ] Key question: does sufficient vs insufficient show different uncertainty profiles?
+- [ ] CoT shuffle experiments (expensive — ~80h each, need BU allocation increase)
 - [ ] Build partial (C3) and counterfactual (C4) context conditions
-- [ ] Port/rewrite Streamlit dashboard for QuALITY
