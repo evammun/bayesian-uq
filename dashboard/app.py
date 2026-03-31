@@ -37,13 +37,14 @@ SIGNALS_CSV = PROJECT_ROOT / "analysis" / "signals.csv"
 # Palette
 # ---------------------------------------------------------------------------
 
-TEAL = "#2D7F83"
-DEEP_BLUE = "#1E4D8A"
-DARK_TEAL = "#2F555A"
-CHARCOAL = "#1A2F32"
-SLATE = "#6B7280"
-ROSE = "#B85C5C"
-GOLD = "#EEB127"
+TEAL = "#2A8C8F"
+DEEP_BLUE = "#4B7C92"
+SLATE = "#5B5E8D"
+ROSE = "#CA4A7A"
+GOLD = "#D4A017"
+PURPLE = "#6C4F7F"
+MAGENTA = "#9B4F8F"
+SOFT_TEAL = "#65B2B5"
 BG = "#FDFCFB"
 TEXT = "#2C3E50"
 GRAY_LIGHT = "#8B95A1"
@@ -52,6 +53,20 @@ BORDER = "#E5E0DB"
 CONDITION_COLORS = {"sufficient": TEAL, "insufficient": ROSE}
 ANSWER_LETTERS = ["A", "B", "C", "D"]
 CHOICE_COLORS = [TEAL, DEEP_BLUE, GOLD, ROSE]
+
+# Jewel-toned plot palette — ordered for maximum adjacent contrast
+PLOT_COLORS = [
+    TEAL,       # #2A8C8F  teal
+    ROSE,       # #CA4A7A  rose/magenta
+    GOLD,       # #D4A017  gold
+    SLATE,      # #5B5E8D  slate blue
+    MAGENTA,    # #9B4F8F  purple-pink
+    SOFT_TEAL,  # #65B2B5  light teal
+    PURPLE,     # #6C4F7F  deep purple
+    DEEP_BLUE,  # #4B7C92  steel blue
+    "#B06D94",  #          dusty rose
+    "#7F6B9C",  #          lavender
+]
 
 # ---------------------------------------------------------------------------
 # Page config + CSS
@@ -63,14 +78,16 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500&family=Inter:wght@300;400;500&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; color: #2C3E50; }
-h1 { font-family: 'Playfair Display', serif !important; font-weight: 400 !important; }
-h2, h3, h4 { font-family: 'Inter', sans-serif !important; font-weight: 500 !important; }
+h1 { font-family: 'Playfair Display', serif !important; font-weight: 400 !important; font-size: 1.6rem !important; }
+h2 { font-family: 'Inter', sans-serif !important; font-weight: 500 !important; font-size: 1.3rem !important; }
+h3 { font-family: 'Inter', sans-serif !important; font-weight: 500 !important; font-size: 1.1rem !important; }
+h4 { font-family: 'Inter', sans-serif !important; font-weight: 500 !important; font-size: 0.9rem !important; }
 .stApp { background-color: #FDFCFB; }
 [data-testid="stMetric"] { background: transparent; border: 1px solid #E5E0DB;
-    border-radius: 8px; padding: 16px; }
-[data-testid="stMetricLabel"] { font-size: 13px; text-transform: uppercase;
+    border-radius: 8px; padding: 10px; }
+[data-testid="stMetricLabel"] { font-size: 11px; text-transform: uppercase;
     letter-spacing: 0.04em; color: #8B95A1; }
-[data-testid="stMetricValue"] { font-size: 28px; font-weight: 400; }
+[data-testid="stMetricValue"] { font-size: 22px; font-weight: 400; }
 [data-testid="stSidebar"] { background-color: #F5F3F1; }
 footer, #MainMenu, [data-testid="stDeployButton"] { display: none !important; }
 </style>
@@ -441,64 +458,140 @@ def tab_distributions() -> None:
         st.info("No valid data.")
         return
 
-    CORRECT_COLOR = TEAL
-    INCORRECT_COLOR = GOLD
+    # --- Filters for each experimental variable ---
+    filter_cols = st.columns(3)
+    with filter_cols[0]:
+        ctx_opts = sorted(active["context_condition"].unique())
+        selected_ctx = st.selectbox("Context", ["All"] + ctx_opts)
+    with filter_cols[1]:
+        if "shuffle" in active.columns and active["shuffle"].nunique() > 1:
+            shuffle_opts = ["All", "Shuffle", "No shuffle"]
+            selected_shuffle = st.selectbox("Shuffle", shuffle_opts)
+        else:
+            selected_shuffle = "All"
+    with filter_cols[2]:
+        if "prompt_mode" in active.columns and active["prompt_mode"].nunique() > 1:
+            mode_opts = ["All"] + sorted(active["prompt_mode"].unique())
+            selected_mode = st.selectbox("Mode", mode_opts)
+        else:
+            selected_mode = "All"
 
-    # Context condition selector
-    ctx_options = sorted(active["context_condition"].unique())
-    selected_ctx = st.selectbox("Context condition", ["All"] + ctx_options)
     if selected_ctx != "All":
         active = active[active["context_condition"] == selected_ctx]
+    if selected_shuffle == "Shuffle":
+        active = active[active["shuffle"] == True]
+    elif selected_shuffle == "No shuffle":
+        active = active[active["shuffle"] == False]
+    if selected_mode != "All":
+        active = active[active["prompt_mode"] == selected_mode]
 
-    # MSP distribution — correct vs incorrect overlay
-    st.subheader("Max Single Probability (MSP)")
-    fig = go.Figure()
-    correct_msp = active[active["is_correct"] == True]["msp"].dropna()
-    incorrect_msp = active[active["is_correct"] == False]["msp"].dropna()
-    if len(correct_msp) > 0:
-        fig.add_trace(go.Histogram(x=correct_msp, name="Correct", histnorm="percent",
-                                   marker_color=CORRECT_COLOR, opacity=0.7, nbinsx=20))
-    if len(incorrect_msp) > 0:
-        fig.add_trace(go.Histogram(x=incorrect_msp, name="Incorrect", histnorm="percent",
-                                   marker_color=INCORRECT_COLOR, opacity=0.7, nbinsx=20))
-    fig.update_layout(**_base_layout(title="MSP: Correct vs Incorrect",
-                                     xaxis_title="MSP", yaxis_title="% of group", barmode="overlay"))
-    st.plotly_chart(_round_hover(fig), use_container_width=True)
+    if active.empty:
+        st.info("No data matches the selected filters.")
+        return
 
-    # Agreement distribution — correct vs incorrect
-    st.subheader("Agreement Rate")
-    fig2 = go.Figure()
-    correct_ag = active[active["is_correct"] == True]["agreement"].dropna()
-    incorrect_ag = active[active["is_correct"] == False]["agreement"].dropna()
-    if len(correct_ag) > 0:
-        fig2.add_trace(go.Histogram(x=correct_ag, name="Correct", histnorm="percent",
-                                    marker_color=CORRECT_COLOR, opacity=0.7, nbinsx=20))
-    if len(incorrect_ag) > 0:
-        fig2.add_trace(go.Histogram(x=incorrect_ag, name="Incorrect", histnorm="percent",
-                                    marker_color=INCORRECT_COLOR, opacity=0.7, nbinsx=20))
-    fig2.update_layout(**_base_layout(title="Agreement: Correct vs Incorrect",
-                                      xaxis_title="Agreement", yaxis_title="% of group", barmode="overlay"))
-    st.plotly_chart(_round_hover(fig2), use_container_width=True)
+    # --- Helper: build a histogram figure ---
+    def _msp_hist(sub, label):
+        fig = go.Figure()
+        correct_msp = sub[sub["is_correct"] == True]["msp"].dropna()
+        incorrect_msp = sub[sub["is_correct"] == False]["msp"].dropna()
+        if len(correct_msp) > 0:
+            fig.add_trace(go.Histogram(x=correct_msp, name="Correct", histnorm="percent",
+                                       marker_color=TEAL, opacity=0.7, nbinsx=20))
+        if len(incorrect_msp) > 0:
+            fig.add_trace(go.Histogram(x=incorrect_msp, name="Incorrect", histnorm="percent",
+                                       marker_color=GOLD, opacity=0.7, nbinsx=20))
+        fig.update_layout(**_base_layout(title=label, xaxis_title="MSP", yaxis_title="% of group",
+                                         barmode="overlay", height=250, showlegend=False))
+        return fig
 
-    # Fragile confidence scatter: agreement (x) vs MSP (y)
-    st.subheader("Fragile Confidence: Agreement vs MSP")
-    fig3 = go.Figure()
-    for cond, color in CONDITION_COLORS.items():
-        sub = active[active["context_condition"] == cond].dropna(subset=["agreement", "msp"])
-        for correct_val, symbol, label_suffix in [
-            (True, "circle", "Correct"),
-            (False, "x", "Wrong"),
-        ]:
-            s = sub[sub["is_correct"] == correct_val]
-            if len(s) > 0:
-                fig3.add_trace(go.Scatter(
-                    x=s["agreement"], y=s["msp"], mode="markers",
-                    marker=dict(color=color, symbol=symbol, size=8, opacity=0.7),
-                    name=f"{cond.capitalize()} {label_suffix}",
-                ))
-    fig3.update_layout(**_base_layout(title="Fragile Confidence Space",
-                                      xaxis_title="Agreement", yaxis_title="MSP"))
-    st.plotly_chart(_round_hover(fig3), use_container_width=True)
+    def _agree_hist(sub, label):
+        fig = go.Figure()
+        correct_ag = sub[sub["is_correct"] == True]["agreement"].dropna()
+        incorrect_ag = sub[sub["is_correct"] == False]["agreement"].dropna()
+        if len(correct_ag) > 0:
+            fig.add_trace(go.Histogram(x=correct_ag, name="Correct", histnorm="percent",
+                                       marker_color=TEAL, opacity=0.7, nbinsx=20))
+        if len(incorrect_ag) > 0:
+            fig.add_trace(go.Histogram(x=incorrect_ag, name="Incorrect", histnorm="percent",
+                                       marker_color=GOLD, opacity=0.7, nbinsx=20))
+        fig.update_layout(**_base_layout(title=label, xaxis_title="Agreement", yaxis_title="% of group",
+                                         barmode="overlay", height=250, showlegend=False))
+        fig.update_xaxes(range=[0, 1.05])
+        return fig
+
+    def _run_label(run_name):
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        return format_run_label(cfg) if cfg else run_name.replace("quality_", "")
+
+    # --- Per-run MSP distributions (2 per row) ---
+    st.subheader("MSP by Run (Correct vs Incorrect)")
+    st.caption("Teal = correct, Gold = incorrect")
+    run_names = sorted(active["run_name"].unique())
+    for i in range(0, len(run_names), 2):
+        cols = st.columns(2)
+        for j, col in enumerate(cols):
+            idx = i + j
+            if idx >= len(run_names):
+                break
+            sub = active[active["run_name"] == run_names[idx]]
+            with col:
+                st.plotly_chart(_round_hover(_msp_hist(sub, _run_label(run_names[idx]))),
+                                use_container_width=True)
+
+    # --- Agreement (only for multi-query runs, 2 per row) ---
+    multi = active[(active["num_queries"] > 1) & active["agreement"].notna()]
+    if not multi.empty:
+        st.subheader("Agreement by Run (Correct vs Incorrect)")
+        multi_runs = sorted(multi["run_name"].unique())
+        for i in range(0, len(multi_runs), 2):
+            cols = st.columns(2)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx >= len(multi_runs):
+                    break
+                sub = multi[multi["run_name"] == multi_runs[idx]]
+                with col:
+                    st.plotly_chart(_round_hover(_agree_hist(sub, _run_label(multi_runs[idx]))),
+                                    use_container_width=True)
+
+    # --- Fragile confidence: MSP by agreement bin ---
+    st.subheader("Fragile Confidence: MSP by Agreement Level")
+    st.caption(
+        "Box plots of MSP at each agreement level. "
+        "High MSP + low agreement = fragile confidence (overconfident on unstable answers)."
+    )
+    multi_fc = active[(active["num_queries"] > 1) & active["agreement"].notna()]
+    if not multi_fc.empty:
+        def _fragile_box(sub, label):
+            sub = sub.copy()
+            sub["agree_bin"] = (sub["agreement"] * 10).round() / 10
+            fig3 = go.Figure()
+            for correct_val, color, name in [(True, TEAL, "Correct"), (False, GOLD, "Incorrect")]:
+                s = sub[sub["is_correct"] == correct_val]
+                if len(s) > 0:
+                    fig3.add_trace(go.Box(x=s["agree_bin"], y=s["msp"], name=name,
+                                          marker_color=color, boxpoints="outliers", line_width=1.5))
+            fig3.update_layout(**_base_layout(title=label, xaxis_title="Agreement", yaxis_title="MSP",
+                                              boxmode="group", height=280, showlegend=False))
+            fig3.update_xaxes(dtick=0.1)
+            return fig3
+
+        fc_runs = [rn for rn in sorted(multi_fc["run_name"].unique())
+                   if len(multi_fc[multi_fc["run_name"] == rn]) >= 5]
+        for i in range(0, len(fc_runs), 2):
+            cols = st.columns(2)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx >= len(fc_runs):
+                    break
+                sub = multi_fc[multi_fc["run_name"] == fc_runs[idx]].dropna(subset=["agreement", "msp"])
+                with col:
+                    st.plotly_chart(_round_hover(_fragile_box(sub, _run_label(fc_runs[idx]))),
+                                    use_container_width=True)
+    else:
+        st.caption("Requires multi-query runs (shuffle conditions).")
 
 
 # ---------------------------------------------------------------------------
@@ -550,16 +643,66 @@ def tab_comparison() -> None:
             else:
                 row[label] = str(val).capitalize()
         acc = sub["is_correct"].mean()
-        acc_easy = sub[~sub["difficult"]]["is_correct"].mean() if (~sub["difficult"]).any() else float("nan")
-        acc_hard = sub[sub["difficult"]]["is_correct"].mean() if sub["difficult"].any() else float("nan")
-        row["Accuracy"] = f"{acc:.1%}"
-        row["Easy"] = f"{acc_easy:.1%}" if not math.isnan(acc_easy) else "-"
-        row["Hard"] = f"{acc_hard:.1%}" if not math.isnan(acc_hard) else "-"
+        easy = sub[~sub["difficult"]]
+        hard = sub[sub["difficult"]]
+        acc_easy = easy["is_correct"].mean() if len(easy) > 0 else float("nan")
+        acc_hard = hard["is_correct"].mean() if len(hard) > 0 else float("nan")
+
+        msp_all = sub["msp"].mean()
+        msp_easy = easy["msp"].mean() if len(easy) > 0 else float("nan")
+        msp_hard = hard["msp"].mean() if len(hard) > 0 else float("nan")
+
+        row["Accuracy"] = f"{acc:.0%}"
+        row["Acc Easy"] = f"{acc_easy:.0%}" if not math.isnan(acc_easy) else "-"
+        row["Acc Hard"] = f"{acc_hard:.0%}" if not math.isnan(acc_hard) else "-"
+        row["Confidence"] = f"{msp_all:.2f}"
+        row["Conf Easy"] = f"{msp_easy:.2f}" if not math.isnan(msp_easy) else "-"
+        row["Conf Hard"] = f"{msp_hard:.2f}" if not math.isnan(msp_hard) else "-"
         row["N"] = len(sub)
         pivot_data.append(row)
 
     if pivot_data:
-        st.dataframe(pd.DataFrame(pivot_data), use_container_width=True, hide_index=True)
+        # Build HTML table with grouped column headers
+        factor_hdrs = [factor_labels.get(c, c) for c in factor_cols]
+        n_factors = len(factor_hdrs)
+
+        html = """<style>
+        .cond-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
+        .cond-table th, .cond-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
+        .cond-table th { color: #8B95A1; font-weight: 500; }
+        .cond-table th.group { border-bottom: 2px solid #2A8C8F; color: #2C3E50; font-weight: 600; }
+        .cond-table td.factor { text-align: left; font-weight: 500; }
+        .cond-table tr:hover { background: #F5F3F1; }
+        </style><table class="cond-table">"""
+
+        # Row 1: group headers
+        html += "<tr>"
+        for h in factor_hdrs:
+            html += f'<th rowspan="2" class="factor">{h}</th>'
+        html += '<th colspan="2" class="group">Overall</th>'
+        html += '<th colspan="2" class="group">Easy</th>'
+        html += '<th colspan="2" class="group">Hard</th>'
+        html += '<th rowspan="2">N</th></tr>'
+
+        # Row 2: sub-headers
+        html += "<tr>"
+        for _ in range(3):
+            html += "<th>Acc</th><th>Conf</th>"
+        html += "</tr>"
+
+        # Data rows
+        for row in pivot_data:
+            html += "<tr>"
+            for h in factor_hdrs:
+                html += f'<td class="factor">{row.get(h, "")}</td>'
+            html += f'<td>{row["Accuracy"]}</td><td>{row["Confidence"]}</td>'
+            html += f'<td>{row["Acc Easy"]}</td><td>{row["Conf Easy"]}</td>'
+            html += f'<td>{row["Acc Hard"]}</td><td>{row["Conf Hard"]}</td>'
+            html += f'<td>{row["N"]}</td>'
+            html += "</tr>"
+
+        html += "</table>"
+        st.markdown(html, unsafe_allow_html=True)
 
     # Signals table from CSV
     if signals_df is not None and not signals_df.empty:
@@ -601,30 +744,20 @@ def _wilson_ci(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, fl
 
 
 def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count: int = 2) -> None:
-    """Binned reliability diagram + sharpness histogram (shared x-axis)."""
-    from plotly.subplots import make_subplots
-
+    """Binned reliability diagram — clean lines, no bin count panel."""
     df_valid = df[(df["num_queries"] > 0) & df["is_correct"].notna()].copy()
     if df_valid.empty:
         st.info("No data for calibration.")
         return
 
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.7, 0.3],
-        vertical_spacing=0.06,
-        subplot_titles=["Reliability", "Bin Counts"],
-    )
+    fig = go.Figure()
 
-    # Perfect calibration diagonal (top panel)
+    # Perfect calibration diagonal
     fig.add_trace(go.Scatter(
         x=[0.25, 1], y=[0.25, 1], mode="lines",
         line=dict(color=GRAY_LIGHT, dash="dash", width=1),
-        name="Perfect", showlegend=True,
-    ), row=1, col=1)
-
-    # Distinct colors for each run (cycle through a palette)
-    run_palette = [TEAL, ROSE, DEEP_BLUE, GOLD, DARK_TEAL, SLATE, CHARCOAL, "#3A8A8F"]
+        name="Perfect calibration", showlegend=True,
+    ))
 
     run_names = sorted(df_valid["run_name"].unique())
     for ri, run_name in enumerate(run_names):
@@ -632,7 +765,7 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
         if len(sub) < 5:
             continue
 
-        color = run_palette[ri % len(run_palette)]
+        color = PLOT_COLORS[ri % len(PLOT_COLORS)]
 
         # Build clean label from config
         cfg = _extract_config_head(selected_paths.get(
@@ -643,7 +776,7 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
         msp_vals = sub["msp"].values
         correct_vals = sub["is_correct"].astype(float).values
 
-        # Fixed bins across 0.25–1.0 range
+        # Fixed bins across 0.25–1.0
         lo, hi = 0.25, 1.0
         bin_edges = np.linspace(lo, hi, n_bins + 1)
 
@@ -658,8 +791,8 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
                 mask = (msp_vals >= bin_edges[b]) & (msp_vals <= bin_edges[b + 1])
             n_in_bin = mask.sum()
             if n_in_bin < min_count:
-                bin_centers.append(float((bin_edges[b] + bin_edges[b + 1]) / 2))
                 bin_accs.append(float("nan"))
+                bin_centers.append(float((bin_edges[b] + bin_edges[b + 1]) / 2))
                 bin_counts.append(int(n_in_bin))
                 continue
 
@@ -674,38 +807,26 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
             if not math.isnan(acc) and total_n > 0:
                 ece += (n / total_n) * abs(acc - conf)
 
-        # Filter NaN bins
-        valid = [(c, a, n) for c, a, n in zip(bin_centers, bin_accs, bin_counts) if not math.isnan(a)]
+        # Plot valid bins as a clean line
+        valid = [(c, a) for c, a in zip(bin_centers, bin_accs) if not math.isnan(a)]
         if valid:
-            plot_x, plot_y, _ = zip(*valid)
-            # Top panel: clean line only
+            plot_x, plot_y = zip(*valid)
             fig.add_trace(go.Scatter(
                 x=list(plot_x), y=list(plot_y),
                 mode="lines",
                 line=dict(color=color, width=2.5),
                 name=f"{label} (ECE={ece:.3f})",
-            ), row=1, col=1)
+            ))
 
-        # Bottom panel: bin counts
-        all_centers = [(bin_edges[b] + bin_edges[b + 1]) / 2 for b in range(n_bins)]
-        fig.add_trace(go.Bar(
-            x=all_centers, y=bin_counts,
-            marker_color=color, opacity=0.5,
-            name=label, showlegend=False,
-            width=(hi - lo) / n_bins * 0.8,
-        ), row=2, col=1)
-
-    fig.update_layout(
-        paper_bgcolor=BG, plot_bgcolor=BG,
-        font=dict(family="Inter, sans-serif", color=TEXT, size=13),
-        margin=dict(l=50, r=30, t=40, b=40),
-        height=550,
+    fig.update_layout(**_base_layout(
+        title="Calibration: Confidence vs Accuracy",
+        xaxis_title="MSP (model confidence)",
+        yaxis_title="Accuracy in bin",
+        xaxis=dict(range=[0.2, 1.02], gridcolor=GRID),
+        yaxis=dict(range=[0, 1.05], gridcolor=GRID),
         legend=dict(x=0.02, y=0.98),
-    )
-    fig.update_xaxes(gridcolor=GRID, range=[0.2, 1.02], row=1, col=1)
-    fig.update_xaxes(gridcolor=GRID, range=[0.2, 1.02], title_text="MSP (model confidence)", row=2, col=1)
-    fig.update_yaxes(gridcolor=GRID, range=[0, 1.05], title_text="Accuracy", row=1, col=1)
-    fig.update_yaxes(gridcolor=GRID, title_text="Count", row=2, col=1)
+        height=450,
+    ))
 
     st.plotly_chart(_round_hover(fig), use_container_width=True)
 
@@ -738,13 +859,15 @@ def tab_explorer() -> None:
 
     row = df_valid[df_valid["label"] == selected].iloc[0]
 
-    # Question text and options
-    st.subheader(f"Q: {row['question_text']}")
+    # Question text and options (compact)
+    st.markdown(f"**Q: {row['question_text']}**", help=None)
     options = row.get("options", [])
     correct = row.get("correct_answer", -1)
+    opts_html = ""
     for i, opt in enumerate(options):
-        marker = " **[CORRECT]**" if i == correct else ""
-        st.write(f"**{ANSWER_LETTERS[i]})** {opt}{marker}")
+        marker = ' <span style="color:#2A8C8F; font-weight:600;">[CORRECT]</span>' if i == correct else ""
+        opts_html += f'<div style="font-size:13px; margin:2px 0;"><b>{ANSWER_LETTERS[i]})</b> {opt}{marker}</div>'
+    st.markdown(opts_html, unsafe_allow_html=True)
 
     # Compact metadata line instead of large metric cards
     diff_label = "Hard" if row["difficult"] else "Easy"
@@ -810,15 +933,156 @@ def tab_explorer() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab 5: Effect Analysis
+# ---------------------------------------------------------------------------
+
+def tab_effects() -> None:
+    """Matched-pair analysis: what does each experimental variable do?"""
+    st.header("Effect Analysis")
+    st.caption("Each delta is the average across matched pairs differing only on that variable.")
+
+    if df.empty or len(df["run_name"].unique()) < 2:
+        st.info("Need at least 2 runs to compare effects.")
+        return
+
+    active = df[df["num_queries"] > 0].copy()
+
+    # Index runs by condition tuple: (prompt_mode, shuffle, context)
+    run_metrics: dict[str, dict] = {}
+    for run_name in active["run_name"].unique():
+        sub = active[active["run_name"] == run_name]
+        valid = sub[sub["is_correct"].notna()]
+        multi = sub[sub["agreement"].notna()]
+        correct_sub = valid[valid["is_correct"] == True]
+        incorrect_sub = valid[valid["is_correct"] == False]
+
+        run_metrics[run_name] = {
+            "accuracy": valid["is_correct"].mean() if len(valid) > 0 else None,
+            "n": len(valid),
+            "msp_correct": correct_sub["msp"].mean() if len(correct_sub) > 0 else None,
+            "msp_incorrect": incorrect_sub["msp"].mean() if len(incorrect_sub) > 0 else None,
+            "agreement_correct": correct_sub["agreement"].mean() if len(correct_sub[correct_sub["agreement"].notna()]) > 0 else None,
+            "agreement_incorrect": incorrect_sub["agreement"].mean() if len(incorrect_sub[incorrect_sub["agreement"].notna()]) > 0 else None,
+            "prompt_mode": sub["prompt_mode"].iloc[0] if "prompt_mode" in sub.columns else "direct",
+            "shuffle": sub["shuffle"].iloc[0] if "shuffle" in sub.columns else True,
+            "context": sub["context_condition"].iloc[0],
+        }
+
+    # --- Summary metrics table (like old dashboard) ---
+    st.subheader("Summary Metrics by Run")
+    summary_rows = []
+    for run_name, m in sorted(run_metrics.items()):
+        # Build label from config
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
+
+        summary_rows.append({
+            "Run": label,
+            "N": m["n"],
+            "Accuracy": f"{m['accuracy']:.1%}" if m["accuracy"] is not None else "-",
+            "MSP (correct)": f"{m['msp_correct']:.3f}" if m["msp_correct"] is not None else "-",
+            "MSP (incorrect)": f"{m['msp_incorrect']:.3f}" if m["msp_incorrect"] is not None else "-",
+            "Agreement (correct)": f"{m['agreement_correct']:.3f}" if m["agreement_correct"] is not None else "-",
+            "Agreement (incorrect)": f"{m['agreement_incorrect']:.3f}" if m["agreement_incorrect"] is not None else "-",
+        })
+
+    if summary_rows:
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # --- Matched pair analysis ---
+    st.subheader("Matched Pair Effects")
+
+    # Detect which variables vary
+    contexts = set(m["context"] for m in run_metrics.values())
+    shuffles = set(m["shuffle"] for m in run_metrics.values())
+    modes = set(m["prompt_mode"] for m in run_metrics.values())
+
+    # Find matched pairs for each variable that has both levels
+    variables = []
+    if len(contexts) > 1:
+        variables.append(("context", "Context: sufficient vs insufficient"))
+    if len(shuffles) > 1:
+        variables.append(("shuffle", "Shuffle: on vs off"))
+    if len(modes) > 1:
+        variables.append(("prompt_mode", "Mode: direct vs CoT"))
+
+    if not variables:
+        st.info("Need runs with contrasting conditions to compute effects.")
+        return
+
+    effect_rows = []
+    for var_name, var_label in variables:
+        # Group runs into pairs differing only on this variable
+        pairs_found = 0
+        acc_deltas = []
+        msp_deltas = []
+
+        run_list = list(run_metrics.items())
+        for i, (name_a, m_a) in enumerate(run_list):
+            for name_b, m_b in run_list[i+1:]:
+                # Check they differ on var_name and match on everything else
+                diff_on_var = m_a[var_name] != m_b[var_name]
+                other_vars = [v for v in ["context", "shuffle", "prompt_mode"] if v != var_name]
+                match_on_rest = all(m_a[v] == m_b[v] for v in other_vars)
+
+                if diff_on_var and match_on_rest:
+                    pairs_found += 1
+                    if m_a["accuracy"] is not None and m_b["accuracy"] is not None:
+                        acc_deltas.append(m_a["accuracy"] - m_b["accuracy"])
+
+        avg_delta = sum(acc_deltas) / len(acc_deltas) if acc_deltas else None
+        effect_rows.append({
+            "Effect": var_label,
+            "Pairs": pairs_found,
+            "Accuracy Delta": f"{avg_delta:+.1%}" if avg_delta is not None else "-",
+        })
+
+    if effect_rows:
+        st.dataframe(pd.DataFrame(effect_rows), use_container_width=True, hide_index=True)
+
+    # --- Per-run distribution comparison ---
+    st.subheader("MSP Distributions by Run")
+    st.caption("Compare how confidence distributions shift across conditions.")
+
+    fig = go.Figure()
+    for ri, run_name in enumerate(sorted(active["run_name"].unique())):
+        sub = active[(active["run_name"] == run_name) & active["msp"].notna()]
+        if len(sub) == 0:
+            continue
+
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
+        color = PLOT_COLORS[ri % len(PLOT_COLORS)]
+
+        fig.add_trace(go.Violin(
+            x=sub["msp"], name=label,
+            line_color=color, fillcolor=color,
+            opacity=0.5, orientation="h",
+            side="positive", meanline_visible=True,
+        ))
+
+    fig.update_layout(**_base_layout(
+        title="MSP Distribution per Run",
+        xaxis_title="MSP", yaxis_title="",
+        height=max(250, 80 * len(active["run_name"].unique())),
+    ))
+    st.plotly_chart(_round_hover(fig), use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 st.title("Pre-Action Uncertainty Quantification")
 st.caption("QuALITY dataset | Context sufficiency experiments")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Progress", "Uncertainty Distributions",
-    "Condition Comparison", "Question Explorer",
+    "Condition Comparison", "Effect Analysis", "Question Explorer",
 ])
 
 with tab1:
@@ -828,4 +1092,6 @@ with tab2:
 with tab3:
     tab_comparison()
 with tab4:
+    tab_effects()
+with tab5:
     tab_explorer()
