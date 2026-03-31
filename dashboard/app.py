@@ -242,50 +242,76 @@ def format_run_label(cfg: dict) -> str:
 
 def compute_timing(file_path: Path, done_q: int, total_q: int,
                     completed_at: str | None = None) -> dict:
-    """Compute elapsed time and ETA.
+    """Compute ETA based on observed question rate between dashboard refreshes.
 
-    Uses the filename timestamp as the start time. For the end time:
-      - If completed_at is set (ISO 8601 from final save), use that.
-      - If still in progress, use the file's mtime.
-      - Never use mtime for finished runs (Dropbox sync keeps updating it).
+    For in-progress runs: stores (count, utc_time) in session_state on each
+    refresh. Computes questions/sec from the delta between the two most recent
+    observations, then extrapolates remaining time. This is robust to
+    interruptions — it only measures the rate the run is *currently* going at,
+    not cumulative time since start.
+
+    For completed runs: shows 'Done' with elapsed if completed_at is available.
     """
+    import time as _time
+
     elapsed_str = ""
     remaining_str = ""
+    rate_str = ""
     pct = done_q / max(total_q, 1)
     finished = pct >= 1.0
 
     try:
-        # Parse start time from filename: ..._YYYYMMDD_HHMMSS.json
-        parts = file_path.stem.split("_")
-        start = None
-        if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
-            try:
+        if finished and completed_at:
+            # Parse start from filename
+            parts = file_path.stem.split("_")
+            if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
                 start = datetime.strptime(parts[-2] + "_" + parts[-1], "%Y%m%d_%H%M%S")
-            except ValueError:
-                pass
-
-        if start is not None:
-            if finished and completed_at:
-                # Use the recorded completion timestamp
                 end = datetime.fromisoformat(completed_at).replace(tzinfo=None)
-                elapsed = (end - start).total_seconds()
-                elapsed_str = _fmt_sec(elapsed)
-                remaining_str = "Done"
-            elif finished:
-                # No completed_at recorded — just show Done
-                remaining_str = "Done"
-            else:
-                # Still running — use UTC now (filename timestamp is UTC)
-                end = datetime.utcnow()
-                elapsed = (end - start).total_seconds()
-                elapsed_str = _fmt_sec(elapsed)
-                if 0 < pct < 1 and elapsed > 0:
-                    remaining = elapsed / pct * (1 - pct)
-                    remaining_str = f"~{_fmt_sec(remaining)}"
+                elapsed_str = _fmt_sec((end - start).total_seconds())
+            remaining_str = "Done"
+        elif finished:
+            remaining_str = "Done"
+        else:
+            # Rate-based ETA from a rolling history of observations
+            now = _time.time()
+            key = f"_rate_hist_{file_path.name}"
+            history = st.session_state.get(key, [])
+
+            # Append current observation, keep last 10
+            history.append((done_q, now))
+            if len(history) > 10:
+                history = history[-10:]
+            st.session_state[key] = history
+
+            # Use the observation closest to 5 minutes ago for a stable rate
+            rate = None
+            for old_count, old_time in history:
+                dt = now - old_time
+                dq = done_q - old_count
+                if dt >= 240 and dq > 0:  # at least ~4min window
+                    rate = dq / dt
+                    break
+            # Fall back to any observation with progress if <5min of history
+            if rate is None:
+                for old_count, old_time in history:
+                    dt = now - old_time
+                    dq = done_q - old_count
+                    if dt > 30 and dq > 0:
+                        rate = dq / dt
+                        break
+
+            if rate is not None and rate > 0:
+                remaining_q = total_q - done_q
+                remaining_sec = remaining_q / rate
+                remaining_str = f"~{_fmt_sec(remaining_sec)}"
+                rate_str = f"{rate * 60:.0f} q/min"
+            elif len(history) < 3:
+                remaining_str = "measuring..."
+            # else: leave as empty (no rate yet, don't show stalled)
     except Exception:
         pass
 
-    return {"pct": pct, "elapsed": elapsed_str, "remaining": remaining_str}
+    return {"pct": pct, "elapsed": elapsed_str, "remaining": remaining_str, "rate": rate_str}
 
 
 def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
@@ -423,6 +449,7 @@ def tab_progress() -> None:
             pass
         timing = compute_timing(fp, done_q, total_q, completed_at=completed_at)
 
+        skipped = done_q - correct - incorrect
         col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
         with col1:
             st.markdown(f"**{label}**")
@@ -432,10 +459,9 @@ def tab_progress() -> None:
         with col3:
             st.metric("Accuracy", f"{acc:.0%}")
         with col4:
-            skipped = done_q - correct - incorrect
-            st.metric("Skipped", skipped)
+            st.metric("Skipped", skipped if skipped > 0 else "-")
         with col5:
-            st.metric("Elapsed", timing["elapsed"] or "-")
+            st.metric("Rate", timing.get("rate") or "-")
         with col6:
             st.metric("ETA", timing["remaining"] or "-")
 
