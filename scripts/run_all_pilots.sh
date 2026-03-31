@@ -49,7 +49,7 @@ STARTED=0
 FAILED=0
 
 for config in "${CONFIGS[@]}"; do
-    run_name=$(grep '^run_name:' "$config" | awk '{print $2}')
+    run_name=$(grep '^run_name:' "$config" | awk '{print $2}' | tr -d '\r')
 
     # Find ALL result files for this run_name, newest first
     # (there may be multiple from interrupted runs)
