@@ -685,7 +685,11 @@ def tab_comparison() -> None:
         row["Conf Easy"] = f"{msp_easy:.2f}" if not math.isnan(msp_easy) else "-"
         row["Conf Hard"] = f"{msp_hard:.2f}" if not math.isnan(msp_hard) else "-"
         row["N"] = len(sub)
+        row["_ctx_sort"] = 0 if "Context" in row and row["Context"] == "Sufficient" else 1
         pivot_data.append(row)
+
+    # Sort: sufficient first, then insufficient
+    pivot_data.sort(key=lambda r: r.pop("_ctx_sort", 0))
 
     if pivot_data:
         # Build HTML table with grouped column headers
@@ -873,51 +877,36 @@ def tab_explorer() -> None:
         st.info("No questions with valid queries.")
         return
 
-    df_valid["label"] = (
-        df_valid["question_id"].str[:20] + " | " +
-        df_valid["question_text"].str[:50] + " | " +
-        df_valid["context_condition"]
-    )
-
-    selected = st.selectbox("Select a question", df_valid["label"].unique())
-    if not selected:
+    # Build dropdown by unique question (not per-run)
+    q_info = df_valid.drop_duplicates("question_id")[["question_id", "question_text", "difficult"]].copy()
+    q_info["label"] = q_info["question_id"].str[:20] + " | " + q_info["question_text"].str[:60]
+    selected_label = st.selectbox("Select a question", q_info["label"].values)
+    if not selected_label:
         return
 
-    row = df_valid[df_valid["label"] == selected].iloc[0]
+    qid = q_info[q_info["label"] == selected_label]["question_id"].iloc[0]
+    all_rows = df_valid[df_valid["question_id"] == qid]
+    first = all_rows.iloc[0]
 
-    # Question text and options (compact)
-    st.markdown(f"**Q: {row['question_text']}**", help=None)
-    options = row.get("options", [])
-    correct = row.get("correct_answer", -1)
+    # --- Question header (shared across runs) ---
+    st.markdown(f"**Q: {first['question_text']}**")
+    options = first.get("options", [])
+    correct = first.get("correct_answer", -1)
+    diff_label = "Hard" if first["difficult"] else "Easy"
     opts_html = ""
     for i, opt in enumerate(options):
         marker = ' <span style="color:#2A8C8F; font-weight:600;">[CORRECT]</span>' if i == correct else ""
         opts_html += f'<div style="font-size:13px; margin:2px 0;"><b>{ANSWER_LETTERS[i]})</b> {opt}{marker}</div>'
     st.markdown(opts_html, unsafe_allow_html=True)
+    st.caption(f"Difficulty: {diff_label} · Article: {first.get('article_id', '?')}")
 
-    # Compact metadata line instead of large metric cards
-    diff_label = "Hard" if row["difficult"] else "Easy"
-    correct_label = "Yes" if row["is_correct"] else "No"
-    agree_str = f'{row["agreement"]:.2f}' if not math.isnan(row["agreement"]) else "-"
-    st.markdown(
-        f"**Difficulty:** {diff_label} · "
-        f"**Context:** {row['context_condition'].capitalize()} · "
-        f"**Answer:** {ANSWER_LETTERS[row['final_answer']]} · "
-        f"**Correct:** {correct_label} · "
-        f"**MSP:** {row['msp']:.3f} · "
-        f"**Agreement:** {agree_str}"
-    )
-
-    # Show article context
+    # --- Article context ---
     article_texts = load_article_texts()
-    article_id = row.get("article_id", "")
+    article_id = first.get("article_id", "")
     article_text = article_texts.get(article_id, "")
     if article_text:
         with st.expander(f"Article context (article_id: {article_id})", expanded=False):
-            truncated = article_text
-            # Use a styled div — st.text uses <pre> which doesn't wrap
-            escaped = truncated.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            # Collapse Gutenberg hard-wrapped lines: single \n → space, \n\n → paragraph break
+            escaped = article_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             paragraphs = escaped.split("\n\n")
             html = "".join(f"<p>{' '.join(p.split())}</p>" for p in paragraphs)
             st.markdown(
@@ -927,35 +916,75 @@ def tab_explorer() -> None:
                 unsafe_allow_html=True,
             )
 
-    # Per-query bar chart
-    query_log = row.get("query_log", [])
-    if query_log:
-        st.subheader("Per-Query Probability Distributions")
-        fig = go.Figure()
-        for qi, ql in enumerate(query_log):
-            probs = ql.get("canonical_probs", [0.25]*4)
-            for li, letter in enumerate(ANSWER_LETTERS):
-                fig.add_trace(go.Bar(
-                    x=[f"Q{qi}"], y=[probs[li] if li < len(probs) else 0],
-                    name=letter if qi == 0 else None,
-                    marker_color=CHOICE_COLORS[li],
-                    showlegend=(qi == 0), legendgroup=letter,
-                ))
-        fig.update_layout(**_base_layout(
-            title="A/B/C/D Probabilities per Query",
-            xaxis_title="Query", yaxis_title="Probability", barmode="stack",
-        ))
-        st.plotly_chart(_round_hover(fig), use_container_width=True)
+    st.divider()
 
-    # Same question across conditions
-    same_q = df_valid[df_valid["question_id"] == row["question_id"]]
-    if len(same_q) > 1:
-        st.subheader("Same Question Across Conditions")
-        for _, other in same_q.iterrows():
-            ctx = other["context_condition"]
-            ans = ANSWER_LETTERS[other["final_answer"]]
-            correct_str = "Correct" if other["is_correct"] else "Wrong"
-            st.write(f"**{ctx.capitalize()}**: Answer={ans}, MSP={other['msp']:.3f}, {correct_str}")
+    # --- Per-run results ---
+    for ri, (_, row) in enumerate(all_rows.iterrows()):
+        # Build run label
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == row["run_name"]), ""), None))
+        label = format_run_label(cfg) if cfg else row["run_name"].replace("quality_", "")
+        prompt_mode = cfg.get("prompt_mode", "direct") if cfg else "direct"
+
+        correct_str = "Correct" if row["is_correct"] else "Wrong"
+        correct_color = TEAL if row["is_correct"] else ROSE
+        agree_str = f'{row["agreement"]:.2f}' if not math.isnan(row["agreement"]) else "-"
+
+        st.markdown(
+            f'<div style="font-size:14px; margin-bottom:4px;">'
+            f'<b>{label}</b> · '
+            f'Answer: <b>{ANSWER_LETTERS[row["final_answer"]]}</b> · '
+            f'<span style="color:{correct_color};">{correct_str}</span> · '
+            f'MSP: {row["msp"]:.3f} · '
+            f'Agreement: {agree_str}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        query_log = row.get("query_log", [])
+
+        # Per-query probability bar chart (only if multiple queries)
+        if len(query_log) > 1:
+            fig = go.Figure()
+            for qi, ql in enumerate(query_log):
+                probs = ql.get("canonical_probs", [0.25]*4)
+                for li, letter in enumerate(ANSWER_LETTERS):
+                    fig.add_trace(go.Bar(
+                        x=[f"Q{qi}"], y=[probs[li] if li < len(probs) else 0],
+                        name=letter if qi == 0 else None,
+                        marker_color=CHOICE_COLORS[li],
+                        showlegend=(qi == 0), legendgroup=letter,
+                    ))
+            fig.update_layout(**_base_layout(
+                xaxis_title="Query", yaxis_title="Probability",
+                barmode="stack", height=220, showlegend=True,
+            ))
+            st.plotly_chart(_round_hover(fig), use_container_width=True)
+
+        # Reasoning trace (CoT / think modes)
+        if prompt_mode in ("cot", "cot_structured") or (cfg and cfg.get("think")):
+            traces = [ql.get("thinking_trace", "") for ql in query_log if ql.get("thinking_trace")]
+            if traces:
+                with st.expander("Reasoning trace", expanded=False):
+                    # Show first query's reasoning (they're all for the same question)
+                    trace_text = traces[0]
+                    escaped = trace_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    paras = escaped.split("\n\n")
+                    html = "".join(f"<p>{' '.join(p.split())}</p>" for p in paras)
+                    st.markdown(
+                        f'<div style="font-size:13px; line-height:1.5; max-height:400px; '
+                        f'overflow-y:auto; color:#4a5568;">{html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    # Show pass1 answer if available
+                    pass1 = query_log[0].get("pass1_answer", "")
+                    if pass1:
+                        st.caption(f"Pass 1 (free) answer: **{pass1}** · Pass 2 (logprob) answer: **{ANSWER_LETTERS[row['final_answer']]}**")
+
+        if ri < len(all_rows) - 1:
+            st.divider()
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1061,7 @@ def tab_effects() -> None:
     if len(shuffles) > 1:
         variables.append(("shuffle", "Shuffle: on vs off"))
     if len(modes) > 1:
-        variables.append(("prompt_mode", "Mode: direct vs CoT"))
+        variables.append(("prompt_mode", "Mode: CoT vs direct"))
 
     if not variables:
         st.info("Need runs with contrasting conditions to compute effects.")

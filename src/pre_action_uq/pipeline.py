@@ -205,18 +205,21 @@ def build_prompt(
     options: list[str],
     article_text: str,
     answer_permutation: list[int],
+    prompt_mode: str = "direct",
 ) -> str:
     """Construct an MCQ prompt with article context.
 
-    The output ends with "Answer:" — the model's next token is the
-    answer letter. The chat template is applied later in the inference
-    layer (generate_with_logprobs wraps this in _build_chat_prompt).
+    For direct mode: ends with "Answer:" for single-token extraction.
+    For CoT mode: adds reasoning instructions that explicitly forbid
+    naming the answer letter in the reasoning (prevents leaking the
+    answer to Pass 2 of the two-pass pipeline).
 
     Args:
         question_text: The question stem.
         options: Answer texts in canonical order (index 0-3).
         article_text: The passage to read.
         answer_permutation: Display position → canonical index.
+        prompt_mode: "direct" or "cot".
 
     Returns:
         Formatted prompt ending with "Answer:".
@@ -227,13 +230,25 @@ def build_prompt(
         letter = ANSWER_LETTERS[display_pos]
         choice_lines.append(f"{letter}) {options[canonical_idx]}")
 
-    return (
-        "Read the following passage and answer the question.\n\n"
-        f"Passage:\n{article_text}\n\n"
-        f"Question: {question_text}\n\n"
-        + "\n".join(choice_lines)
-        + "\n\nAnswer:"
-    )
+    if prompt_mode == "cot":
+        return (
+            "Read the following passage and answer the question.\n\n"
+            f"Passage:\n{article_text}\n\n"
+            f"Question: {question_text}\n\n"
+            + "\n".join(choice_lines)
+            + "\n\n"
+            "BE CONCISE. 3-4 bullet points of reasoning only "
+            "-- do NOT name the answer letter in your reasoning.\n\n"
+            "End with: Answer: X"
+        )
+    else:
+        return (
+            "Read the following passage and answer the question.\n\n"
+            f"Passage:\n{article_text}\n\n"
+            f"Question: {question_text}\n\n"
+            + "\n".join(choice_lines)
+            + "\n\nAnswer:"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +484,7 @@ def run_single_question(
             question.options,
             article_text,
             perm,
+            prompt_mode=config.prompt_mode,
         )
         prompts.append(prompt)
         paraphrase_indices.append(qn)
