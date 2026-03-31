@@ -1,28 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "bayesian-uq"
+name = "pre-action-uq"
 version = "0.1.0"
-description = "Black-box Bayesian uncertainty quantification for LLM outputs"
-readme = "README.md"
+description = "Pre-action uncertainty quantification for RAG-augmented LLMs"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.84.0",
-    "datasets>=4.6.1",
-    "jupyter>=1.1.1",
-    "numpy>=2.2.6",
-    "orjson>=3.10",
-    "plotly>=6.6.0",
+    "llama-cpp-python",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "pandas",
     "pydantic>=2.0",
-    "pyyaml>=6.0",
-    "requests>=2.32.5",
-    "scikit-learn>=1.7.2",
-    "scipy>=1.15.3",
-    "streamlit>=1.55.0",
-    "streamlit-autorefresh>=1.0.1",
+    "pyyaml",
+    "orjson",
+    "tqdm",
+    "matplotlib",
+    "plotly",
+    "anthropic",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ipython",
+]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/bayesian_uq"]
+[tool.setuptools.packages.find]
+where = ["src"]

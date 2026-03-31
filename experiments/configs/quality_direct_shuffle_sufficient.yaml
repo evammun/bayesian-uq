@@ -1,0 +1,15 @@
+# QuALITY full: direct mode, sufficient context, shuffle
+# Full dataset (10 queries/q)
+
+run_name: quality_direct_shuffle_sufficient
+model_path: auto
+model_name: "qwen3:8b-q4_K_M"
+think: false
+prompt_mode: direct
+dataset_file: data/quality_all.jsonl
+context_condition: sufficient
+shuffle_options: true
+seed: 42
+temperature: 0.7
+num_permutations: 10
+n_ctx: 12288

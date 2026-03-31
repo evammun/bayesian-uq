@@ -1,124 +1,82 @@
 """
-CLI entry point for running Bayesian UQ v2 experiments.
+CLI entry point for running QuALITY experiments.
 
 Usage:
-    python experiments/run_experiment.py --config experiments/configs/exp1_100q_direct_shuffle_para.yaml
-
-Loads the experiment config, question database, and paraphrase bank,
-then runs the logprob extraction pipeline and saves results to results/.
+    python experiments/run_experiment.py --config experiments/configs/quality_pilot_direct_nothink_sufficient.yaml
+    python experiments/run_experiment.py --config experiments/configs/quality_pilot_direct_nothink_sufficient.yaml --resume results/partial.json
 """
 
+from __future__ import annotations
+
 import argparse
+import json
 import sys
 from pathlib import Path
 
-# Add the project root to the path so we can import bayesian_uq
-# (not needed if the package is installed with `uv pip install -e .`)
+# Add project root to path so src/ is importable
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from bayesian_uq.pipeline import (
-    filter_questions,
-    load_config,
-    load_paraphrases,
-    load_questions,
-    run_experiment,
-    stratified_sample,
-)
+from pre_action_uq.config import ExperimentResult, QuestionResult
+from pre_action_uq.pipeline import load_config, run_experiment
+
+
+def load_resume_data(resume_path: Path) -> tuple[set[str], list[QuestionResult]]:
+    """Load completed question IDs and results from a partial run."""
+    with open(resume_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    completed_ids: set[str] = set()
+    carried_over: list[QuestionResult] = []
+
+    for qr_dict in data.get("question_results", []):
+        qid = qr_dict.get("question_id", "")
+        completed_ids.add(qid)
+        carried_over.append(QuestionResult.model_validate(qr_dict))
+
+    print(f"Loaded {len(completed_ids)} completed questions from {resume_path.name}")
+    return completed_ids, carried_over
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a Bayesian UQ v2 experiment against a local Ollama model",
+        description="Run a QuALITY experiment from a YAML config."
     )
     parser.add_argument(
         "--config", type=Path, required=True,
-        help="Path to experiment config YAML (e.g. experiments/configs/exp1_100q_direct_shuffle_para.yaml)",
-    )
-    parser.add_argument(
-        "--questions", type=Path, default=None,
-        help="Path to questions.json (default: data/questions.json)",
-    )
-    parser.add_argument(
-        "--paraphrases", type=Path, default=None,
-        help="Path to paraphrases.json (default: data/paraphrases.json)",
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=None,
-        help="Output directory for results (default: results/)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility (default: 42)",
+        help="Path to YAML experiment config",
     )
     parser.add_argument(
         "--resume", type=Path, default=None,
-        help="Path to a partial results JSON file to resume from",
+        help="Path to partial result JSON to resume from",
     )
     args = parser.parse_args()
 
-    # Resolve paths relative to project root
-    questions_path = args.questions or project_root / "data" / "questions.json"
-    paraphrases_path = args.paraphrases or project_root / "data" / "paraphrases.json"
-    output_dir = args.output_dir or project_root / "results"
+    # Load config
+    config_path = args.config
+    if not config_path.is_absolute():
+        config_path = project_root / config_path
+    config = load_config(config_path)
 
-    # Load everything
-    config = load_config(args.config)
-    questions = load_questions(questions_path)
-    paraphrases = load_paraphrases(paraphrases_path)
-
-    # Filter to the questions this experiment cares about
-    filtered = filter_questions(questions, config.question_set)
-
-    # Apply max_questions cap if set — uses stratified sampling across subjects
-    if config.max_questions is not None:
-        total_filtered = len(filtered)
-        filtered = stratified_sample(filtered, config.max_questions, seed=config.seed)
-        subjects_in_sample = len({q.subject for q in filtered})
-        print(f"Loaded {len(questions)} questions total, "
-              f"{total_filtered} match question_set='{config.question_set}'")
-        print(f"Stratified sample: {len(filtered)} questions across "
-              f"{subjects_in_sample} subjects (seed={config.seed})")
-    else:
-        print(f"Loaded {len(questions)} questions total, "
-              f"{len(filtered)} match question_set='{config.question_set}'")
-    print()
-
-    if not filtered:
-        print("ERROR: No questions matched the filter. Check your question_set value.")
-        sys.exit(1)
-
-    # Load partial results if resuming
-    completed_ids: set[str] | None = None
-    carried_over_results = None
+    # Resume support
+    completed_ids = None
+    carried_over = None
     if args.resume:
-        import json
-        from bayesian_uq.config import QuestionResult
+        resume_path = args.resume
+        if not resume_path.is_absolute():
+            resume_path = project_root / resume_path
+        completed_ids, carried_over = load_resume_data(resume_path)
 
-        if not args.resume.exists():
-            print(f"ERROR: Resume file not found: {args.resume}")
-            sys.exit(1)
+    # Output directory
+    output_dir = project_root / "results"
 
-        with open(args.resume, encoding="utf-8") as f:
-            partial_data = json.load(f)
-
-        raw_results = partial_data.get("question_results", [])
-        carried_over_results = [QuestionResult(**r) for r in raw_results]
-        completed_ids = {r.question_id for r in carried_over_results}
-        print(f"Resuming from {args.resume.name}: "
-              f"{len(carried_over_results)} completed questions loaded")
-        print()
-
-    # Run the experiment (use config seed, CLI --seed overrides if provided)
-    seed = args.seed if args.seed != 42 else config.seed
+    # Run experiment
     run_experiment(
         config=config,
-        questions=filtered,
-        paraphrases=paraphrases,
         output_dir=output_dir,
-        seed=seed,
         completed_ids=completed_ids,
-        carried_over_results=carried_over_results,
+        carried_over_results=carried_over,
+        resume_file=resume_path if args.resume else None,
     )
 
 

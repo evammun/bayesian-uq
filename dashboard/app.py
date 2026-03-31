@@ -1,23 +1,22 @@
 """
-Streamlit dashboard for Bayesian UQ v2 (logprob-based) results.
+Streamlit dashboard for Pre-Action UQ (QuALITY-based) results.
 
 Aesthetic: "Fountain Pen in a Lab Coat" — Playfair Display for titles,
 Inter for body text, teal/rose palette on warm off-white.
 
 Tabs:
-  1. Progress — per-run status cards
-  2. Probability Distributions — confidence, agreement, mean probs
-  3. Condition Comparison — accuracy by subject, AUROC
-  4. Effect Analysis — factorial main effects
-  5. Question Explorer — drill into individual questions
+  1. Progress — one-line-per-run status with timing
+  2. Uncertainty Distributions — MSP, agreement, entropy overlaid by condition
+  3. Condition Comparison — 2×2 accuracy, AUROC, calibration curves
+  4. Question Explorer — drill into individual questions
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
-import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -26,14 +25,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_ROOT / "results"
-QUESTIONS_PATH = PROJECT_ROOT / "data" / "questions.json"
+SIGNALS_CSV = PROJECT_ROOT / "analysis" / "signals.csv"
 
 # ---------------------------------------------------------------------------
 # Palette
@@ -48,19 +46,18 @@ ROSE = "#B85C5C"
 GOLD = "#EEB127"
 BG = "#FDFCFB"
 TEXT = "#2C3E50"
-GRAY_MID = "#6B7280"
 GRAY_LIGHT = "#8B95A1"
 GRID = "#E8E4E0"
 BORDER = "#E5E0DB"
-RUN_COLORS = [TEAL, DEEP_BLUE, DARK_TEAL, CHARCOAL, SLATE, "#3A8A8F"]
-CHOICE_COLORS = [TEAL, DEEP_BLUE, "#C9A227", ROSE]  # A, B, C, D
+CONDITION_COLORS = {"sufficient": TEAL, "insufficient": ROSE}
 ANSWER_LETTERS = ["A", "B", "C", "D"]
+CHOICE_COLORS = [TEAL, DEEP_BLUE, GOLD, ROSE]
 
 # ---------------------------------------------------------------------------
 # Page config + CSS
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Bayesian UQ v2", layout="wide")
+st.set_page_config(page_title="Pre-Action UQ", layout="wide")
 
 st.markdown("""
 <style>
@@ -74,231 +71,61 @@ h2, h3, h4 { font-family: 'Inter', sans-serif !important; font-weight: 500 !impo
 [data-testid="stMetricLabel"] { font-size: 13px; text-transform: uppercase;
     letter-spacing: 0.04em; color: #8B95A1; }
 [data-testid="stMetricValue"] { font-size: 28px; font-weight: 400; }
-.stProgress > div > div > div { background-color: #2D7F83; }
 [data-testid="stSidebar"] { background-color: #F5F3F1; }
-button[data-baseweb="tab"] { font-weight: 400 !important; }
-button[data-baseweb="tab"][aria-selected="true"] { color: #2D7F83 !important; }
 footer, #MainMenu, [data-testid="stDeployButton"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
+
+
+def _base_layout(**kwargs) -> dict:
+    layout = dict(
+        paper_bgcolor=BG, plot_bgcolor=BG,
+        font=dict(family="Inter, sans-serif", color=TEXT, size=13),
+        margin=dict(l=50, r=30, t=40, b=40),
+        xaxis=dict(gridcolor=GRID, zeroline=False, hoverformat=".2f"),
+        yaxis=dict(gridcolor=GRID, zeroline=False, hoverformat=".2f"),
+    )
+    layout.update(kwargs)
+    return layout
+
+
+def _round_hover(fig: go.Figure) -> go.Figure:
+    """Set hovertemplate on all traces to show values rounded to 2dp."""
+    for trace in fig.data:
+        if trace.hovertemplate is None:
+            if hasattr(trace, "orientation") and getattr(trace, "orientation", None) == "h":
+                trace.hovertemplate = "%{y}: %{x:.2f}<extra>%{fullData.name}</extra>"
+            else:
+                trace.hovertemplate = "%{x:.2f}, %{y:.2f}<extra>%{fullData.name}</extra>"
+    return fig
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _extract_run_name_prefix(stem: str) -> str:
-    """Extract the condition prefix from a result filename, stripping the timestamp.
-
-    Example: 'exp1_full_direct_shuffle_para_20260317_093909' -> 'exp1_full_direct_shuffle_para'
-    This groups original and resumed runs for the same condition together.
-    """
-    # Timestamps are always _YYYYMMDD_HHMMSS at the end
+def _extract_run_prefix(stem: str) -> str:
     parts = stem.split("_")
-    # Walk backwards: strip trailing parts that look like timestamp components
     while parts and parts[-1].isdigit():
         parts.pop()
     return "_".join(parts) if parts else stem
 
 
-def get_result_files() -> list[Path]:
-    """Scan results/ for JSON files, keeping only the newest per condition.
-
-    When a run is resumed with --resume, both the old partial file and the
-    new resumed file exist with different timestamps but the same condition
-    prefix. The resumed file supersedes the partial, so we keep only the
-    most recent file per condition prefix (by mtime).
-    """
-    if not RESULTS_DIR.exists():
-        return []
-    all_files = sorted(RESULTS_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-
-    # Keep only the newest file per condition prefix
-    seen_prefixes: dict[str, Path] = {}
-    deduped: list[Path] = []
-    for fp in all_files:
-        prefix = _extract_run_name_prefix(fp.stem)
-        if prefix not in seen_prefixes:
-            seen_prefixes[prefix] = fp
-            deduped.append(fp)
-    return deduped
-
-
-try:
-    import orjson as _json_fast
-    def _try_load_json(path: str) -> dict | None:
-        """Try to load a JSON file once using orjson for speed."""
-        try:
-            with open(path, "rb") as f:
-                return _json_fast.loads(f.read())
-        except (_json_fast.JSONDecodeError, OSError):
-            return None
-except ImportError:
-    def _try_load_json(path: str) -> dict | None:  # type: ignore[misc]
-        """Try to load a JSON file once. Returns None on any error."""
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return None
-
-
-def _strip_unused_fields(data: dict) -> dict:
-    """Remove fields the dashboard never reads to reduce memory and parse overhead.
-
-    The dashboard only uses these per-query fields:
-      canonical_probs, canonical_answer, query_text
-    Everything else is for the analysis pipeline or audit trail — safe to drop.
-    For an 11-query × 5,000-question run this cuts in-memory size from ~280MB
-    to roughly ~15MB.
-    """
-    _KEEP_QUERY_KEYS = {"canonical_probs", "canonical_answer", "query_text", "raw_response"}
-    for qr in data.get("question_results", []):
-        qr.pop("answer_counts", None)
-        for ql in qr.get("query_log", []):
-            drop_keys = [k for k in ql if k not in _KEEP_QUERY_KEYS]
-            for k in drop_keys:
-                del ql[k]
-    return data
-
-
-# Session-state cache TTL for result files (seconds). Should be >= the
-# auto-refresh interval (60s) so that user interactions between refreshes
-# get instant cache hits, and each auto-refresh triggers at most one reload.
-_RESULT_CACHE_TTL = 60
-
-
-def _fast_file_stats(path: str) -> dict | None:
-    """Extract question count, accuracy, and avg queries from a result file
-    without JSON parsing — pure byte-counting on the raw file.
-
-    Returns dict with keys: count, correct, incorrect, avg_queries (approx).
-    Returns None if the file can't be read.
-    """
+def _fast_file_stats(path: Path) -> dict:
+    """Byte-count stats without full JSON parse."""
     try:
-        with open(path, "rb") as f:
-            content = f.read()
+        content = path.read_bytes()
     except OSError:
-        return None
-
-    count = content.count(b'"question_id"')
-    correct = content.count(b'"correct": true')
-    incorrect = content.count(b'"correct": false')
-    # num_queries appears once per question result as "num_queries": N
-    # Count total query_log entries via "query_number" (one per query)
-    total_queries = content.count(b'"query_number"')
-    avg_queries = total_queries / count if count else 0
-
+        return {"count": 0, "correct": 0, "incorrect": 0}
     return {
-        "count": count,
-        "correct": correct,
-        "incorrect": incorrect,
-        "total_queries": total_queries,
-        "avg_queries": avg_queries,
+        "count": content.count(b'"question_id"'),
+        "correct": content.count(b'"correct": true'),
+        "incorrect": content.count(b'"correct": false'),
     }
 
 
-def _count_results_fast(path: str) -> int | None:
-    """Count question_results in a JSON file without parsing the whole thing."""
-    stats = _fast_file_stats(path)
-    return stats["count"] if stats else None
-
-
-def load_result_file(path: str) -> dict | None:
-    """Load a result JSON with stale-while-revalidate caching.
-
-    Strategy:
-      1. If we have a cached copy younger than _RESULT_CACHE_TTL, return it.
-      2. On TTL expiry, check the file's mtime. If unchanged since last load,
-         bump the cache timestamp and return the old data (no re-parse).
-      3. If mtime changed, do a fast byte-count to get the new question count.
-         If the count hasn't changed (file was rewritten but same data), skip
-         the re-parse. If it has changed, only re-parse if enough new results
-         have accumulated (_REPARSE_THRESHOLD) — otherwise patch the cached
-         count and serve stale data. This avoids re-parsing 300MB files on
-         every auto-refresh while a run is in progress.
-      4. If the fresh load fails (file mid-write / locked), return the last
-         known good copy — the run never disappears from the dashboard.
-
-    Uses st.session_state instead of @st.cache_data because:
-      - We need stale-while-revalidate (serve old data on failure)
-      - No pickle serialisation overhead for large dicts
-      - Full control over TTL and invalidation
-    """
-    data_key = f"_rc_data_{path}"
-    ts_key = f"_rc_ts_{path}"
-    mtime_key = f"_rc_mtime_{path}"
-    count_key = f"_rc_count_{path}"
-
-    now = time.time()
-    cached_data = st.session_state.get(data_key)
-    cached_ts = st.session_state.get(ts_key, 0)
-    cached_mtime = st.session_state.get(mtime_key, 0)
-    cached_count = st.session_state.get(count_key, 0)
-
-    # Cache hit — return without touching the filesystem
-    if cached_data is not None and (now - cached_ts) < _RESULT_CACHE_TTL:
-        return cached_data
-
-    # TTL expired — check if the file has actually changed before re-parsing
-    try:
-        current_mtime = Path(path).stat().st_mtime
-    except OSError:
-        return cached_data  # file inaccessible, serve stale
-
-    if cached_data is not None and current_mtime == cached_mtime:
-        # File unchanged — bump cache timestamp, skip the expensive re-parse
-        st.session_state[ts_key] = now
-        return cached_data
-
-    # File changed — do a fast byte-count to see how many results exist now.
-    # Only trigger a full re-parse if enough new results have accumulated
-    # (500 questions ≈ 10% of a full run). This prevents re-parsing 300MB+
-    # files every 30s while a run is in progress.
-    _REPARSE_THRESHOLD = 500
-    current_count = _count_results_fast(path)
-    if (
-        cached_data is not None
-        and current_count is not None
-        and current_count - cached_count < _REPARSE_THRESHOLD
-    ):
-        # Not enough new data to justify a full re-parse — just update the
-        # count so the Progress tab shows updated numbers, and serve stale
-        st.session_state[ts_key] = now
-        st.session_state[mtime_key] = current_mtime
-        st.session_state[count_key] = current_count
-        # Patch the cached data's question count for the Progress tab
-        cached_data["_fast_count"] = current_count
-        return cached_data
-
-    # Enough new results (or first load) — do a full re-parse
-    fresh = _try_load_json(path)
-    if fresh is not None:
-        fresh = _strip_unused_fields(fresh)
-        fresh_count = len(fresh.get("question_results", []))
-        fresh["_fast_count"] = fresh_count
-        st.session_state[data_key] = fresh
-        st.session_state[ts_key] = now
-        st.session_state[mtime_key] = current_mtime
-        st.session_state[count_key] = fresh_count
-        return fresh
-
-    # Fresh load failed — serve stale data if we have it (run stays visible)
-    if cached_data is not None:
-        return cached_data
-
-    # First load and file is unreadable — nothing we can do
-    return None
-
-
-def _extract_config_from_file(path: str) -> dict | None:
-    """Read only the config from a result JSON without loading full question_results.
-
-    Result files can be 100MB+. This reads just enough to extract the config
-    object (always in the first 4KB), avoiding the cost of deserialising
-    thousands of question results. Single attempt, no blocking retries —
-    if this fails, the caller falls back to _config_from_filename().
-    """
+def _extract_config_head(path: Path) -> dict | None:
+    """Read config from the first 4KB of a result JSON."""
     try:
         with open(path, encoding="utf-8") as f:
             head = f.read(4096)
@@ -308,7 +135,6 @@ def _extract_config_from_file(path: str) -> dict | None:
         brace_start = head.find("{", start)
         if brace_start == -1:
             return None
-        # Walk forward counting braces to find the matching close
         depth = 0
         for i in range(brace_start, len(head)):
             if head[i] == "{":
@@ -317,281 +143,63 @@ def _extract_config_from_file(path: str) -> dict | None:
                 depth -= 1
                 if depth == 0:
                     return json.loads(head[brace_start:i + 1])
-    except (OSError, json.JSONDecodeError):
+    except Exception:
         pass
     return None
 
 
-def _config_from_filename(stem: str) -> dict | None:
-    """Infer a minimal config dict from the result filename.
-
-    Filenames follow the pattern: exp1_{scale}_{prompt}_{shuffle}_{para}_{timestamp}
-    e.g. "exp1_full_direct_shuffle_nopara_20260316_134902"
-
-    This is a last-resort fallback when the file can't be read (mid-write).
-    The resulting dict has enough fields for format_run_name() to work.
-    """
-    parts = stem.lower().split("_")
-    cfg: dict = {"model": "qwen3:8b-q4_K_M"}  # default model
-
-    # Prompt mode
-    if "direct" in parts:
-        cfg["prompt_mode"] = "direct"
-    elif "cotstruct" in parts:
-        cfg["prompt_mode"] = "cot_structured"
-    elif "cot" in parts:
-        cfg["prompt_mode"] = "cot"
-
-    # Shuffle
-    cfg["shuffle_choices"] = "noshuffle" not in parts
-
-    # Paraphrases
-    cfg["use_paraphrases"] = "nopara" not in parts
-
-    # Scale (max_questions)
-    if "100q" in parts:
-        cfg["max_questions"] = 100
-
-    return cfg if "prompt_mode" in cfg else None
+def get_result_files() -> list[Path]:
+    if not RESULTS_DIR.exists():
+        return []
+    all_files = sorted(RESULTS_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    seen: dict[str, Path] = {}
+    deduped: list[Path] = []
+    for fp in all_files:
+        prefix = _extract_run_prefix(fp.stem)
+        if prefix not in seen:
+            seen[prefix] = fp
+            deduped.append(fp)
+    return deduped
 
 
-@st.cache_data(ttl=300)
-def load_question_db() -> dict[str, dict]:
-    """Load questions.json keyed by question_id."""
-    if not QUESTIONS_PATH.exists():
-        return {}
-    with open(QUESTIONS_PATH, encoding="utf-8") as f:
-        data = json.load(f)
-    return {q["question_id"]: q for q in data}
-
-
-# ---------------------------------------------------------------------------
-# Run name formatting
-# ---------------------------------------------------------------------------
-
-def _parse_model_str(cfg: dict) -> str:
-    """Human-readable model string from config."""
-    model = cfg.get("model", "unknown")
-    name = model.split(":")[0] if ":" in model else model
-    family = name.capitalize()
-    size = ""
-    m = re.search(r"(\d+)[bB]", model)
-    if m:
-        size = f" {m.group(1)}B"
-    quant = ""
-    m = re.search(r"(q\d+)", model, re.IGNORECASE)
-    if m:
-        quant = f" {m.group(1).upper()}"
-    return f"{family}{size}{quant}"
-
-
-def format_run_name(cfg: dict) -> str:
-    """Human-readable run label: 'Qwen3 8B Q4 · direct · shuffle on · para on · 100q'"""
-    parts = [_parse_model_str(cfg)]
-    pm = cfg.get("prompt_mode", "direct")
-    if pm != "direct":
-        parts.append("CoT" if pm == "cot" else "CoT-struct")
-    else:
-        parts.append("direct")
-    if cfg.get("think", False):
-        parts.append("think on")
-    parts.append("shuffle on" if cfg.get("shuffle_choices", True) else "shuffle off")
-    parts.append("para on" if cfg.get("use_paraphrases", True) else "para off")
-    mq = cfg.get("max_questions")
-    if mq:
-        parts.append(f"{mq}q")
-    return " · ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Subject categories
-# ---------------------------------------------------------------------------
-
-SUBJECT_CATEGORIES = {
-    "STEM": ["math", "physics", "chemistry", "biology", "computer_science",
-             "engineering", "astronomy", "machine_learning", "statistics",
-             "algebra", "conceptual_physics", "electrical_engineering",
-             "abstract_algebra", "college_mathematics", "high_school_mathematics",
-             "elementary_mathematics", "college_physics", "high_school_physics",
-             "high_school_chemistry", "college_chemistry", "college_biology",
-             "high_school_biology", "high_school_computer_science",
-             "college_computer_science", "high_school_statistics"],
-    "Medical": ["anatomy", "clinical_knowledge", "medicine", "nutrition",
-                "virology", "human_aging", "medical_genetics"],
-    "Professional": ["professional", "accounting", "marketing", "management", "law"],
-    "Social Science": ["economics", "econometrics", "geography", "government",
-                       "politics", "sociology", "psychology", "public_relations",
-                       "business_ethics", "international_law", "jurisprudence",
-                       "human_sexuality", "us_foreign_policy", "security_studies",
-                       "computer_security", "microeconomics", "macroeconomics",
-                       "high_school_macroeconomics", "high_school_microeconomics",
-                       "high_school_government_and_politics", "high_school_geography",
-                       "high_school_psychology"],
-    "Humanities": ["history", "philosophy", "world_religions", "prehistory",
-                   "logical_fallacies", "formal_logic", "moral",
-                   "high_school_european_history", "high_school_us_history",
-                   "high_school_world_history", "philosophy", "moral_scenarios",
-                   "moral_disputes"],
-    "Other": [],
-}
-
-
-def get_category(subject: str) -> str:
-    """Map a subject string to one of 6 broad categories."""
-    s = subject.lower().replace(" ", "_")
-    for cat, keywords in SUBJECT_CATEGORIES.items():
-        if cat == "Other":
-            continue
-        for kw in keywords:
-            if kw in s:
-                return cat
-    return "Other"
-
-
-# ---------------------------------------------------------------------------
-# DataFrame builder
-# ---------------------------------------------------------------------------
-
-def build_dataframe(run_data: dict) -> pd.DataFrame:
-    """Build a DataFrame from a run's question_results."""
-    qr_list = run_data.get("question_results", [])
-    if not qr_list:
-        return pd.DataFrame()
-
-    rows = []
-    for qr in qr_list:
-        mean_probs = qr.get("mean_probs", [])
-        num_queries = qr.get("num_queries", 0)
-
-        # Per-query agreement: fraction where argmax matches final_answer
-        final_ans = qr.get("final_answer", 0)
-        query_log = qr.get("query_log", [])
-        if num_queries > 1:
-            agree_count = sum(
-                1 for ql in query_log
-                if ql.get("canonical_answer") == final_ans
-            )
-            agreement = agree_count / num_queries
-        else:
-            agreement = None  # meaningless with 1 query
-
-        # Confidence = max(mean_probs)
-        confidence = max(mean_probs) if mean_probs else 0.0
-
-        rows.append({
-            "question_id": qr["question_id"],
-            "num_queries": num_queries,
-            "final_answer": final_ans,
-            "correct": qr.get("correct"),
-            "mean_probs": mean_probs,
-            "confidence": confidence,
-            "agreement": agreement,
-        })
-
-    df = pd.DataFrame(rows)
-
-    # Add subject from question DB
-    qdb = load_question_db()
-    df["subject"] = df["question_id"].map(lambda qid: qdb.get(qid, {}).get("subject", "unknown"))
-    df["category"] = df["subject"].map(get_category)
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Metric helpers
-# ---------------------------------------------------------------------------
-
-def compute_auroc(df: pd.DataFrame) -> float | None:
-    """AUROC using max(mean_probs) as score, correct as label."""
-    valid = df[df["correct"].notna()].copy()
-    if len(valid) < 5:
-        return None
-    y = valid["correct"].astype(int)
-    if y.nunique() < 2:
+def _load_json(path: Path) -> dict | None:
+    try:
+        import orjson
+        with open(path, "rb") as f:
+            return orjson.loads(f.read())
+    except ImportError:
+        pass
+    except Exception:
         return None
     try:
-        from sklearn.metrics import roc_auc_score
-        return float(roc_auc_score(y, valid["confidence"]))
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return None
 
 
-def compute_timing(run_data: dict, file_path: str | None = None) -> dict:
-    """Compute elapsed time and progress."""
-    cfg = run_data.get("config", {})
-    # Use the fast byte-count if available (updated every refresh without
-    # re-parsing the full file), fall back to actual result list length
-    done_q = run_data.get("_fast_count") or len(run_data.get("question_results", []))
+@st.cache_data(ttl=30)
+def load_signals() -> pd.DataFrame | None:
+    if SIGNALS_CSV.exists():
+        return pd.read_csv(SIGNALS_CSV)
+    return None
 
-    # Determine total question count: max_questions if set, otherwise count
-    # from the question database filtered by question_set
-    total_q = cfg.get("max_questions")
-    if total_q is None:
-        qdb = load_question_db()
-        question_set = cfg.get("question_set", "all")
-        if question_set == "mmlu_standard":
-            total_q = sum(1 for q in qdb.values() if q.get("variant") is None or q.get("variant") == "valid")
-        elif question_set == "all":
-            total_q = len(qdb)
-        elif question_set == "broken_pairs":
-            total_q = sum(1 for q in qdb.values() if q.get("pair_id") is not None)
-        else:
-            total_q = len(qdb) or done_q  # fallback
-    pct = done_q / max(total_q, 1)
 
-    # Compute elapsed time. Prefer the filename timestamp as the start time
-    # because it's always set at file creation (even for resumed runs, where
-    # the JSON "timestamp" field only covers the resume window).
-    # Note: filename timestamps are local time (from datetime.now()), so we
-    # use naive local time throughout to avoid timezone mismatches.
-    elapsed_str = ""
-    remaining_str = ""
-    if file_path:
-        try:
-            fp = Path(file_path)
-            mtime = fp.stat().st_mtime
-            end = datetime.fromtimestamp(mtime)  # local time, no tz
-
-            # Try to extract start time from filename: ..._YYYYMMDD_HHMMSS.json
-            parts = fp.stem.split("_")
-            start = None
-            if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
-                try:
-                    start = datetime.strptime(
-                        parts[-2] + "_" + parts[-1], "%Y%m%d_%H%M%S"
-                    )  # local time, no tz — matches datetime.now() in pipeline
-                except ValueError:
-                    pass
-
-            # Fall back to JSON timestamp if filename parsing fails
-            if start is None:
-                ts = run_data.get("timestamp", "")
-                if ts:
-                    start = datetime.fromisoformat(ts).replace(tzinfo=None)
-
-            if start is not None:
-                elapsed = (end - start).total_seconds()
-                elapsed_str = _fmt_sec(elapsed)
-                if pct >= 1:
-                    remaining_str = "Done"
-                elif 0 < pct < 1 and elapsed > 0:
-                    remaining = elapsed / pct * (1 - pct)
-                    remaining_str = _fmt_sec(remaining)
-        except Exception:
-            pass
-
-    return {
-        "total_q": total_q,
-        "done_q": done_q,
-        "pct": pct,
-        "elapsed_str": elapsed_str,
-        "remaining_str": remaining_str,
-    }
+@st.cache_data(ttl=300)
+def load_article_texts() -> dict[str, str]:
+    """Load article_id → article_text mapping from the dataset."""
+    dataset_path = PROJECT_ROOT / "data" / "quality_all.jsonl"
+    if not dataset_path.exists():
+        return {}
+    articles: dict[str, str] = {}
+    with open(dataset_path, encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line.strip())
+            articles[obj["article_id"]] = obj["article"]
+    return articles
 
 
 def _fmt_sec(s: float) -> str:
-    """Format seconds as 'Xh Ym Zs'."""
     h, rem = divmod(int(s), 3600)
     m, sec = divmod(rem, 60)
     if h:
@@ -601,890 +209,623 @@ def _fmt_sec(s: float) -> str:
     return f"{sec}s"
 
 
-# ---------------------------------------------------------------------------
-# Plotly helpers
-# ---------------------------------------------------------------------------
+def format_run_label(cfg: dict) -> str:
+    """Human-readable run label."""
+    parts = []
+    pm = cfg.get("prompt_mode", "direct")
+    parts.append("CoT" if pm == "cot" else "direct")
+    if cfg.get("think", False):
+        parts.append("think")
+    else:
+        parts.append("nothink")
+    parts.append("shuffle" if cfg.get("shuffle_options", True) else "noshuffle")
+    parts.append(cfg.get("context_condition", "?"))
+    return " · ".join(parts)
 
-def _fig_layout(fig: go.Figure, title: str = "", height: int = 400) -> go.Figure:
-    """Apply standard layout to a Plotly figure."""
-    fig.update_layout(
-        title=title,
-        title_font=dict(family="Inter", size=16, color=TEXT),
-        font=dict(family="Inter", size=12, color=TEXT),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        height=height,
-        margin=dict(l=50, r=30, t=50, b=40),
-        xaxis=dict(gridcolor=GRID, zerolinecolor=GRID),
-        yaxis=dict(gridcolor=GRID, zerolinecolor=GRID),
-    )
-    return fig
+
+def compute_timing(file_path: Path, done_q: int, total_q: int,
+                    completed_at: str | None = None) -> dict:
+    """Compute elapsed time and ETA.
+
+    Uses the filename timestamp as the start time. For the end time:
+      - If completed_at is set (ISO 8601 from final save), use that.
+      - If still in progress, use the file's mtime.
+      - Never use mtime for finished runs (Dropbox sync keeps updating it).
+    """
+    elapsed_str = ""
+    remaining_str = ""
+    pct = done_q / max(total_q, 1)
+    finished = pct >= 1.0
+
+    try:
+        # Parse start time from filename: ..._YYYYMMDD_HHMMSS.json
+        parts = file_path.stem.split("_")
+        start = None
+        if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
+            try:
+                start = datetime.strptime(parts[-2] + "_" + parts[-1], "%Y%m%d_%H%M%S")
+            except ValueError:
+                pass
+
+        if start is not None:
+            if finished and completed_at:
+                # Use the recorded completion timestamp
+                end = datetime.fromisoformat(completed_at).replace(tzinfo=None)
+                elapsed = (end - start).total_seconds()
+                elapsed_str = _fmt_sec(elapsed)
+                remaining_str = "Done"
+            elif finished:
+                # No completed_at recorded — just show Done
+                remaining_str = "Done"
+            else:
+                # Still running — use UTC now (filename timestamp is UTC)
+                end = datetime.utcnow()
+                elapsed = (end - start).total_seconds()
+                elapsed_str = _fmt_sec(elapsed)
+                if 0 < pct < 1 and elapsed > 0:
+                    remaining = elapsed / pct * (1 - pct)
+                    remaining_str = f"~{_fmt_sec(remaining)}"
+    except Exception:
+        pass
+
+    return {"pct": pct, "elapsed": elapsed_str, "remaining": remaining_str}
+
+
+def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
+    """Convert loaded result dicts to a flat DataFrame."""
+    rows = []
+    for run_name, data in all_data.items():
+        cfg = data.get("config", {})
+        context = cfg.get("context_condition", "unknown")
+        think = cfg.get("think", False)
+        prompt_mode = cfg.get("prompt_mode", "direct")
+        shuffle = cfg.get("shuffle_options", True)
+
+        for qr in data.get("question_results", []):
+            if qr.get("skipped", False) or not qr.get("mean_probs"):
+                continue
+
+            query_log = qr.get("query_log", [])
+            n_queries = len(query_log)
+            mean_probs = qr.get("mean_probs", [0.25] * 4)
+            final_answer = qr.get("final_answer", 0)
+
+            query_probs = [ql.get("canonical_probs", [0.25]*4) for ql in query_log
+                           if len(ql.get("canonical_probs", [])) == 4]
+            if query_probs:
+                per_query_argmax = [int(np.argmax(p)) for p in query_probs]
+                agreement = sum(1 for a in per_query_argmax if a == final_answer) / len(per_query_argmax)
+            else:
+                agreement = float("nan")
+
+            rows.append({
+                "run_name": run_name,
+                "context_condition": context,
+                "think": think,
+                "prompt_mode": prompt_mode,
+                "shuffle": shuffle,
+                "question_id": qr.get("question_id", ""),
+                "article_id": qr.get("article_id", ""),
+                "question_text": qr.get("question_text", ""),
+                "options": qr.get("options", []),
+                "correct_answer": qr.get("correct_answer"),
+                "difficult": qr.get("difficult", False),
+                "final_answer": final_answer,
+                "is_correct": qr.get("correct"),
+                "num_queries": n_queries,
+                "mean_probs": mean_probs,
+                "msp": max(mean_probs) if mean_probs else float("nan"),
+                "agreement": agreement,
+                "query_log": query_log,
+            })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
-st.sidebar.markdown("# Bayesian UQ v2")
+st.sidebar.markdown("# Pre-Action UQ")
 
 result_files = get_result_files()
 if not result_files:
-    st.sidebar.warning("No result files found in results/")
+    st.sidebar.warning("No result files in results/")
+    st.title("Pre-Action Uncertainty Quantification")
+    st.info("No results found. Run experiments first.")
     st.stop()
 
-# Auto-refresh: uses streamlit-autorefresh component which triggers a clean
-# browser-side reload, preserving widget state (unlike st.rerun which doesn't)
-auto_refresh = st.sidebar.toggle("Auto-refresh (60s)", value=False)
+# Auto-refresh
+auto_refresh = st.sidebar.toggle("Auto-refresh (30s)", value=False)
 if auto_refresh:
-    st_autorefresh(interval=60_000, key="auto_refresh_counter")
+    st_autorefresh(interval=30_000, key="auto_refresh_counter")
 
-# Build label → path mapping using lightweight config extraction (not full file load).
-# Falls back to parsing the filename if extraction fails (e.g. file mid-write).
-# NEVER loads the full file here — that's deferred to when the user selects a run.
-label_to_path: dict[str, Path] = {}
+# Build run labels
+run_labels: dict[str, Path] = {}
 for fp in result_files:
-    cfg = _extract_config_from_file(str(fp))
-    if cfg is None:
-        # Fallback: infer config from filename pattern
-        # e.g. "exp1_full_direct_shuffle_nopara_20260316_134902.json"
-        stem = fp.stem
-        cfg = _config_from_filename(stem)
-    if cfg is None or not cfg:
-        continue
-    label = format_run_name(cfg)
-    # Disambiguate if needed
-    if label in label_to_path:
-        label = f"{label} ({fp.stem})"
-    label_to_path[label] = fp
+    cfg = _extract_config_head(fp)
+    if cfg:
+        label = format_run_label(cfg)
+    else:
+        label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
+    run_labels[label] = fp
 
-available_labels = list(label_to_path.keys())
-
-# Persist multiselect across auto-refreshes via session_state.
-# Validate that previously selected runs are still in the available list
-# (a run might temporarily vanish if its label changed, then come back).
-if "selected_runs" not in st.session_state:
-    st.session_state["selected_runs"] = available_labels[:1] if available_labels else []
+# Select all checkbox + multiselect
+select_all = st.sidebar.checkbox("Select all", value=True)
+if select_all:
+    selected_labels = list(run_labels.keys())
 else:
-    valid = set(available_labels)
-    st.session_state["selected_runs"] = [
-        s for s in st.session_state["selected_runs"] if s in valid
-    ]
-
-selected_labels = st.sidebar.multiselect(
-    "Select runs",
-    options=available_labels,
-    key="selected_runs",
-)
-
-# Build lightweight run metadata from config + byte-count (< 1s total).
-# Full file parsing is deferred until a tab actually needs the data.
-runs: list[dict] = []
-for label in selected_labels:
-    fp = label_to_path[label]
-
-    # Config is already extracted for the sidebar label — reuse it
-    cfg = _extract_config_from_file(str(fp)) or _config_from_filename(fp.stem) or {}
-    stats = _fast_file_stats(str(fp))
-    fast_count = stats["count"] if stats else 0
-
-    # Build a minimal data dict for compute_timing (no full parse needed)
-    light_data = {"config": cfg, "question_results": [], "_fast_count": fast_count}
-    timing = compute_timing(light_data, str(fp))
-
-    # Show metadata in sidebar
-    st.sidebar.caption(
-        f"**{label}**  \n"
-        f"Model: {cfg.get('model', '?')} · Prompt: {cfg.get('prompt_mode', '?')} · "
-        f"Shuffle: {'on' if cfg.get('shuffle_choices') else 'off'} · "
-        f"Para: {'on' if cfg.get('use_paraphrases') else 'off'}  \n"
-        f"Questions: {timing['done_q']}/{timing['total_q']}"
+    selected_labels = st.sidebar.multiselect(
+        "Experiment runs", list(run_labels.keys()), default=list(run_labels.keys())
     )
 
-    runs.append({
-        "label": label,
-        "path": fp,
-        "config": cfg,
-        "timing": timing,
-        "stats": stats,
-        # Full data loaded lazily by _get_run_data() below
-    })
+selected_paths = {label: run_labels[label] for label in selected_labels}
 
-if not runs:
-    if selected_labels:
-        st.warning("Selected run(s) could not be loaded — the result file may be "
-                    "mid-write. This should resolve on the next refresh.")
-    else:
-        st.info("Select at least one run to view results.")
-    st.stop()
+# Load selected data
+all_data: dict[str, dict] = {}
+for label, fp in selected_paths.items():
+    data = _load_json(fp)
+    if data:
+        prefix = _extract_run_prefix(fp.stem)
+        all_data[prefix] = data
 
-
-def _get_run_data(run: dict) -> dict | None:
-    """Lazy-load the full result data for a run (cached after first call).
-
-    Tabs that need the full question_results (Distributions, Comparison,
-    Effects, Explorer) call this. The Progress tab doesn't need it at all.
-    """
-    if "raw" not in run:
-        data = load_result_file(str(run["path"]))
-        if data is None:
-            return None
-        run["raw"] = data
-        run["df"] = build_dataframe(data)
-        run["question_results"] = data.get("question_results", [])
-    return run.get("raw")
+df = results_to_df(all_data)
+signals_df = load_signals()
 
 
 # ---------------------------------------------------------------------------
 # Tab 1: Progress
 # ---------------------------------------------------------------------------
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Progress",
-    "Probability Distributions",
-    "Condition Comparison",
-    "Effect Analysis",
-    "Question Explorer",
-])
+def tab_progress() -> None:
+    st.header("Experiment Progress")
 
-with tab1:
-    st.markdown("# Progress")
-    for run in runs:
-        timing = run["timing"]
-        stats = run.get("stats")
+    if not selected_paths:
+        st.info("Select at least one run.")
+        return
 
-        # Accuracy and avg queries from fast byte-count stats
-        if stats and (stats["correct"] + stats["incorrect"]) > 0:
-            total_scored = stats["correct"] + stats["incorrect"]
-            acc_str = f"{stats['correct'] / total_scored:.1%}"
-        else:
-            acc_str = "—"
-        avg_q_str = f"{stats['avg_queries']:.1f}" if stats and stats["avg_queries"] else "—"
+    # One row per run
+    for label, fp in selected_paths.items():
+        cfg = _extract_config_head(fp)
+        stats = _fast_file_stats(fp)
+        total_q = (cfg.get("max_questions") if cfg else None) or 4609
+        done_q = stats["count"]
+        correct = stats["correct"]
+        incorrect = stats["incorrect"]
+        acc = correct / max(correct + incorrect, 1)
+        # Read completed_at from the file head (it's near the top, before question_results)
+        completed_at = None
+        try:
+            with open(fp, encoding="utf-8") as _f:
+                head = _f.read(2048)
+            import re as _re
+            m = _re.search(r'"completed_at":\s*"([^"]+)"', head)
+            if m:
+                completed_at = m.group(1)
+        except Exception:
+            pass
+        timing = compute_timing(fp, done_q, total_q, completed_at=completed_at)
 
-        st.markdown(f"### {run['label']}")
-        cols = st.columns(5)
-        cols[0].metric("Questions", f"{timing['done_q']}/{timing['total_q']}")
-        cols[1].metric("Accuracy", acc_str)
-        cols[2].metric("Avg Queries", avg_q_str)
-        cols[3].metric("Elapsed", timing["elapsed_str"] or "—")
-        cols[4].metric("Remaining", timing["remaining_str"] or "—")
+        col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+        with col1:
+            st.markdown(f"**{label}**")
+            st.progress(timing["pct"])
+        with col2:
+            st.metric("Questions", f"{done_q}/{total_q}")
+        with col3:
+            st.metric("Accuracy", f"{acc:.0%}")
+        with col4:
+            skipped = done_q - correct - incorrect
+            st.metric("Skipped", skipped)
+        with col5:
+            st.metric("Elapsed", timing["elapsed"] or "-")
+        with col6:
+            st.metric("ETA", timing["remaining"] or "-")
 
-        st.progress(timing["pct"])
         st.divider()
 
 
 # ---------------------------------------------------------------------------
-# Helper: ensure full data is loaded for tabs that need it
+# Tab 2: Uncertainty Distributions
 # ---------------------------------------------------------------------------
 
-def _ensure_loaded(runs: list[dict]) -> list[dict]:
-    """Trigger lazy-load for all runs and return only those that loaded OK."""
-    loaded = []
-    for run in runs:
-        if _get_run_data(run) is not None:
-            loaded.append(run)
-    return loaded
+def tab_distributions() -> None:
+    st.header("Uncertainty Distributions")
 
+    if df.empty:
+        st.info("No data.")
+        return
 
-# ---------------------------------------------------------------------------
-# Tab 2: Probability Distributions
-# ---------------------------------------------------------------------------
+    active = df[(df["num_queries"] > 0) & df["is_correct"].notna()].copy()
+    if active.empty:
+        st.info("No valid data.")
+        return
 
-with tab2:
-    st.markdown("# What does the model actually believe?")
-    _ensure_loaded(runs)
+    CORRECT_COLOR = TEAL
+    INCORRECT_COLOR = GOLD
 
-    # Section 2a: Per-query confidence
-    st.markdown("### Per-query confidence (max probability)")
-    st.caption("How peaked are the model's per-query distributions? Correct answers should have higher peak probabilities.")
+    # Context condition selector
+    ctx_options = sorted(active["context_condition"].unique())
+    selected_ctx = st.selectbox("Context condition", ["All"] + ctx_options)
+    if selected_ctx != "All":
+        active = active[active["context_condition"] == selected_ctx]
 
-    for run in runs:
-        qrs = run["question_results"]
-        conf_correct = []
-        conf_incorrect = []
-        for qr in qrs:
-            is_correct = qr.get("correct")
-            for ql in qr.get("query_log", []):
-                probs = ql.get("canonical_probs", [])
-                if probs:
-                    peak = max(probs)
-                    if is_correct is True:
-                        conf_correct.append(peak)
-                    elif is_correct is False:
-                        conf_incorrect.append(peak)
+    # MSP distribution — correct vs incorrect overlay
+    st.subheader("Max Single Probability (MSP)")
+    fig = go.Figure()
+    correct_msp = active[active["is_correct"] == True]["msp"].dropna()
+    incorrect_msp = active[active["is_correct"] == False]["msp"].dropna()
+    if len(correct_msp) > 0:
+        fig.add_trace(go.Histogram(x=correct_msp, name="Correct", histnorm="percent",
+                                   marker_color=CORRECT_COLOR, opacity=0.7, nbinsx=20))
+    if len(incorrect_msp) > 0:
+        fig.add_trace(go.Histogram(x=incorrect_msp, name="Incorrect", histnorm="percent",
+                                   marker_color=INCORRECT_COLOR, opacity=0.7, nbinsx=20))
+    fig.update_layout(**_base_layout(title="MSP: Correct vs Incorrect",
+                                     xaxis_title="MSP", yaxis_title="% of group", barmode="overlay"))
+    st.plotly_chart(_round_hover(fig), use_container_width=True)
 
-        fig = go.Figure()
-        if conf_correct:
-            fig.add_trace(go.Histogram(
-                x=conf_correct, name="Correct", marker_color=TEAL,
-                opacity=0.7, nbinsx=30, histnorm="percent",
-            ))
-        if conf_incorrect:
-            fig.add_trace(go.Histogram(
-                x=conf_incorrect, name="Incorrect", marker_color=GOLD,
-                opacity=0.7, nbinsx=30, histnorm="percent",
-            ))
-        fig.update_layout(barmode="overlay")
-        _fig_layout(fig, title=f"{run['label']} — Per-query max(prob)", height=300)
-        fig.update_yaxes(title="% of group")
-        st.plotly_chart(fig, width="stretch")
+    # Agreement distribution — correct vs incorrect
+    st.subheader("Agreement Rate")
+    fig2 = go.Figure()
+    correct_ag = active[active["is_correct"] == True]["agreement"].dropna()
+    incorrect_ag = active[active["is_correct"] == False]["agreement"].dropna()
+    if len(correct_ag) > 0:
+        fig2.add_trace(go.Histogram(x=correct_ag, name="Correct", histnorm="percent",
+                                    marker_color=CORRECT_COLOR, opacity=0.7, nbinsx=20))
+    if len(incorrect_ag) > 0:
+        fig2.add_trace(go.Histogram(x=incorrect_ag, name="Incorrect", histnorm="percent",
+                                    marker_color=INCORRECT_COLOR, opacity=0.7, nbinsx=20))
+    fig2.update_layout(**_base_layout(title="Agreement: Correct vs Incorrect",
+                                      xaxis_title="Agreement", yaxis_title="% of group", barmode="overlay"))
+    st.plotly_chart(_round_hover(fig2), use_container_width=True)
 
-    # Section 2b: Agreement across paraphrases
-    st.markdown("### Agreement across paraphrases")
-    st.caption("Fraction of queries where argmax matches the final answer. Correct questions should cluster near 1.0.")
-
-    for run in runs:
-        df = run["df"]
-        df_multi = df[df["agreement"].notna()]
-        if df_multi.empty:
-            st.caption(f"{run['label']}: Only single-query results — agreement N/A")
-            continue
-
-        fig = go.Figure()
-        correct_ag = df_multi[df_multi["correct"] == True]["agreement"]
-        incorrect_ag = df_multi[df_multi["correct"] == False]["agreement"]
-        if len(correct_ag):
-            fig.add_trace(go.Histogram(
-                x=correct_ag, name="Correct", marker_color=TEAL,
-                opacity=0.7, nbinsx=20, histnorm="percent",
-            ))
-        if len(incorrect_ag):
-            fig.add_trace(go.Histogram(
-                x=incorrect_ag, name="Incorrect", marker_color=GOLD,
-                opacity=0.7, nbinsx=20, histnorm="percent",
-            ))
-        fig.update_layout(barmode="overlay")
-        _fig_layout(fig, title=f"{run['label']} — Agreement distribution", height=300)
-        fig.update_xaxes(range=[0, 1.05])
-        fig.update_yaxes(title="% of group")
-        st.plotly_chart(fig, width="stretch")
-
-        # Agreement range filter for drill-through
-        ag_range = st.slider(
-            "Filter by agreement", 0.0, 1.0, (0.0, 0.7),
-            key=f"ag_slider_{run['label']}",
-        )
-        filtered = df_multi[
-            (df_multi["agreement"] >= ag_range[0]) &
-            (df_multi["agreement"] <= ag_range[1])
-        ].sort_values("agreement")
-        if not filtered.empty:
-            st.caption(f"{len(filtered)} questions with agreement in [{ag_range[0]:.2f}, {ag_range[1]:.2f}]")
-            display_df = filtered[["question_id", "agreement", "confidence", "correct", "category"]].copy()
-            display_df["agreement"] = display_df["agreement"].map(lambda x: f"{x:.2f}")
-            display_df["confidence"] = display_df["confidence"].map(lambda x: f"{x:.3f}")
-            st.dataframe(display_df, width="stretch", hide_index=True)
-
-    # Section 2c: Mean probability of winning answer
-    st.markdown("### Mean probability of winning answer")
-    st.caption("How decisive is the aggregate across paraphrases?")
-
-    for run in runs:
-        df = run["df"]
-        valid = df[df["correct"].notna()]
-
-        fig = go.Figure()
-        correct_conf = valid[valid["correct"] == True]["confidence"]
-        incorrect_conf = valid[valid["correct"] == False]["confidence"]
-        if len(correct_conf):
-            fig.add_trace(go.Histogram(
-                x=correct_conf, name="Correct", marker_color=TEAL,
-                opacity=0.7, nbinsx=25, histnorm="percent",
-            ))
-        if len(incorrect_conf):
-            fig.add_trace(go.Histogram(
-                x=incorrect_conf, name="Incorrect", marker_color=GOLD,
-                opacity=0.7, nbinsx=25, histnorm="percent",
-            ))
-        fig.update_layout(barmode="overlay")
-        _fig_layout(fig, title=f"{run['label']} — max(mean_probs)", height=300)
-        fig.update_yaxes(title="% of group")
-        st.plotly_chart(fig, width="stretch")
-
-    # Section 2d: Summary metrics table
-    st.markdown("### Summary metrics")
-    summary_rows = []
-    for run in runs:
-        df = run["df"]
-        valid = df[df["correct"].notna()]
-        correct_df = valid[valid["correct"] == True]
-        incorrect_df = valid[valid["correct"] == False]
-
-        multi_q = df[df["agreement"].notna()]
-        correct_multi = multi_q[multi_q["correct"] == True]
-        incorrect_multi = multi_q[multi_q["correct"] == False]
-
-        summary_rows.append({
-            "Run": run["label"],
-            "Accuracy": f"{valid['correct'].mean():.1%}" if len(valid) else "—",
-            "Avg conf (correct)": f"{correct_df['confidence'].mean():.3f}" if len(correct_df) else "—",
-            "Avg conf (incorrect)": f"{incorrect_df['confidence'].mean():.3f}" if len(incorrect_df) else "—",
-            "Avg agreement (correct)": f"{correct_multi['agreement'].mean():.3f}" if len(correct_multi) else "N/A",
-            "Avg agreement (incorrect)": f"{incorrect_multi['agreement'].mean():.3f}" if len(incorrect_multi) else "N/A",
-        })
-
-    if summary_rows:
-        st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+    # Fragile confidence scatter: agreement (x) vs MSP (y)
+    st.subheader("Fragile Confidence: Agreement vs MSP")
+    fig3 = go.Figure()
+    for cond, color in CONDITION_COLORS.items():
+        sub = active[active["context_condition"] == cond].dropna(subset=["agreement", "msp"])
+        for correct_val, symbol, label_suffix in [
+            (True, "circle", "Correct"),
+            (False, "x", "Wrong"),
+        ]:
+            s = sub[sub["is_correct"] == correct_val]
+            if len(s) > 0:
+                fig3.add_trace(go.Scatter(
+                    x=s["agreement"], y=s["msp"], mode="markers",
+                    marker=dict(color=color, symbol=symbol, size=8, opacity=0.7),
+                    name=f"{cond.capitalize()} {label_suffix}",
+                ))
+    fig3.update_layout(**_base_layout(title="Fragile Confidence Space",
+                                      xaxis_title="Agreement", yaxis_title="MSP"))
+    st.plotly_chart(_round_hover(fig3), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
 # Tab 3: Condition Comparison
 # ---------------------------------------------------------------------------
 
-with tab3:
-    st.markdown("# Condition Comparison")
-    _ensure_loaded(runs)
+def tab_comparison() -> None:
+    st.header("Condition Comparison")
 
-    if len(runs) < 2:
-        st.info("Select two or more runs to compare conditions.")
-    else:
-        # Accuracy heatmap by category × run
-        st.markdown("### Accuracy by subject category")
-        categories = ["STEM", "Medical", "Humanities", "Social Science", "Professional", "Other"]
-        heat_data = []
-        for run in runs:
-            df = run["df"]
-            valid = df[df["correct"].notna()]
-            row = {}
-            for cat in categories:
-                cat_df = valid[valid["category"] == cat]
-                row[cat] = cat_df["correct"].mean() if len(cat_df) > 0 else None
-            heat_data.append(row)
+    if df.empty:
+        st.info("No data.")
+        return
 
-        heat_df = pd.DataFrame(heat_data, index=[r["label"] for r in runs])
-        z = heat_df.values.astype(float)
-        text = [[f"{v:.0%}" if not np.isnan(v) else "—" for v in row] for row in z]
+    # Accuracy table — dynamically split by all factors that vary across runs
+    st.subheader("Accuracy by Condition")
+    active = df[df["num_queries"] > 0].copy()
+    if active.empty:
+        st.info("No valid data.")
+        return
 
-        fig = go.Figure(data=go.Heatmap(
-            z=z, x=categories, y=[r["label"] for r in runs],
-            text=text, texttemplate="%{text}", textfont=dict(color="white", size=13),
-            colorscale=[[0, GOLD], [0.5, SLATE], [1, TEAL]],
-            zmin=0, zmax=1,
-            showscale=True,
-            colorbar=dict(title="Accuracy"),
-        ))
-        _fig_layout(fig, height=max(200, 60 * len(runs) + 80))
-        fig.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig, width="stretch")
+    # Detect which factors actually vary (only show columns that differ)
+    factor_cols = []
+    factor_labels = {
+        "prompt_mode": "Mode",
+        "think": "Think",
+        "shuffle": "Shuffle",
+        "context_condition": "Context",
+    }
+    for col, label in factor_labels.items():
+        if col in active.columns and active[col].nunique() > 1:
+            factor_cols.append(col)
 
-        # Key metrics table
-        st.markdown("### Key metrics")
-        metric_rows = []
-        for run in runs:
-            df = run["df"]
-            valid = df[df["correct"].notna()]
-            auroc = compute_auroc(df)
+    # If no factors vary, just show one row
+    if not factor_cols:
+        factor_cols = ["context_condition"]
 
-            multi = df[df["agreement"].notna()]
-            correct_multi = multi[multi["correct"] == True]
-            incorrect_multi = multi[multi["correct"] == False]
+    # Group by the varying factors
+    pivot_data = []
+    for keys, sub in active.groupby(factor_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        if len(sub) == 0:
+            continue
+        row: dict = {}
+        for col, val in zip(factor_cols, keys):
+            label = factor_labels.get(col, col)
+            if isinstance(val, bool):
+                row[label] = "Yes" if val else "No"
+            else:
+                row[label] = str(val).capitalize()
+        acc = sub["is_correct"].mean()
+        acc_easy = sub[~sub["difficult"]]["is_correct"].mean() if (~sub["difficult"]).any() else float("nan")
+        acc_hard = sub[sub["difficult"]]["is_correct"].mean() if sub["difficult"].any() else float("nan")
+        row["Accuracy"] = f"{acc:.1%}"
+        row["Easy"] = f"{acc_easy:.1%}" if not math.isnan(acc_easy) else "-"
+        row["Hard"] = f"{acc_hard:.1%}" if not math.isnan(acc_hard) else "-"
+        row["N"] = len(sub)
+        pivot_data.append(row)
 
-            metric_rows.append({
-                "Run": run["label"],
-                "Accuracy": f"{valid['correct'].mean():.1%}" if len(valid) else "—",
-                "AUROC": f"{auroc:.3f}" if auroc is not None else "—",
-                "Avg agree (correct)": f"{correct_multi['agreement'].mean():.3f}" if len(correct_multi) else "N/A",
-                "Avg agree (incorrect)": f"{incorrect_multi['agreement'].mean():.3f}" if len(incorrect_multi) else "N/A",
-            })
+    if pivot_data:
+        st.dataframe(pd.DataFrame(pivot_data), use_container_width=True, hide_index=True)
 
-        if metric_rows:
-            st.dataframe(pd.DataFrame(metric_rows), width="stretch", hide_index=True)
+    # Signals table from CSV
+    if signals_df is not None and not signals_df.empty:
+        st.subheader("Key Signals by Condition")
+        signal_cols = ["msp", "single_entropy", "agreement", "epistemic",
+                       "mean_confidence", "answer_coverage", "hesitation_mass",
+                       "mean_pairwise_jsd", "confidence_variance"]
+        available = [c for c in signal_cols if c in signals_df.columns]
+
+        if available:
+            summary_rows = []
+            for cond in sorted(signals_df["condition"].unique()):
+                sub = signals_df[signals_df["condition"] == cond]
+                row = {"Condition": cond.replace("quality_pilot_", "")}
+                for col in available:
+                    vals = sub[col].dropna()
+                    row[col] = f"{vals.mean():.3f}" if len(vals) > 0 else "-"
+                summary_rows.append(row)
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # Calibration curves
+    st.subheader("Calibration: Reliability Diagram")
+    st.caption(
+        "Top: binned reliability (mean confidence vs observed accuracy). "
+        "Bottom: bin counts. ECE = weighted mean |accuracy - confidence|."
+    )
+    _plot_calibration_reliability(df)
+
+
+def _wilson_ci(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score confidence interval for a proportion."""
+    if n_total == 0:
+        return 0.0, 1.0
+    p = n_success / n_total
+    denom = 1 + z**2 / n_total
+    centre = (p + z**2 / (2 * n_total)) / denom
+    spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * n_total)) / n_total) / denom
+    return max(0.0, centre - spread), min(1.0, centre + spread)
+
+
+def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count: int = 2) -> None:
+    """Binned reliability diagram + sharpness histogram (shared x-axis)."""
+    from plotly.subplots import make_subplots
+
+    df_valid = df[(df["num_queries"] > 0) & df["is_correct"].notna()].copy()
+    if df_valid.empty:
+        st.info("No data for calibration.")
+        return
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.7, 0.3],
+        vertical_spacing=0.06,
+        subplot_titles=["Reliability", "Bin Counts"],
+    )
+
+    # Perfect calibration diagonal (top panel)
+    fig.add_trace(go.Scatter(
+        x=[0.25, 1], y=[0.25, 1], mode="lines",
+        line=dict(color=GRAY_LIGHT, dash="dash", width=1),
+        name="Perfect", showlegend=True,
+    ), row=1, col=1)
+
+    # Distinct colors for each run (cycle through a palette)
+    run_palette = [TEAL, ROSE, DEEP_BLUE, GOLD, DARK_TEAL, SLATE, CHARCOAL, "#3A8A8F"]
+
+    run_names = sorted(df_valid["run_name"].unique())
+    for ri, run_name in enumerate(run_names):
+        sub = df_valid[df_valid["run_name"] == run_name]
+        if len(sub) < 5:
+            continue
+
+        color = run_palette[ri % len(run_palette)]
+
+        # Build clean label from config
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
+
+        msp_vals = sub["msp"].values
+        correct_vals = sub["is_correct"].astype(float).values
+
+        # Fixed bins across 0.25–1.0 range
+        lo, hi = 0.25, 1.0
+        bin_edges = np.linspace(lo, hi, n_bins + 1)
+
+        bin_centers = []
+        bin_accs = []
+        bin_counts = []
+
+        for b in range(n_bins):
+            if b < n_bins - 1:
+                mask = (msp_vals >= bin_edges[b]) & (msp_vals < bin_edges[b + 1])
+            else:
+                mask = (msp_vals >= bin_edges[b]) & (msp_vals <= bin_edges[b + 1])
+            n_in_bin = mask.sum()
+            if n_in_bin < min_count:
+                bin_centers.append(float((bin_edges[b] + bin_edges[b + 1]) / 2))
+                bin_accs.append(float("nan"))
+                bin_counts.append(int(n_in_bin))
+                continue
+
+            bin_centers.append(float(msp_vals[mask].mean()))
+            bin_accs.append(float(correct_vals[mask].mean()))
+            bin_counts.append(int(n_in_bin))
+
+        # ECE
+        ece = 0.0
+        total_n = sum(bin_counts)
+        for acc, conf, n in zip(bin_accs, bin_centers, bin_counts):
+            if not math.isnan(acc) and total_n > 0:
+                ece += (n / total_n) * abs(acc - conf)
+
+        # Filter NaN bins
+        valid = [(c, a, n) for c, a, n in zip(bin_centers, bin_accs, bin_counts) if not math.isnan(a)]
+        if valid:
+            plot_x, plot_y, _ = zip(*valid)
+            # Top panel: clean line only
+            fig.add_trace(go.Scatter(
+                x=list(plot_x), y=list(plot_y),
+                mode="lines",
+                line=dict(color=color, width=2.5),
+                name=f"{label} (ECE={ece:.3f})",
+            ), row=1, col=1)
+
+        # Bottom panel: bin counts
+        all_centers = [(bin_edges[b] + bin_edges[b + 1]) / 2 for b in range(n_bins)]
+        fig.add_trace(go.Bar(
+            x=all_centers, y=bin_counts,
+            marker_color=color, opacity=0.5,
+            name=label, showlegend=False,
+            width=(hi - lo) / n_bins * 0.8,
+        ), row=2, col=1)
+
+    fig.update_layout(
+        paper_bgcolor=BG, plot_bgcolor=BG,
+        font=dict(family="Inter, sans-serif", color=TEXT, size=13),
+        margin=dict(l=50, r=30, t=40, b=40),
+        height=550,
+        legend=dict(x=0.02, y=0.98),
+    )
+    fig.update_xaxes(gridcolor=GRID, range=[0.2, 1.02], row=1, col=1)
+    fig.update_xaxes(gridcolor=GRID, range=[0.2, 1.02], title_text="MSP (model confidence)", row=2, col=1)
+    fig.update_yaxes(gridcolor=GRID, range=[0, 1.05], title_text="Accuracy", row=1, col=1)
+    fig.update_yaxes(gridcolor=GRID, title_text="Count", row=2, col=1)
+
+    st.plotly_chart(_round_hover(fig), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: Effect Analysis
+# Tab 4: Question Explorer
 # ---------------------------------------------------------------------------
 
-def _extract_condition(cfg: dict) -> dict:
-    """Extract condition flags from a run config."""
-    return {
-        "think": bool(cfg.get("think")),
-        "prompt_mode": cfg.get("prompt_mode", "direct"),
-        "shuffle": bool(cfg.get("shuffle_choices", False)),
-        "para": bool(cfg.get("use_paraphrases", False)),
-    }
+def tab_explorer() -> None:
+    st.header("Question Explorer")
 
+    if df.empty:
+        st.info("No data.")
+        return
 
-def _condition_label(cond: dict, exclude_var: str | None = None) -> str:
-    """Human-readable label from condition flags, excluding one variable."""
-    parts = []
-    if exclude_var != "think":
-        parts.append("think on" if cond["think"] else "think off")
-    if exclude_var != "prompt_mode":
-        pm = cond.get("prompt_mode", "direct")
-        pm_label = {"direct": "direct", "cot": "CoT", "cot_structured": "CoT-struct"}.get(pm, pm)
-        parts.append(pm_label)
-    if exclude_var != "shuffle":
-        parts.append("shuffle on" if cond["shuffle"] else "shuffle off")
-    if exclude_var != "para":
-        parts.append("para on" if cond["para"] else "para off")
-    return " · ".join(parts)
+    df_valid = df[df["num_queries"] > 0].copy()
+    if df_valid.empty:
+        st.info("No questions with valid queries.")
+        return
 
+    df_valid["label"] = (
+        df_valid["question_id"].str[:20] + " | " +
+        df_valid["question_text"].str[:50] + " | " +
+        df_valid["context_condition"]
+    )
 
-def _compute_run_metrics(run: dict) -> dict:
-    """Compute key metrics for a single run."""
-    df = run["df"]
-    valid = df[df["correct"].notna()]
-    acc = valid["correct"].mean() if len(valid) > 0 else None
-    multi = df[df["agreement"].notna()]
-    avg_agreement = float(multi["agreement"].mean()) if len(multi) > 0 else None
-    avg_confidence = float(df["confidence"].mean()) if len(df) > 0 else None
-    return {
-        "accuracy": acc,
-        "auroc": compute_auroc(df),
-        "confidence": avg_confidence,
-        "agreement": avg_agreement,
-    }
+    selected = st.selectbox("Select a question", df_valid["label"].unique())
+    if not selected:
+        return
 
+    row = df_valid[df_valid["label"] == selected].iloc[0]
 
-with tab4:
-    st.markdown("# Effect Analysis")
-    _ensure_loaded(runs)
-    st.caption("What does each experimental variable actually do?")
+    # Question text and options
+    st.subheader(f"Q: {row['question_text']}")
+    options = row.get("options", [])
+    correct = row.get("correct_answer", -1)
+    for i, opt in enumerate(options):
+        marker = " **[CORRECT]**" if i == correct else ""
+        st.write(f"**{ANSWER_LETTERS[i]})** {opt}{marker}")
 
-    if len(runs) < 2:
-        st.info("Select two or more runs to analyse effects.")
-    else:
-        # --- Index runs by their condition tuple ---
-        run_by_condition: dict[tuple, dict] = {}
-        for run in runs:
-            cond = _extract_condition(run["config"])
-            key = (cond["think"], cond["prompt_mode"], cond["shuffle"], cond["para"])
-            run_by_condition[key] = run
+    # Compact metadata line instead of large metric cards
+    diff_label = "Hard" if row["difficult"] else "Easy"
+    correct_label = "Yes" if row["is_correct"] else "No"
+    agree_str = f'{row["agreement"]:.2f}' if not math.isnan(row["agreement"]) else "-"
+    st.markdown(
+        f"**Difficulty:** {diff_label} · "
+        f"**Context:** {row['context_condition'].capitalize()} · "
+        f"**Answer:** {ANSWER_LETTERS[row['final_answer']]} · "
+        f"**Correct:** {correct_label} · "
+        f"**MSP:** {row['msp']:.3f} · "
+        f"**Agreement:** {agree_str}"
+    )
 
-        # --- Matched pair finders ---
-        BINARY_VARS = [
-            ("think", "Think on vs off", 0),
-            ("shuffle", "Shuffle on vs off", 2),
-            ("para", "Para on vs off", 3),
-        ]
-
-        def _find_binary_matched_pairs(var_name: str, key_idx: int) -> list[tuple[dict, dict, dict]]:
-            """Find matched pairs differing only on a binary variable.
-
-            Returns (cond_off, run_off, run_on) tuples.
-            """
-            pairs = []
-            seen = set()
-            for key, run in run_by_condition.items():
-                flipped = list(key)
-                flipped[key_idx] = not flipped[key_idx]
-                flipped_key = tuple(flipped)
-                pair_id = tuple(sorted([key, flipped_key]))
-                if pair_id in seen:
-                    continue
-                seen.add(pair_id)
-                if flipped_key in run_by_condition:
-                    if key[key_idx]:
-                        run_on, run_off = run, run_by_condition[flipped_key]
-                        cond_off = _extract_condition(run_by_condition[flipped_key]["config"])
-                    else:
-                        run_off, run_on = run, run_by_condition[flipped_key]
-                        cond_off = _extract_condition(run["config"])
-                    pairs.append((cond_off, run_off, run_on))
-            return pairs
-
-        def _find_prompt_matched_pairs(target_mode: str) -> list[tuple[dict, dict, dict]]:
-            """Find matched pairs: direct vs target_mode."""
-            pairs = []
-            seen = set()
-            for key, run in run_by_condition.items():
-                if key[1] != "direct":
-                    continue
-                target_key = (key[0], target_mode, key[2], key[3])
-                pair_id = tuple(sorted([key, target_key]))
-                if pair_id in seen:
-                    continue
-                seen.add(pair_id)
-                if target_key in run_by_condition:
-                    cond_direct = _extract_condition(run["config"])
-                    pairs.append((cond_direct, run, run_by_condition[target_key]))
-            return pairs
-
-        # Build variable list dynamically based on what's loaded
-        VARIABLES: list[tuple[str, str]] = [
-            ("think", "Think on vs off"),
-            ("shuffle", "Shuffle on vs off"),
-            ("para", "Para on vs off"),
-        ]
-
-        _prompt_modes_present = {key[1] for key in run_by_condition}
-        if "cot" in _prompt_modes_present:
-            VARIABLES.append(("prompt_cot", "Direct vs CoT"))
-        if "cot_structured" in _prompt_modes_present:
-            VARIABLES.append(("prompt_cotstruct", "Direct vs CoT-struct"))
-
-        def _find_matched_pairs(var_name: str) -> list[tuple[dict, dict, dict]]:
-            """Dispatch to the right pair-finder for a given variable."""
-            for bvar, _, kidx in BINARY_VARS:
-                if bvar == var_name:
-                    return _find_binary_matched_pairs(var_name, kidx)
-            if var_name == "prompt_cot":
-                return _find_prompt_matched_pairs("cot")
-            if var_name == "prompt_cotstruct":
-                return _find_prompt_matched_pairs("cot_structured")
-            return []
-
-        # --- Section 1: Main effects table ---
-        st.markdown("### Main effects")
-        st.caption(
-            "Each delta is the average across all matched pairs that differ "
-            "only on that variable. Positive accuracy/AUROC = better. "
-            "Confidence and agreement show how the variable shifts model behaviour."
-        )
-
-        # Metrics config: (key, display_name, format, higher_is_better)
-        METRICS = [
-            ("accuracy", "Accuracy Δ", lambda x: f"{x:+.1%}", True),
-            ("auroc", "AUROC Δ", lambda x: f"{x:+.3f}", True),
-            ("confidence", "Confidence Δ", lambda x: f"{x:+.3f}", None),
-            ("agreement", "Agreement Δ", lambda x: f"{x:+.3f}", None),
-        ]
-
-        effect_rows = []
-        all_pair_data: dict[str, list] = {}
-
-        for var_name, var_label in VARIABLES:
-            pairs = _find_matched_pairs(var_name)
-            if not pairs:
-                effect_rows.append({
-                    "Effect": var_label, "Pairs": 0,
-                    **{m[1]: None for m in METRICS},
-                })
-                all_pair_data[var_name] = []
-                continue
-
-            deltas = {m[0]: [] for m in METRICS}
-            pair_details = []
-
-            for cond_off, run_off, run_on in pairs:
-                m_off = _compute_run_metrics(run_off)
-                m_on = _compute_run_metrics(run_on)
-                pair_info = {
-                    "label": _condition_label(cond_off, exclude_var=var_name),
-                    "deltas": {},
-                }
-                for metric_key, _, _, _ in METRICS:
-                    v_off = m_off[metric_key]
-                    v_on = m_on[metric_key]
-                    if v_off is not None and v_on is not None:
-                        d = v_on - v_off
-                        deltas[metric_key].append(d)
-                        pair_info["deltas"][metric_key] = d
-                pair_details.append(pair_info)
-
-            all_pair_data[var_name] = pair_details
-
-            def _mean_or_none(lst):
-                return sum(lst) / len(lst) if lst else None
-
-            row = {"Effect": var_label, "Pairs": len(pairs)}
-            for metric_key, col_name, _, _ in METRICS:
-                row[col_name] = _mean_or_none(deltas[metric_key])
-            effect_rows.append(row)
-
-        if effect_rows:
-            eff_df = pd.DataFrame(effect_rows)
-
-            def _colour_delta(val, higher_is_better: bool | None) -> str:
-                """Teal for favourable, gold for unfavourable, neutral for informational."""
-                if pd.isna(val) or val is None or higher_is_better is None:
-                    return ""
-                if higher_is_better:
-                    return f"color: {TEAL}" if val > 0 else (f"color: {GOLD}" if val < 0 else "")
-                else:
-                    return f"color: {TEAL}" if val < 0 else (f"color: {GOLD}" if val > 0 else "")
-
-            def _style_effects(sdf: pd.DataFrame) -> pd.io.formats.style.Styler:
-                fmt = {m[1]: (lambda x, f=m[2]: f(x) if pd.notna(x) else "—") for m in METRICS}
-                fmt["Pairs"] = lambda x: str(x)
-                styled = sdf.style.format(fmt)
-                for _, col_name, _, hib in METRICS:
-                    styled = styled.map(
-                        lambda v, h=hib: _colour_delta(v, h), subset=[col_name],
-                    )
-                return styled
-
-            st.dataframe(_style_effects(eff_df), width="stretch", hide_index=True)
-
-            missing_vars = [row["Effect"] for row in effect_rows if row["Pairs"] == 0]
-            if missing_vars:
-                st.caption(
-                    f"No matched pairs found for: {', '.join(missing_vars)}. "
-                    "Load more runs with contrasting conditions."
-                )
-
-        st.markdown(
-            "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
-            unsafe_allow_html=True,
-        )
-
-        # --- Section 2: Effect consistency bar charts ---
-        st.markdown("### Effect consistency")
-        st.caption(
-            "Each bar is one matched pair. If all bars point the same direction, "
-            "the effect is robust across conditions."
-        )
-
-        for metric_key, metric_label, metric_fmt, _ in METRICS[:2]:
-            # Show consistency charts for accuracy and AUROC
-            st.markdown(f"**{metric_label.replace(' Δ', '')} deltas by variable**")
-            cols = st.columns(max(len(VARIABLES), 1))
-
-            for col_idx, (var_name, var_label) in enumerate(VARIABLES):
-                with cols[col_idx]:
-                    pair_details = all_pair_data.get(var_name, [])
-                    if not pair_details:
-                        st.caption(f"{var_label}: no pairs")
-                        continue
-
-                    labels = []
-                    values = []
-                    colors = []
-                    for pd_item in pair_details:
-                        d = pd_item["deltas"].get(metric_key)
-                        if d is not None:
-                            labels.append(pd_item["label"])
-                            values.append(d)
-                            colors.append(TEAL if d >= 0 else GOLD)
-
-                    if not values:
-                        st.caption(f"{var_label}: no data")
-                        continue
-
-                    text_vals = [metric_fmt(v) for v in values]
-                    fig_bar = go.Figure()
-                    fig_bar.add_trace(go.Bar(
-                        y=labels, x=values, orientation="h",
-                        marker_color=colors, text=text_vals,
-                        textposition="outside", textfont=dict(size=11),
-                    ))
-                    fig_bar.add_vline(x=0, line_color=GRAY_LIGHT, line_width=1)
-                    _fig_layout(fig_bar, title=var_label,
-                                height=max(180, 60 * len(values)))
-                    fig_bar.update_layout(showlegend=False,
-                                          yaxis=dict(autorange="reversed"))
-                    st.plotly_chart(fig_bar, width="stretch")
-
-        st.markdown(
-            "<hr style='border:none; border-top:1px solid #E5E0DB; margin:16px 0;'>",
-            unsafe_allow_html=True,
-        )
-
-        # --- Section 3: Interaction spotlight ---
-        st.markdown("### Interaction spotlight")
-        st.caption(
-            "Flags variables whose effect on accuracy flips sign depending on "
-            "other conditions — a sign of interaction between variables."
-        )
-
-        interactions_found = []
-        for var_name, var_label in VARIABLES:
-            pair_details = all_pair_data.get(var_name, [])
-            acc_deltas = [
-                (pd_item["label"], pd_item["deltas"].get("accuracy"))
-                for pd_item in pair_details
-                if pd_item["deltas"].get("accuracy") is not None
-            ]
-            if len(acc_deltas) < 2:
-                continue
-
-            signs = [d >= 0 for _, d in acc_deltas]
-            if len(set(signs)) > 1:
-                pos_pairs = [(lbl, d) for lbl, d in acc_deltas if d >= 0]
-                neg_pairs = [(lbl, d) for lbl, d in acc_deltas if d < 0]
-                best_pos = max(pos_pairs, key=lambda x: x[1]) if pos_pairs else None
-                worst_neg = min(neg_pairs, key=lambda x: x[1]) if neg_pairs else None
-
-                short_name = var_label.split(" on")[0].split(" vs")[0]
-                msg = f"**{short_name}** effect on accuracy flips sign: "
-                if best_pos:
-                    msg += f"+{best_pos[1]:.1%} when {best_pos[0]}"
-                if worst_neg:
-                    msg += f", but {worst_neg[1]:+.1%} when {worst_neg[0]}"
-                msg += "."
-                interactions_found.append(msg)
-
-        if interactions_found:
-            for msg in interactions_found:
-                st.markdown(msg)
-        else:
+    # Show article context
+    article_texts = load_article_texts()
+    article_id = row.get("article_id", "")
+    article_text = article_texts.get(article_id, "")
+    if article_text:
+        with st.expander(f"Article context (article_id: {article_id})", expanded=False):
+            truncated = article_text
+            # Use a styled div — st.text uses <pre> which doesn't wrap
+            escaped = truncated.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            # Collapse Gutenberg hard-wrapped lines: single \n → space, \n\n → paragraph break
+            paragraphs = escaped.split("\n\n")
+            html = "".join(f"<p>{' '.join(p.split())}</p>" for p in paragraphs)
             st.markdown(
-                "All effects are consistent across conditions — no sign-flip "
-                "interactions detected."
+                f'<div style="font-size:14px; line-height:1.6; max-height:500px; '
+                f'overflow-y:auto; white-space:normal; word-wrap:break-word;">'
+                f'{html}</div>',
+                unsafe_allow_html=True,
             )
 
-
-# ---------------------------------------------------------------------------
-# Tab 5: Question Explorer
-# ---------------------------------------------------------------------------
-
-with tab5:
-    st.markdown("# Question Explorer")
-    _ensure_loaded(runs)
-
-    qdb = load_question_db()
-    if not qdb:
-        st.warning("Could not load question database.")
-        st.stop()
-
-    # Build question options from all selected runs
-    all_qids = set()
-    for run in runs:
-        for qr in run["question_results"]:
-            all_qids.add(qr["question_id"])
-
-    if not all_qids:
-        st.info("No questions in selected runs.")
-        st.stop()
-
-    # Filters
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        # Disagreement filter
-        disagree_filter = st.checkbox("Show only disagreements (agreement < 0.7 or runs disagree)", value=False)
-    with col_f2:
-        # Category filter
-        all_cats = sorted({get_category(qdb.get(qid, {}).get("subject", "")) for qid in all_qids})
-        cat_filter = st.multiselect("Filter by category", all_cats, default=all_cats)
-
-    # Apply filters
-    filtered_qids = []
-    for qid in sorted(all_qids):
-        q_info = qdb.get(qid, {})
-        cat = get_category(q_info.get("subject", ""))
-        if cat not in cat_filter:
-            continue
-
-        if disagree_filter:
-            # Check if any run has low agreement or runs disagree on correctness
-            show = False
-            answers = set()
-            for run in runs:
-                df = run["df"]
-                row = df[df["question_id"] == qid]
-                if row.empty:
-                    continue
-                row = row.iloc[0]
-                if row["agreement"] is not None and row["agreement"] < 0.7:
-                    show = True
-                answers.add(row["correct"])
-            if len(answers) > 1:
-                show = True
-            if not show:
-                continue
-
-        text_preview = q_info.get("question_text", "")[:80]
-        filtered_qids.append((qid, f"{qid} — {text_preview}"))
-
-    if not filtered_qids:
-        st.info("No questions match the current filters.")
-        st.stop()
-
-    selected_q_label = st.selectbox("Select question", [label for _, label in filtered_qids])
-    selected_qid = selected_q_label.split(" — ")[0]
-
-    # Display question info
-    q_info = qdb.get(selected_qid, {})
-    st.markdown(f"**Subject:** {q_info.get('subject', '?')} · **Category:** {get_category(q_info.get('subject', ''))}")
-    st.markdown(f"**Question:** {q_info.get('question_text', '?')}")
-
-    # Show choices with correct highlighted
-    choices = q_info.get("choices", [])
-    correct_idx = q_info.get("correct_answer")
-    for i, choice in enumerate(choices):
-        letter = ANSWER_LETTERS[i]
-        if i == correct_idx:
-            st.markdown(f"**{letter})** <span style='color:{TEAL}; font-weight:500;'>{choice} ✓</span>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"**{letter})** {choice}")
-
-    st.divider()
-
-    # Per-run details
-    for run in runs:
-        qr = None
-        for q in run["question_results"]:
-            if q["question_id"] == selected_qid:
-                qr = q
-                break
-        if qr is None:
-            st.caption(f"{run['label']}: question not in this run")
-            continue
-
-        mean_probs = qr.get("mean_probs", [])
-        final_ans = qr.get("final_answer", 0)
-        correct = qr.get("correct")
-        query_log = qr.get("query_log", [])
-        num_q = qr.get("num_queries", 0)
-
-        # Agreement
-        if num_q > 1:
-            agree = sum(1 for ql in query_log if ql.get("canonical_answer") == final_ans) / num_q
-            agree_str = f"{agree:.2f}"
-        else:
-            agree_str = "N/A"
-
-        # Summary line
-        prob_str = " ".join(f"{ANSWER_LETTERS[i]}:{p:.3f}" for i, p in enumerate(mean_probs))
-        correct_str = "✓ Correct" if correct else ("✗ Incorrect" if correct is False else "—")
-        correct_color = TEAL if correct else (GOLD if correct is False else GRAY_MID)
-
-        st.markdown(
-            f"### {run['label']}\n"
-            f"Answer: **{ANSWER_LETTERS[final_ans]}** · "
-            f"<span style='color:{correct_color};'>{correct_str}</span> · "
-            f"Mean probs: {prob_str} · Agreement: {agree_str}",
-            unsafe_allow_html=True,
-        )
-
-        # Query detail table
-        if query_log:
-            table_rows = []
-            for ql in query_log:
-                probs = ql.get("canonical_probs", [])
-                prob_display = " ".join(f"{ANSWER_LETTERS[i]}:{p:.2f}" for i, p in enumerate(probs))
-                table_rows.append({
-                    "Query text": ql.get("query_text", ""),
-                    "Answer": ANSWER_LETTERS[ql.get("canonical_answer", 0)],
-                    "Probs": prob_display,
-                })
-            st.dataframe(
-                pd.DataFrame(table_rows),
-                width="stretch", hide_index=True,
-                column_config={"Query text": st.column_config.TextColumn(width="large")},
-            )
-
-            # Show reasoning for CoT runs (raw_response contains the
-            # model's chain-of-thought; for direct mode it's just " A")
-            prompt_mode = run.get("config", {}).get("prompt_mode", "direct")
-            if prompt_mode in ("cot", "cot_structured"):
-                for qi, ql in enumerate(query_log):
-                    reasoning = ql.get("raw_response", "")
-                    if reasoning and len(reasoning) > 5:
-                        with st.expander(
-                            f"Query {qi} reasoning",
-                            expanded=(len(query_log) == 1),
-                        ):
-                            st.text(reasoning)
-
-        # Stacked bar chart of probabilities across queries
-        if query_log and len(query_log) > 1:
-            fig = go.Figure()
-            for choice_idx in range(4):
-                vals = [
-                    ql.get("canonical_probs", [0, 0, 0, 0])[choice_idx]
-                    for ql in query_log
-                ]
+    # Per-query bar chart
+    query_log = row.get("query_log", [])
+    if query_log:
+        st.subheader("Per-Query Probability Distributions")
+        fig = go.Figure()
+        for qi, ql in enumerate(query_log):
+            probs = ql.get("canonical_probs", [0.25]*4)
+            for li, letter in enumerate(ANSWER_LETTERS):
                 fig.add_trace(go.Bar(
-                    x=list(range(len(query_log))),
-                    y=vals,
-                    name=ANSWER_LETTERS[choice_idx],
-                    marker_color=CHOICE_COLORS[choice_idx],
+                    x=[f"Q{qi}"], y=[probs[li] if li < len(probs) else 0],
+                    name=letter if qi == 0 else None,
+                    marker_color=CHOICE_COLORS[li],
+                    showlegend=(qi == 0), legendgroup=letter,
                 ))
-            fig.update_layout(barmode="stack")
-            _fig_layout(fig, title="Probability distribution per query", height=300)
-            fig.update_xaxes(title="Query number", dtick=1)
-            fig.update_yaxes(title="Probability", range=[0, 1.05])
-            st.plotly_chart(fig, width="stretch")
+        fig.update_layout(**_base_layout(
+            title="A/B/C/D Probabilities per Query",
+            xaxis_title="Query", yaxis_title="Probability", barmode="stack",
+        ))
+        st.plotly_chart(_round_hover(fig), use_container_width=True)
 
-        st.divider()
+    # Same question across conditions
+    same_q = df_valid[df_valid["question_id"] == row["question_id"]]
+    if len(same_q) > 1:
+        st.subheader("Same Question Across Conditions")
+        for _, other in same_q.iterrows():
+            ctx = other["context_condition"]
+            ans = ANSWER_LETTERS[other["final_answer"]]
+            correct_str = "Correct" if other["is_correct"] else "Wrong"
+            st.write(f"**{ctx.capitalize()}**: Answer={ans}, MSP={other['msp']:.3f}, {correct_str}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+st.title("Pre-Action Uncertainty Quantification")
+st.caption("QuALITY dataset | Context sufficiency experiments")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Progress", "Uncertainty Distributions",
+    "Condition Comparison", "Question Explorer",
+])
+
+with tab1:
+    tab_progress()
+with tab2:
+    tab_distributions()
+with tab3:
+    tab_comparison()
+with tab4:
+    tab_explorer()

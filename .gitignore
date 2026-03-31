@@ -11,3 +11,10 @@ __pycache__/
 Power settings.docx
 results/
 results_test/
+=0.3.16
+Temp crappy folder random stuff/
+bayesian-uq.tar
+*.pdf
+v2_mmlu_archive/analysis/signals*.csv
+v2_mmlu_archive/results/
+v2_mmlu_archive/v1_sampling_archive/results/
