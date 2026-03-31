@@ -311,58 +311,117 @@ cp -r /scratch/project_2018384/bayesian-uq/results/ \
 
 ---
 
-## Pitfalls — Ranked by Likelihood
+## Pitfalls — Actual Issues Hit (2026-03-31)
 
-### HIGH risk
-1. **llama-cpp-python compilation.** CUDA version, GCC version, CMake flags. Try wheel first, source build second. Test explicitly before submitting real jobs.
-2. **CRLF line endings.** Fix after every rsync from Windows. We already got burned on vast.ai.
-3. **No internet on compute nodes.** ALL downloads must happen on login node. pip install on login node. Model download on login node.
+These are real problems we hit during the first Mahti deployment, in order:
 
-### MEDIUM risk
-4. **llama-cpp-python API version differences.** `memory_clear`, `llama_get_logits` APIs change between versions. Our `_full_reset` has fallbacks. Test with 2+ sequential questions to verify KV cache actually clears.
-5. **Path resolution.** `dataset_file: data/quality_all.jsonl` is relative — resolved from project root via `Path(__file__)`. Works IF the SLURM script `cd`s to the project directory. Always `cd $PROJECT` before running.
-6. **File count limit on `/projappl/`.** 100K files. Clean `__pycache__` after venv setup.
+### 1. SSH key auth + MAC corruption (SOLVED)
+- CSC uses SSH-key-only auth (added via MyCSC portal, takes up to 1 hour to propagate)
+- Windows OpenSSH has a MAC algorithm incompatibility with Mahti: `Corrupted MAC on input`
+- **Fix:** Add to `~/.ssh/config`:
+  ```
+  Host mahti.csc.fi
+      MACs hmac-sha2-256
+  ```
+- **Pitfall:** Do NOT use PowerShell `echo >>` to edit SSH config — it writes UTF-16 with spaces between characters. Use a text editor or Claude Code's Write tool.
 
-### LOW risk
-7. **Scratch auto-cleanup.** 180 days. Set a calendar reminder.
-8. **BU budget exhaustion.** Jobs get killed. Resume handles it.
-9. **Wall-time on shuffle experiments.** 36h limit should suffice (~15-20h estimated). If not, resume.
+### 2. `module` command not found in SLURM jobs (SOLVED)
+- The Lmod module system isn't initialized in non-interactive shells or SLURM batch scripts
+- `module load gcc cuda python-data` silently does nothing, leaving system Python 3.6 in PATH
+- **Fix:** Add `source /appl/profile/zz-csc-env.sh` as the FIRST line after SBATCH directives, before any `module load`
+- This is the CSC-specific init that sets up MODULEPATH and the module function
+
+### 3. `srun` doesn't inherit environment (SOLVED)
+- In SLURM scripts, `srun python3` starts a subprocess that doesn't see the venv activation or loaded modules
+- **Fix:** Don't use `srun` — just call `python3` directly. The batch script's environment is inherited by child processes without `srun`.
+
+### 4. llama-cpp-python installs CPU-only by default (SOLVED)
+- `pip install llama-cpp-python` from the default index gives a CPU-only wheel
+- The CUDA wheel index (`whl/cu124`) only has wheels for CUDA 12.x; Mahti has CUDA 11.5
+- `llama_cpp.llama_supports_gpu_offload()` returns `False` silently — the pipeline runs but 100x slower
+- **Fix:** Build from source with `CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=80"`
+- **BUT:** This fails on the login node because `libcuda.so` (the CUDA driver) only exists on GPU compute nodes
+- **Fix for the fix:** Submit the build as a SLURM job on `gputest` partition:
+  ```bash
+  sbatch --partition=gputest --time=0:15:00 --gres=gpu:a100:1,nvme:100 --wrap='bash /scratch/.../build_llama.sh'
+  ```
+- Build takes ~8 minutes on compute node (377 compilation units, sm_80 only)
+- **Always verify after install:** `python3 -c "import llama_cpp; print(llama_cpp.llama_supports_gpu_offload())"` must print `True`
+
+### 5. YAML files with Windows encoding (SOLVED)
+- Python's `write_text()` on Windows can embed em-dash characters (U+2014) as single byte 0x97 (Windows-1252) instead of the 3-byte UTF-8 sequence
+- YAML parser on Linux chokes: `UnicodeDecodeError: 'utf-8' codec can't decode byte 0x97`
+- **Fix:** Write YAML files as pure ASCII — no special characters in comments. Use `write_text(content, encoding='ascii')` to catch any non-ASCII chars at write time
+- **Also:** `sed -i 's/\r$//'` after every scp to strip CRLF (same issue as vast.ai)
+
+### 6. HuggingFace model URL case sensitivity (SOLVED)
+- The GGUF filename on HuggingFace is `Qwen3-8B-Q4_K_M.gguf` (capital letters)
+- Our code references `qwen3-8b-q4_k_m.gguf` (lowercase)
+- wget with the wrong case returns 404
+- **Fix:** Download with correct URL, save as lowercase: `wget -O qwen3-8b-q4_k_m.gguf https://...Qwen3-8B-Q4_K_M.gguf`
+
+### 7. CoT wall time might be tight (MONITORING)
+- CoT noshuffle: ~6s per question x 4609 = ~7.7 hours. Wall time set to 6 hours.
+- May need resume after wall-time kill, or increase to `--time=10:00:00`
+- Resume logic handles this automatically
 
 ---
 
-## Budget Planning
+## Verified Working Configuration (2026-03-31)
 
-| Experiment | Queries/q | Total queries | Est. hours (A100) | BU cost |
-|-----------|-----------|---------------|-------------------|---------|
-| direct × noshuffle × sufficient | 1 | 4,609 | ~1.5h | 150 |
-| direct × noshuffle × insufficient | 1 | 4,609 | ~1.5h | 150 |
-| direct × shuffle × sufficient | 10 | 46,090 | ~15h | 1,500 |
-| direct × shuffle × insufficient | 10 | 46,090 | ~15h | 1,500 |
-| cot × noshuffle × sufficient | 1 | 4,609 | ~4h | 400 |
-| cot × noshuffle × insufficient | 1 | 4,609 | ~4h | 400 |
-| cot × shuffle × sufficient | 10 | 46,090 | ~40h | 4,000 |
-| cot × shuffle × insufficient | 10 | 46,090 | ~40h | 4,000 |
-| **Total** | | **~199,000** | **~121h** | **~12,100** |
+```
+Cluster:        Mahti (mahti.csc.fi)
+Node:           g2102.mahti.csc.fi
+GPU:            NVIDIA A100-SXM4-40GB
+CUDA:           11.5.0 (module)
+CUDA driver:    535.288.01 (on compute nodes)
+GCC:            11.2.0 (Spack)
+Python:         3.12.11 (python-data module)
+llama-cpp-python: 0.3.19 (built from source, GPU=True)
+n_ctx:          32768
+Model:          qwen3-8b-q4_k_m.gguf (4.7 GB)
+Load time:      4.4s
+Direct query:   ~2.5s per question
+CoT query:      ~6s per question
+```
 
-Current allocation: 1,000 BU = enough for the 2 noshuffle direct experiments as validation.
+**Init sequence for SLURM scripts:**
+```bash
+source /appl/profile/zz-csc-env.sh   # MUST be first — sets up module system
+module load gcc cuda python-data
+source /projappl/project_2018384/llama-env/bin/activate
+export UQ_MODEL_PATH=$LOCAL_SCRATCH/qwen3-8b-q4_k_m.gguf
+```
 
-**Strategy:** Run noshuffle experiments first (~300 BU). Validate results match vast.ai. Then request medium allocation (~15,000 BU) for the full set. Run direct shuffle next (~3,000 BU). CoT experiments last (~8,800 BU) — they're the most expensive and may not be needed depending on direct-mode results.
+---
+
+## Budget Planning (updated with actual timings)
+
+| Experiment | Queries/q | Est. hours (A100) | BU cost |
+|-----------|-----------|-------------------|---------|
+| direct x noshuffle x 2 contexts | 1 | ~1.5h each | 300 |
+| direct x shuffle x 2 contexts | 10 | ~7h each | 1,400 |
+| cot x noshuffle x 2 contexts | 1 | ~8h each | 1,600 |
+| cot x shuffle x 2 contexts | 10 | ~80h each | 16,000 |
+| **Total** | | **~195h** | **~19,300** |
+
+CoT is slower than initially estimated (~6s/q vs ~3s predicted). Shuffle+CoT experiments are very expensive.
 
 ---
 
 ## Code changes required
 
-**Core inference code (`src/pre_action_uq/`):** NONE. Works as-is. `UQ_MODEL_PATH` env var handles model discovery. All paths relative to project root.
+**Core inference code (`src/pre_action_uq/`):** NONE. Works as-is on Mahti without modification.
 
-**New scripts needed (`scripts/mahti/`):**
-- `slurm_single.sh` — SLURM batch script for one experiment
-- `submit_all.sh` — loop to submit all 8 experiments
-- `setup_env.sh` — one-time environment setup helper
+**Mahti-specific scripts (`scripts/mahti/`):**
+- `slurm_single.sh` — SLURM batch script (sources zz-csc-env.sh, no srun)
+- `submit_all.sh` — submit all 8 experiments with tailored wall times
+- `setup_env.sh` — one-time environment setup
+- `smoke_test.sh` — 5-test validation on gputest partition
+- `fetch_results.ps1` — pull results from Mahti to local
 
-**Existing scripts unchanged:**
-- `scripts/run_all_pilots.sh` — vast.ai only
-- `scripts/autorun.sh` — vast.ai only
-- `scripts/vastai_setup.sh` — vast.ai only
-- `scripts/fetch_results.ps1` — update SSH target for Mahti downloads
+**Mahti configs (`experiments/configs/mahti/`):**
+- All 8 experiments with n_ctx=32768 (vs 12288 on vast.ai)
+- Pure ASCII encoding (no em-dashes or special chars)
 
-**Config changes:** None. All 8 YAML configs work as-is. `model_path: auto` uses `UQ_MODEL_PATH`.
+**vast.ai scripts (`scripts/`) unchanged** — different execution model, same core code.

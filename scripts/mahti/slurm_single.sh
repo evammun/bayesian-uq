@@ -20,6 +20,7 @@
 #SBATCH --error=/scratch/project_2018384/logs/%x_%j.err
 
 # --- Environment ---
+source /appl/profile/zz-csc-env.sh
 module load gcc cuda python-data
 source /projappl/project_2018384/llama-env/bin/activate
 
@@ -75,11 +76,11 @@ if [ -n "$EXISTING" ]; then
     fi
     echo "Resuming from $EXISTING ($N/$TOTAL questions done)"
     echo ""
-    srun python3 experiments/run_experiment.py --config "$CONFIG" --resume "$EXISTING"
+    python3 experiments/run_experiment.py --config "$CONFIG" --resume "$EXISTING"
 else
     echo "Starting fresh: $RUN_NAME"
     echo ""
-    srun python3 experiments/run_experiment.py --config "$CONFIG"
+    python3 experiments/run_experiment.py --config "$CONFIG"
 fi
 
 EXIT_CODE=$?

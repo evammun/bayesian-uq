@@ -15,6 +15,7 @@
 #SBATCH --output=/scratch/project_2018384/logs/%x_%j.out
 #SBATCH --error=/scratch/project_2018384/logs/%x_%j.err
 
+source /appl/profile/zz-csc-env.sh
 module load gcc cuda python-data
 source /projappl/project_2018384/llama-env/bin/activate
 

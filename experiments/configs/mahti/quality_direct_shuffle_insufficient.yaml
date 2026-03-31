@@ -1,9 +1,9 @@
-# QuALITY full (Mahti A100): direct mode, insufficient context, shuffle
-# n_ctx=32768 — A100 40GB has headroom for CoT reasoning chains
+# QuALITY full (Mahti A100): direct mode, insufficient context
+# n_ctx=32768 for A100 40GB headroom
 
 run_name: quality_direct_shuffle_insufficient
 model_path: auto
-model_name: "qwen3:8b-q4_K_M"
+model_name: qwen3:8b-q4_K_M
 think: false
 prompt_mode: direct
 dataset_file: data/quality_all.jsonl

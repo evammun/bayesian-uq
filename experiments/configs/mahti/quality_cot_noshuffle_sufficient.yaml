@@ -1,9 +1,9 @@
-# QuALITY full (Mahti A100): cot mode, sufficient context, noshuffle
-# n_ctx=32768 — A100 40GB has headroom for CoT reasoning chains
+# QuALITY full (Mahti A100): cot mode, sufficient context
+# n_ctx=32768 for A100 40GB headroom
 
 run_name: quality_cot_noshuffle_sufficient
 model_path: auto
-model_name: "qwen3:8b-q4_K_M"
+model_name: qwen3:8b-q4_K_M
 think: false
 prompt_mode: cot
 dataset_file: data/quality_all.jsonl
