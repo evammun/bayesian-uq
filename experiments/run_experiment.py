@@ -22,9 +22,41 @@ from pre_action_uq.pipeline import load_config, run_experiment
 
 
 def load_resume_data(resume_path: Path) -> tuple[set[str], list[QuestionResult]]:
-    """Load completed question IDs and results from a partial run."""
-    with open(resume_path, encoding="utf-8") as f:
-        data = json.load(f)
+    """Load completed question IDs and results from a partial run.
+
+    Handles truncated JSON from interrupted writes: reads as much valid
+    data as possible rather than crashing.
+    """
+    try:
+        with open(resume_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        # File was truncated mid-write. Try to salvage by finding the
+        # last complete question_result entry.
+        print(f"WARNING: {resume_path.name} has invalid JSON (truncated?). Attempting partial recovery...")
+        with open(resume_path, encoding="utf-8") as f:
+            raw = f.read()
+        # Find all complete question_id entries as a count estimate
+        import re
+        question_ids = re.findall(r'"question_id":\s*"([^"]+)"', raw)
+        # Try progressively shorter slices until JSON parses
+        data = None
+        for trim in [1000, 5000, 20000, 100000, 500000]:
+            try:
+                # Try to close the JSON structure
+                truncated = raw[:len(raw) - trim]
+                # Find last complete question result (ends with })
+                last_brace = truncated.rfind("}")
+                if last_brace > 0:
+                    attempt = truncated[:last_brace + 1] + "\n  ]\n}"
+                    data = json.loads(attempt)
+                    break
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if data is None:
+            print(f"  Could not recover any data. Starting fresh.")
+            return set(), []
+        print(f"  Recovered {len(data.get('question_results', []))} of ~{len(question_ids)} questions")
 
     completed_ids: set[str] = set()
     carried_over: list[QuestionResult] = []
