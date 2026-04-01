@@ -668,12 +668,17 @@ def run_experiment(
     print(f"  Output: {output_file}")
     print(flush=True)
 
-    # Run
+    # Run — seed with carried-over results, track IDs to prevent duplicates
     question_results: list[QuestionResult] = list(carried_over_results or [])
+    completed_ids_set = set(completed_ids or [])
     global_query_count = [0]
     writer = _IncrementalWriter()
 
     for idx, question in enumerate(all_questions):
+        # Double-check: skip if already in carried-over results (belt + suspenders)
+        if question.question_unique_id in completed_ids_set:
+            continue
+
         rng = _make_question_rng(config.seed, idx)
 
         result = run_single_question(
@@ -687,6 +692,7 @@ def run_experiment(
             global_query_count=global_query_count,
         )
         question_results.append(result)
+        completed_ids_set.add(question.question_unique_id)
 
         # Incremental save: first question immediately, then every 10
         if idx == 0 or (idx + 1) % 10 == 0:

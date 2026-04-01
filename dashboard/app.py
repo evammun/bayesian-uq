@@ -315,8 +315,13 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
 
 
 def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
-    """Convert loaded result dicts to a flat DataFrame."""
+    """Convert loaded result dicts to a flat DataFrame.
+
+    Deduplicates by (run_name, question_id) — keeps first occurrence.
+    This handles the case where a resumed run appended duplicate results.
+    """
     rows = []
+    seen: set[tuple[str, str]] = set()
     for run_name, data in all_data.items():
         cfg = data.get("config", {})
         context = cfg.get("context_condition", "unknown")
@@ -327,6 +332,13 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
         for qr in data.get("question_results", []):
             if qr.get("skipped", False) or not qr.get("mean_probs"):
                 continue
+
+            # Deduplicate: skip if we've already seen this question in this run
+            qid = qr.get("question_id", "")
+            dedup_key = (run_name, qid)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
 
             query_log = qr.get("query_log", [])
             n_queries = len(query_log)
@@ -964,10 +976,15 @@ def tab_explorer() -> None:
 
         # Reasoning trace (CoT / think modes)
         if prompt_mode in ("cot", "cot_structured") or (cfg and cfg.get("think")):
+            # Pass 1 vs Pass 2 answer — always visible
+            pass1 = query_log[0].get("pass1_answer", "") if query_log else ""
+            if pass1:
+                st.caption(f"Pass 1 (free) answer: **{pass1}** · Pass 2 (logprob) answer: **{ANSWER_LETTERS[row['final_answer']]}**")
+
+            # Reasoning trace in expander
             traces = [ql.get("thinking_trace", "") for ql in query_log if ql.get("thinking_trace")]
             if traces:
                 with st.expander("Reasoning trace", expanded=False):
-                    # Show first query's reasoning (they're all for the same question)
                     trace_text = traces[0]
                     escaped = trace_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                     paras = escaped.split("\n\n")
@@ -977,11 +994,6 @@ def tab_explorer() -> None:
                         f'overflow-y:auto; color:#4a5568;">{html}</div>',
                         unsafe_allow_html=True,
                     )
-
-                    # Show pass1 answer if available
-                    pass1 = query_log[0].get("pass1_answer", "")
-                    if pass1:
-                        st.caption(f"Pass 1 (free) answer: **{pass1}** · Pass 2 (logprob) answer: **{ANSWER_LETTERS[row['final_answer']]}**")
 
         if ri < len(all_rows) - 1:
             st.divider()
