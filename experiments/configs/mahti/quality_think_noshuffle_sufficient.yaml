@@ -1,0 +1,16 @@
+# QuALITY full (Mahti A100): direct + think mode, sufficient context
+# n_ctx=32768 for A100 40GB headroom
+# Two-pass: Pass 1 captures internal reasoning, Pass 2 extracts logprobs
+
+run_name: quality_think_noshuffle_sufficient
+model_path: auto
+model_name: qwen3:8b-q4_K_M
+think: true
+prompt_mode: direct
+dataset_file: data/quality_all.jsonl
+context_condition: sufficient
+shuffle_options: false
+seed: 42
+temperature: 0.7
+num_permutations: 1
+n_ctx: 32768
