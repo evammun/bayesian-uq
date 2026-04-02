@@ -369,88 +369,74 @@ class LlamaCppClient:
     # Two-pass CoT
     # ------------------------------------------------------------------
 
-    def generate_cot(
+    def _generate_and_extract(
         self,
         prompt: str,
         max_tokens: int = 2048,
         temperature: float = 0.0,
-        top_logprobs: int = 20,
         think: bool = False,
     ) -> dict[str, Any]:
-        """Two-pass Chain-of-Thought generation with clean answer logprobs.
+        """Generate reasoning + answer, then extract logprobs at the answer position.
 
-        Pass 1: Generate full reasoning + answer freely (no stop sequence).
-                Parse out the answer letter the model chose.
-        Pass 2: Feed ONLY the reasoning (before "Answer:") as assistant
-                prefill, then extract logprobs at the answer position.
-                The Pass 1 answer does NOT appear in Pass 2 — no leaking.
+        Single logical pass (two mechanical steps due to llama-cpp-python):
+          1. Generate: model reasons (visibly or in <think> block) then answers
+          2. Extract: eval the full output up to "Answer:", get logprobs
 
-        This captures both what the model freely chose (pass1_answer) and
-        the pre-commitment probability distribution (Pass 2 logprobs).
+        Logprobs are conditioned on the model's FULL reasoning — no stripping,
+        no anti-leak constraints. This is the natural post-reasoning probability
+        distribution at the answer position.
 
         Args:
             prompt: Question text (becomes user message in chat template).
-            max_tokens: Max tokens for the reasoning pass.
+            max_tokens: Max tokens for generation.
             temperature: Sampling temperature.
-            top_logprobs: Top-k logprobs for the answer token.
-            think: Enable Qwen3 /think reasoning for Pass 1.
+            think: Enable Qwen3 /think reasoning.
 
         Returns:
             Dict with response_text, logprobs, thinking_trace, pass1_answer.
         """
         import re
 
-        # --- Pass 1: generate reasoning + answer freely ---
-        pass1_prompt = self._build_chat_prompt(prompt, think=think)
+        # --- Step 1: generate reasoning + answer freely ---
+        chat_prompt = self._build_chat_prompt(prompt, think=think)
 
-        pass1 = self.generate(
-            prompt=pass1_prompt,
+        gen = self.generate(
+            prompt=chat_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
-            stop=None,  # let the model generate through to its answer
+            stop=None,
             think=False,  # template already applied
         )
 
-        raw_pass1 = pass1["response_text"]
-        visible_output, thinking_trace = _split_think_response(raw_pass1)
+        raw_output = gen["response_text"]
+        visible_output, thinking_trace = _split_think_response(raw_output)
 
-        # Parse Pass 1 answer: find the last "Answer: X" pattern
+        # Parse the model's freely chosen answer from visible output
         pass1_answer = ""
-        answer_match = re.search(r'[Aa]nswer:\s*([A-Da-d])', visible_output[::-1][:200][::-1])
-        if not answer_match:
-            # Search the full output from the end
-            matches = list(re.finditer(r'[Aa]nswer:\s*([A-Da-d])', visible_output))
-            if matches:
-                pass1_answer = matches[-1].group(1).upper()
-        else:
-            # Search from the end of the output
-            matches = list(re.finditer(r'[Aa]nswer:\s*([A-Da-d])', visible_output))
-            if matches:
-                pass1_answer = matches[-1].group(1).upper()
+        matches = list(re.finditer(r'[Aa]nswer:\s*([A-Da-d])', visible_output))
+        if matches:
+            pass1_answer = matches[-1].group(1).upper()
 
-        # Extract reasoning: everything before the last "Answer:" occurrence
-        # This MUST NOT include the answer letter — no leaking to Pass 2
+        # --- Step 2: eval full output up to "Answer:", extract logprobs ---
+        # Keep everything (including <think> block), strip only the answer letter.
+        # Find the last "Answer:" in the RAW output (before think/visible split).
         last_answer_pos = -1
-        for m in re.finditer(r'[Aa]nswer:', visible_output):
+        for m in re.finditer(r'[Aa]nswer:', raw_output):
             last_answer_pos = m.start()
-        if last_answer_pos > 0:
-            reasoning_text = visible_output[:last_answer_pos].rstrip()
-        else:
-            reasoning_text = visible_output.rstrip()
 
-        # --- Pass 2: logprobs at answer position ---
-        # Uses ONLY reasoning_text — pass1_answer is NOT included
-        pass2_prompt = (
-            self._build_chat_prompt(prompt, think=False)
-            + reasoning_text.rstrip() + "\n\nAnswer:"
-        )
+        if last_answer_pos > 0:
+            output_prefix = raw_output[:last_answer_pos].rstrip()
+        else:
+            output_prefix = raw_output.rstrip()
+
+        eval_prompt = chat_prompt + output_prefix + "\n\nAnswer:"
 
         with self._lock:
-            tokens = self.model.tokenize(pass2_prompt.encode(), add_bos=True)
+            tokens = self.model.tokenize(eval_prompt.encode(), add_bos=True)
 
             if len(tokens) > self._n_ctx:
                 raise ValueError(
-                    f"CoT Pass 2 prompt ({len(tokens)} tokens) exceeds n_ctx ({self._n_ctx})."
+                    f"Reasoning eval ({len(tokens)} tokens) exceeds n_ctx ({self._n_ctx})."
                 )
 
             self._full_reset()
@@ -460,14 +446,15 @@ class LlamaCppClient:
 
         # --- Assemble result ---
         response_text = (
-            reasoning_text + "\nAnswer:" +
+            output_prefix + "\nAnswer:" +
             (logprobs[0]["token"] if logprobs else "")
         )
 
+        # Store full reasoning in thinking_trace
         if thinking_trace:
-            thinking_trace = thinking_trace + "\n---\n" + reasoning_text
+            thinking_trace = thinking_trace + "\n---\n" + visible_output
         else:
-            thinking_trace = reasoning_text
+            thinking_trace = visible_output
 
         return {
             "response_text": response_text,
@@ -475,6 +462,28 @@ class LlamaCppClient:
             "thinking_trace": thinking_trace,
             "pass1_answer": pass1_answer,
         }
+
+    def generate_cot(
+        self,
+        prompt: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        """Natural Chain-of-Thought: model reasons visibly, logprobs conditioned on full reasoning."""
+        return self._generate_and_extract(
+            prompt, max_tokens=max_tokens, temperature=temperature, think=False,
+        )
+
+    def generate_think(
+        self,
+        prompt: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        """Qwen3 think mode: model reasons in <think> block, logprobs conditioned on full output."""
+        return self._generate_and_extract(
+            prompt, max_tokens=max_tokens, temperature=temperature, think=True,
+        )
 
     # ------------------------------------------------------------------
     # Chat template

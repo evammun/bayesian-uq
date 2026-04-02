@@ -206,6 +206,7 @@ def build_prompt(
     article_text: str,
     answer_permutation: list[int],
     prompt_mode: str = "direct",
+    think: bool = False,
 ) -> str:
     """Construct an MCQ prompt with article context.
 
@@ -213,6 +214,9 @@ def build_prompt(
     For CoT mode: adds reasoning instructions that explicitly forbid
     naming the answer letter in the reasoning (prevents leaking the
     answer to Pass 2 of the two-pass pipeline).
+    For direct+think: tells the model to answer with a single letter
+    only — all reasoning goes in the <think> block, visible output
+    must be minimal to prevent answer leaking to Pass 2.
 
     Args:
         question_text: The question stem.
@@ -231,14 +235,28 @@ def build_prompt(
         choice_lines.append(f"{letter}) {options[canonical_idx]}")
 
     if prompt_mode == "cot":
+        # Natural CoT: model reasons freely, no anti-leak constraint.
+        # Logprobs are extracted conditioned on the full reasoning.
         return (
             "Read the following passage and answer the question.\n\n"
             f"Passage:\n{article_text}\n\n"
             f"Question: {question_text}\n\n"
             + "\n".join(choice_lines)
             + "\n\n"
-            "BE CONCISE. 3-4 bullet points of reasoning only "
-            "-- do NOT name the answer letter in your reasoning.\n\n"
+            "BE CONCISE. 3-4 bullet points of reasoning only.\n\n"
+            "End with: Answer: X"
+        )
+    elif think:
+        # Think mode: reasoning goes in <think> block via /think tag.
+        # Logprobs are extracted conditioned on the full output
+        # (including think block).
+        return (
+            "Read the following passage and answer the question.\n\n"
+            f"Passage:\n{article_text}\n\n"
+            f"Question: {question_text}\n\n"
+            + "\n".join(choice_lines)
+            + "\n\n"
+            "Answer with a single letter.\n\n"
             "End with: Answer: X"
         )
     else:
@@ -336,21 +354,23 @@ def _process_single_query(
 ) -> QueryResult | None:
     """Send one query and process the result. Returns None on failure."""
     try:
-        if config.prompt_mode == "cot" or (config.prompt_mode == "direct" and config.think):
-            # Think mode needs more headroom — <think> blocks can be 500-1500 tokens
-            cot_max_tokens = 4096 if config.think else 2048
+        if config.think:
+            result = client.generate_think(
+                prompt=prompt,
+                max_tokens=4096,
+                temperature=config.temperature,
+            )
+        elif config.prompt_mode == "cot":
             result = client.generate_cot(
                 prompt=prompt,
-                max_tokens=cot_max_tokens,
+                max_tokens=2048,
                 temperature=config.temperature,
-                top_logprobs=20,
-                think=config.think,
             )
         else:
-            # Direct mode — generate_with_logprobs applies the chat template
+            # Direct mode — single-token logprob extraction
             result = client.generate_with_logprobs(
                 prompt=prompt,
-                think=config.think,
+                think=False,
             )
     except Exception:
         return None
@@ -487,6 +507,7 @@ def run_single_question(
             article_text,
             perm,
             prompt_mode=config.prompt_mode,
+            think=config.think,
         )
         prompts.append(prompt)
         paraphrase_indices.append(qn)
