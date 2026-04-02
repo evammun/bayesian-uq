@@ -66,6 +66,10 @@ class QueryResult(BaseModel):
     paraphrase_index: int = Field(
         description="Index into paraphrase list, or -1 for original question",
     )
+    paraphrase_category: str = Field(
+        default="",
+        description="Paraphrase category: 'A' (text-grounded), 'B' (pure rephrase), 'C' (angle shift), or '' (shuffle-only/no paraphrase)",
+    )
     query_text: str  # the actual prompt sent to the model (truncated for storage)
     answer_permutation: list[int] = Field(
         description="Display position → canonical index mapping",

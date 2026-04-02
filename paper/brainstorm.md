@@ -51,6 +51,23 @@
 
 **Key empirical question:** Does pure paraphrase consistency (Option A) already predict context sufficiency + action correctness? If yes, skip the fancy probes. **Pilot should test this.**
 
+### 3.1 Paraphrase Design (April 2 — tested)
+
+Goal: introduce diversity into the LLM's reasoning to surface mechanical uncertainty. Paraphrases must NOT contaminate — no leaking answer content, no adding context beyond the original question. Three categories per question (10 total: 3+3+4):
+
+**Category A — Text-grounded framing (3 paraphrases)**
+Anchor the question to the passage: "According to the passage...", "In [Title]...", "Based on what you just read...". Nudges model to attend to retrieved context over pretraining. Light touch only — title and character names, no plot details.
+
+**Category B — Pure rephrasing (3 paraphrases)**
+Synonym/structure variation only. No reference to text or title. Baseline diversity. Limited but clean.
+
+**Category C — Perspective/angle shifts (4 paraphrases)**
+Push hardest for diversity. Counterfactuals ("What would have had to be different for X?"), perspective inversions ("What about the era makes someone like Gubelin rare?"), negation ("What would NOT be true if..."), specificity shifts ("What about Si specifically — rather than retirement in general?"). These stress-test comprehension differently from A/B.
+
+**Generation approach:** Sonnet API with article context (so it understands the question) but constrained output (must not include article details that hint at answers). Paraphrase categories stored in data for per-category analysis.
+
+**Key insight from testing:** Pure rephrasing (B) produces low diversity for short questions ("What makes Gubelin an outlier?" has only so many synonyms). Context-heavy paraphrasing leaks answers. The A+B+C split balances diversity against contamination. Category C counterfactuals produce the most genuinely different framings.
+
 ---
 
 ## 4. Dataset Strategy
