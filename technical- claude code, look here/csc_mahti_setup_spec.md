@@ -360,10 +360,27 @@ These are real problems we hit during the first Mahti deployment, in order:
 - wget with the wrong case returns 404
 - **Fix:** Download with correct URL, save as lowercase: `wget -O qwen3-8b-q4_k_m.gguf https://...Qwen3-8B-Q4_K_M.gguf`
 
-### 7. CoT wall time might be tight (MONITORING)
-- CoT noshuffle: ~6s per question x 4609 = ~7.7 hours. Wall time set to 6 hours.
-- May need resume after wall-time kill, or increase to `--time=10:00:00`
-- Resume logic handles this automatically
+### 7. CoT wall time might be tight (SOLVED)
+- CoT noshuffle: ~6s per question x 4609 = ~7.7 hours. Default wall time was 6 hours.
+- First run was killed after ~4 minutes (likely crash, not wall time), second run resumed
+- **Fix:** Always specify `--time=36:00:00` for CoT shuffle experiments when submitting directly via `sbatch` (the `submit_all.sh` script handles this automatically)
+
+### 8. Duplicate results on resume (SOLVED — 2026-04-02)
+- CoT noshuffle results (sufficient + insufficient) had ~9178 entries instead of 4609
+- **Root cause:** After the first run saved partial results and died, a second run resumed from the file but reprocessed all 4609 questions instead of just the remaining ones. The carried-over results were preserved, and new results were appended, creating duplicates with alternating 10-entry blocks matching the incremental save interval.
+- Both occurrences were genuine re-inferences (different CoT reasoning, 5.5% answer disagreement), not byte-identical copies
+- The exact mechanism for why the filtering (`all_questions = [q for q in all_questions if q.question_unique_id not in completed_ids]`) failed is unclear — the IDs match, the code looks correct. Likely a Mahti-specific environmental factor (early SLURM script bugs with `srun`, possible Lustre filesystem interaction)
+- **Fix (3 layers):**
+  1. Pre-loop filtering (existed before, but somehow failed)
+  2. Belt-and-suspenders skip: `if question.question_unique_id in completed_ids_set: continue` (added commit `6916fc8`)
+  3. `completed_ids_set.add()` after each question to prevent within-run duplicates
+- **Data fix:** Deduped both affected files by keeping first occurrence of each question_id (9178→4609, 9168→4609)
+- **Prevention:** Single `sbatch` submissions instead of `submit_all.sh`, all three filtering layers active
+
+### 9. RNG seeding breaks on resume (SOLVED — 2026-04-02)
+- `_make_question_rng(seed, idx)` used loop index from the FILTERED question list
+- On resume, remaining questions get different indices → different shuffle permutations than an uninterrupted run
+- **Fix:** Build `_original_index` map (question_unique_id → position in unfiltered list) before filtering. RNG seeds are now stable regardless of resume state (commit `4c23baa`)
 
 ---
 
@@ -421,7 +438,7 @@ CoT is slower than initially estimated (~6s/q vs ~3s predicted). Shuffle+CoT exp
 - `fetch_results.ps1` — pull results from Mahti to local
 
 **Mahti configs (`experiments/configs/mahti/`):**
-- All 8 experiments with n_ctx=32768 (vs 12288 on vast.ai)
+- 4 sufficient-only experiments with n_ctx=32768 (insufficient configs removed 2026-04-02)
 - Pure ASCII encoding (no em-dashes or special chars)
 
 **vast.ai scripts (`scripts/`) unchanged** — different execution model, same core code.

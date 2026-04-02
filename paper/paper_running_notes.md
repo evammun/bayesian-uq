@@ -246,21 +246,63 @@ New Streamlit dashboard with: progress+timing per run, per-run distribution hist
 
 ---
 
+## April 2, 2026 — Dedup Fix, Insufficient Dropped, CoT Shuffle Running
+
+### Duplicate results in CoT noshuffle runs (diagnosed + fixed)
+Both CoT noshuffle result files (sufficient: 9178 entries, insufficient: 9168) had nearly 2x the expected 4609 entries. Investigation:
+- Data shows two separate inference runs interleaved in alternating 10-entry blocks (matching incremental save interval)
+- First run saved 4569/4559 entries, then died. Second run resumed, carried over results, but reprocessed all questions instead of just the remaining ~40
+- Confirmed by timestamps: filename from run 1 (20:18 UTC), JSON timestamp from run 2 (20:22 UTC), ~4 min gap = ~40 questions at 6s/q
+- Both copies are valid inferences (different CoT reasoning, 5.5% answer disagreement) — not byte-identical dupes
+- Exact filtering failure mechanism unclear (code looks correct, IDs match). Likely related to early SLURM script issues (`srun` environment inheritance, first deployment bugs)
+- **Fix:** Three layers of duplicate prevention now in place (pre-loop filter, belt-and-suspenders skip, per-question set update). Data deduped: kept first occurrence of each question_id.
+
+### RNG seeding bug on resume (fixed)
+`_make_question_rng(seed, idx)` used loop position from the FILTERED list. On resume, remaining questions got different RNG seeds → different shuffle permutations. Fixed by building a stable index map from question_unique_id → original position BEFORE filtering. Critical for the cot_shuffle run which will need multiple resume cycles.
+
+### Insufficient context configs removed
+Dropped all 8 insufficient configs (4 regular + 4 Mahti). Sufficient-only going forward — insufficient data already collected is enough as supporting evidence, not the main experiment.
+
+### CoT shuffle sufficient: running on Mahti
+- Job 6213699 submitted with `--time=36:00:00`
+- Config verified: cot, shuffle=true, sufficient, 10 permutations, n_ctx=32768
+- Early results (50 questions): 80% accuracy, 97.6% Pass 1/2 agreement, no duplicates, clean reasoning traces
+- Estimated ~77h total compute, will need 2-3 submissions with auto-resume
+
+### Dashboard fixes
+- Progress bar: clamp pct to [0, 1.0] (was crashing on pre-dedup files with count > total)
+- CoT explorer: Pass 1/2 comparison now in canonical space (was comparing display letter vs canonical letter — every shuffled result looked like a disagreement)
+- Effects tab: delta direction now consistent (sufficient-insufficient, not arbitrary pair ordering)
+
+---
+
+## Decision Log (updated)
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-04-02 | Drop insufficient context configs | Enough data collected, not our main experiment |
+| 2026-04-02 | Single sbatch instead of submit_all.sh | Prevents accidental double-submission that may have caused duplicates |
+| 2026-04-02 | 3-layer duplicate prevention | Belt-and-suspenders: pre-filter + in-loop skip + per-question set tracking |
+| 2026-04-02 | Stable RNG seeding via original index map | Ensures shuffle permutations are reproducible across resume cycles |
+
+---
+
 ## Next Steps
-- [x] ~~Download RGB dataset~~ (dropped)
-- [x] Dataset change: RGB → QuALITY
-- [x] Download QuALITY, merge train+dev → `quality_all.jsonl` (265 articles, 4609 questions)
-- [x] Port inference layer: llama-cpp-python with low-level logit extraction
-- [x] Port experiment pipeline for QuALITY MCQ format
-- [x] Build insufficient context condition (article swapping, same-topic preferred)
-- [x] Fix chat template, n_batch, model discovery, remove fake threading
-- [x] Port/rewrite Streamlit dashboard for QuALITY
-- [x] Run direct noshuffle experiments (sufficient + insufficient) — DONE on vast.ai
-- [x] Deploy pipeline to CSC Mahti, smoke test passes
-- [ ] **IN PROGRESS:** Direct shuffle sufficient — vast.ai (~2000/4609)
-- [ ] **IN PROGRESS:** CoT noshuffle sufficient + insufficient — Mahti (just started)
-- [ ] Direct shuffle insufficient — vast.ai (next after shuffle suf finishes)
+### Completed
+- [x] Dataset: QuALITY (530 articles, 4609 questions, MCQ format)
+- [x] Inference layer: llama-cpp-python, low-level logit extraction, chat template
+- [x] Pipeline: experiment runner, incremental save, resume, CoT two-pass
+- [x] Dashboard: progress, distributions, accuracy, effects, question explorer
+- [x] Direct noshuffle sufficient + insufficient — DONE (vast.ai)
+- [x] Direct shuffle sufficient — DONE (vast.ai)
+- [x] Direct shuffle insufficient — DONE (vast.ai, 820q partial)
+- [x] CoT noshuffle sufficient + insufficient — DONE (Mahti, deduped)
+- [x] Mahti deployment, smoke tests, SLURM scripts
+
+### In progress
+- [ ] **CoT shuffle sufficient — Mahti** (50/4609, ~77h total, 2-3 resume cycles)
+
+### Remaining
 - [ ] Compute signals on completed results, validate discriminative power
 - [ ] Key question: does sufficient vs insufficient show different uncertainty profiles?
-- [ ] CoT shuffle experiments (expensive — ~80h each, need BU allocation increase)
 - [ ] Build partial (C3) and counterfactual (C4) context conditions
