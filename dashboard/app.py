@@ -278,10 +278,10 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
             key = f"_rate_hist_{file_path.name}"
             history = st.session_state.get(key, [])
 
-            # Append current observation, keep last 30 (~15 min at 30s refresh)
+            # Append current observation, keep last 60 (~30 min at 30s refresh)
             history.append((done_q, now))
-            if len(history) > 30:
-                history = history[-30:]
+            if len(history) > 60:
+                history = history[-60:]
             st.session_state[key] = history
 
             # Use the observation closest to 5 minutes ago for a stable rate
