@@ -226,15 +226,16 @@ def _fmt_sec(s: float) -> str:
     return f"{sec}s"
 
 
+def _effective_mode(cfg: dict) -> str:
+    """Map prompt_mode + think to a single mode label."""
+    if cfg.get("think", False):
+        return "think"
+    return "CoT" if cfg.get("prompt_mode", "direct") == "cot" else "direct"
+
+
 def format_run_label(cfg: dict) -> str:
     """Human-readable run label."""
-    parts = []
-    pm = cfg.get("prompt_mode", "direct")
-    parts.append("CoT" if pm == "cot" else "direct")
-    if cfg.get("think", False):
-        parts.append("think")
-    else:
-        parts.append("nothink")
+    parts = [_effective_mode(cfg)]
     parts.append("shuffle" if cfg.get("shuffle_options", True) else "noshuffle")
     parts.append(cfg.get("context_condition", "?"))
     return " · ".join(parts)
@@ -364,11 +365,14 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
             else:
                 agreement = float("nan")
 
+            mode = _effective_mode(cfg)
+
             rows.append({
                 "run_name": run_name,
                 "context_condition": context,
                 "think": think,
                 "prompt_mode": prompt_mode,
+                "mode": mode,
                 "shuffle": shuffle,
                 "question_id": qr.get("question_id", ""),
                 "article_id": qr.get("article_id", ""),
@@ -671,8 +675,7 @@ def tab_comparison() -> None:
     # Detect which factors actually vary (only show columns that differ)
     factor_cols = []
     factor_labels = {
-        "prompt_mode": "Mode",
-        "think": "Think",
+        "mode": "Mode",
         "shuffle": "Shuffle",
         "context_condition": "Context",
     }
@@ -1054,7 +1057,7 @@ def tab_effects() -> None:
             "msp_incorrect": incorrect_sub["msp"].mean() if len(incorrect_sub) > 0 else None,
             "agreement_correct": correct_sub["agreement"].mean() if len(correct_sub[correct_sub["agreement"].notna()]) > 0 else None,
             "agreement_incorrect": incorrect_sub["agreement"].mean() if len(incorrect_sub[incorrect_sub["agreement"].notna()]) > 0 else None,
-            "prompt_mode": sub["prompt_mode"].iloc[0] if "prompt_mode" in sub.columns else "direct",
+            "mode": sub["mode"].iloc[0] if "mode" in sub.columns else "direct",
             "shuffle": sub["shuffle"].iloc[0] if "shuffle" in sub.columns else True,
             "context": sub["context_condition"].iloc[0],
         }
@@ -1090,7 +1093,7 @@ def tab_effects() -> None:
     # Detect which variables vary
     contexts = set(m["context"] for m in run_metrics.values())
     shuffles = set(m["shuffle"] for m in run_metrics.values())
-    modes = set(m["prompt_mode"] for m in run_metrics.values())
+    modes = set(m["mode"] for m in run_metrics.values())
 
     # Find matched pairs for each variable that has both levels
     variables = []
@@ -1099,7 +1102,7 @@ def tab_effects() -> None:
     if len(shuffles) > 1:
         variables.append(("shuffle", "Shuffle: on vs off"))
     if len(modes) > 1:
-        variables.append(("prompt_mode", "Mode: CoT vs direct"))
+        variables.append(("mode", "Mode"))
 
     if not variables:
         st.info("Need runs with contrasting conditions to compute effects.")
@@ -1107,9 +1110,9 @@ def tab_effects() -> None:
 
     # Define which value is "first" in each comparison (delta = first - second)
     var_first_value = {
-        "context": "sufficient",       # sufficient vs insufficient → positive = sufficient better
-        "shuffle": True,               # on vs off → positive = shuffle better
-        "prompt_mode": "cot",          # CoT vs direct → positive = CoT better
+        "context": "sufficient",
+        "shuffle": True,
+        "mode": "think",
     }
 
     effect_rows = []
@@ -1122,7 +1125,7 @@ def tab_effects() -> None:
         for i, (name_a, m_a) in enumerate(run_list):
             for name_b, m_b in run_list[i+1:]:
                 diff_on_var = m_a[var_name] != m_b[var_name]
-                other_vars = [v for v in ["context", "shuffle", "prompt_mode"] if v != var_name]
+                other_vars = [v for v in ["context", "shuffle", "mode"] if v != var_name]
                 match_on_rest = all(m_a[v] == m_b[v] for v in other_vars)
 
                 if diff_on_var and match_on_rest:
