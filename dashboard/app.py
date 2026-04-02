@@ -718,11 +718,11 @@ def tab_comparison() -> None:
         row["Conf Easy"] = f"{msp_easy:.2f}" if not math.isnan(msp_easy) else "-"
         row["Conf Hard"] = f"{msp_hard:.2f}" if not math.isnan(msp_hard) else "-"
         row["N"] = len(sub)
-        row["_ctx_sort"] = 0 if "Context" in row and row["Context"] == "Sufficient" else 1
+        row["_acc_sort"] = acc
         pivot_data.append(row)
 
-    # Sort: sufficient first, then insufficient
-    pivot_data.sort(key=lambda r: r.pop("_ctx_sort", 0))
+    # Sort by overall accuracy descending
+    pivot_data.sort(key=lambda r: r.pop("_acc_sort", 0), reverse=True)
 
     if pivot_data:
         # Build HTML table with grouped column headers
