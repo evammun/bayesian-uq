@@ -651,6 +651,10 @@ def run_experiment(
         filename = f"{config.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         output_file = output_dir / filename
 
+    # Build stable index map BEFORE filtering — so each question always gets
+    # the same RNG seed regardless of whether we're resuming or running fresh.
+    _original_index = {q.question_unique_id: i for i, q in enumerate(all_questions)}
+
     # Resume support
     if completed_ids:
         original_count = len(all_questions)
@@ -679,7 +683,7 @@ def run_experiment(
         if question.question_unique_id in completed_ids_set:
             continue
 
-        rng = _make_question_rng(config.seed, idx)
+        rng = _make_question_rng(config.seed, _original_index[question.question_unique_id])
 
         result = run_single_question(
             client=client,

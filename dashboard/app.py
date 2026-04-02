@@ -1079,17 +1079,22 @@ def tab_effects() -> None:
         st.info("Need runs with contrasting conditions to compute effects.")
         return
 
+    # Define which value is "first" in each comparison (delta = first - second)
+    var_first_value = {
+        "context": "sufficient",       # sufficient vs insufficient → positive = sufficient better
+        "shuffle": True,               # on vs off → positive = shuffle better
+        "prompt_mode": "cot",          # CoT vs direct → positive = CoT better
+    }
+
     effect_rows = []
     for var_name, var_label in variables:
-        # Group runs into pairs differing only on this variable
         pairs_found = 0
         acc_deltas = []
-        msp_deltas = []
 
+        first_val = var_first_value.get(var_name)
         run_list = list(run_metrics.items())
         for i, (name_a, m_a) in enumerate(run_list):
             for name_b, m_b in run_list[i+1:]:
-                # Check they differ on var_name and match on everything else
                 diff_on_var = m_a[var_name] != m_b[var_name]
                 other_vars = [v for v in ["context", "shuffle", "prompt_mode"] if v != var_name]
                 match_on_rest = all(m_a[v] == m_b[v] for v in other_vars)
@@ -1097,7 +1102,11 @@ def tab_effects() -> None:
                 if diff_on_var and match_on_rest:
                     pairs_found += 1
                     if m_a["accuracy"] is not None and m_b["accuracy"] is not None:
-                        acc_deltas.append(m_a["accuracy"] - m_b["accuracy"])
+                        # Consistent direction: first_val - other_val
+                        if m_a[var_name] == first_val:
+                            acc_deltas.append(m_a["accuracy"] - m_b["accuracy"])
+                        else:
+                            acc_deltas.append(m_b["accuracy"] - m_a["accuracy"])
 
         avg_delta = sum(acc_deltas) / len(acc_deltas) if acc_deltas else None
         effect_rows.append({
