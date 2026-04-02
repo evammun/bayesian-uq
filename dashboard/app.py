@@ -257,8 +257,8 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
     elapsed_str = ""
     remaining_str = ""
     rate_str = ""
-    pct = done_q / max(total_q, 1)
-    finished = pct >= 1.0
+    pct = min(done_q / max(total_q, 1), 1.0)
+    finished = done_q >= total_q
 
     try:
         if finished and completed_at:
@@ -977,9 +977,12 @@ def tab_explorer() -> None:
         # Reasoning trace (CoT / think modes)
         if prompt_mode in ("cot", "cot_structured") or (cfg and cfg.get("think")):
             # Pass 1 vs Pass 2 answer — always visible
-            pass1 = query_log[0].get("pass1_answer", "") if query_log else ""
-            if pass1:
-                st.caption(f"Pass 1 (free) answer: **{pass1}** · Pass 2 (logprob) answer: **{ANSWER_LETTERS[row['final_answer']]}**")
+            pass1_canonical = query_log[0].get("pass1_canonical_answer", -1) if query_log else -1
+            if pass1_canonical >= 0:
+                pass1_letter = ANSWER_LETTERS[pass1_canonical]
+                pass2_letter = ANSWER_LETTERS[row['final_answer']]
+                agree = "agree" if pass1_letter == pass2_letter else "**DISAGREE**"
+                st.caption(f"Pass 1 (free) answer: **{pass1_letter}** · Pass 2 (logprob) answer: **{pass2_letter}** ({agree})")
 
             # Reasoning trace in expander
             traces = [ql.get("thinking_trace", "") for ql in query_log if ql.get("thinking_trace")]
