@@ -39,10 +39,8 @@ RESULTS_DIR="results"
 mkdir -p "$RESULTS_DIR"
 
 CONFIGS=(
-    "experiments/configs/quality_direct_noshuffle_sufficient.yaml"
-    "experiments/configs/quality_direct_shuffle_sufficient.yaml"
-    "experiments/configs/quality_cot_noshuffle_sufficient.yaml"
-    "experiments/configs/quality_cot_shuffle_sufficient.yaml"
+    # Direct and CoT conditions already complete — run on Mahti or previous vast.ai
+    # Only think experiment remains for vast.ai
     "experiments/configs/quality_think_noshuffle_sufficient.yaml"
 )
 
