@@ -337,9 +337,11 @@ def _process_single_query(
     """Send one query and process the result. Returns None on failure."""
     try:
         if config.prompt_mode == "cot" or (config.prompt_mode == "direct" and config.think):
+            # Think mode needs more headroom — <think> blocks can be 500-1500 tokens
+            cot_max_tokens = 4096 if config.think else 2048
             result = client.generate_cot(
                 prompt=prompt,
-                max_tokens=2048,
+                max_tokens=cot_max_tokens,
                 temperature=config.temperature,
                 top_logprobs=20,
                 think=config.think,
