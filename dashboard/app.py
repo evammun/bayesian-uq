@@ -770,7 +770,10 @@ def tab_comparison() -> None:
                     vals = sub[col].dropna()
                     row[col] = f"{vals.mean():.3f}" if len(vals) > 0 else "-"
                 summary_rows.append(row)
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            df_summary = pd.DataFrame(summary_rows)
+            if "accuracy" in df_summary.columns:
+                df_summary = df_summary.sort_values("accuracy", ascending=False, key=lambda s: pd.to_numeric(s, errors="coerce"))
+            st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
     # Calibration curves
     st.subheader("Calibration: Reliability Diagram")
@@ -1066,7 +1069,9 @@ def tab_effects() -> None:
         })
 
     if summary_rows:
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+        df_runs = pd.DataFrame(summary_rows)
+        df_runs = df_runs.sort_values("Accuracy", ascending=False, key=lambda s: pd.to_numeric(s.str.rstrip("%"), errors="coerce"))
+        st.dataframe(df_runs, use_container_width=True, hide_index=True)
 
     # --- Matched pair analysis ---
     st.subheader("Matched Pair Effects")
