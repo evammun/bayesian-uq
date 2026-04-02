@@ -395,14 +395,21 @@ auto_refresh = st.sidebar.toggle("Auto-refresh (30s)", value=False)
 if auto_refresh:
     st_autorefresh(interval=30_000, key="auto_refresh_counter")
 
+# Filter options
+hide_insufficient = st.sidebar.toggle("Hide insufficient", value=True)
+
 # Build run labels
 run_labels: dict[str, Path] = {}
 for fp in result_files:
     cfg = _extract_config_head(fp)
     if cfg:
+        if hide_insufficient and cfg.get("context_condition") == "insufficient":
+            continue
         label = format_run_label(cfg)
     else:
         label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
+        if hide_insufficient and "insufficient" in label:
+            continue
     run_labels[label] = fp
 
 # Select all checkbox + multiselect

@@ -132,6 +132,7 @@ NOT doing: production system (paper = empirical validation), training anything (
 - Scaffolding absorption in RAG setting: does CoT suppress comprehension uncertainty the same way it suppressed MMLU uncertainty?
 - Broken-premise taxonomy from v2 → types of context insufficiency? (entity missing, contradictory info, wrong domain, partial info)
 - The with/without context comparison: if adding context doesn't change logprob distribution → model answering from parametric knowledge, not context. Simple signal, possibly powerful.
+- Insufficient context accuracy is 34-37%, above 25% chance — model using training data to answer. Worth investigating: which questions does it get right? Are they answerable from world knowledge alone? Connects to C5 design.
 - Per-domain analysis: does UQ help more in some domains (legal, medical) than others?
 - Qwen 3.5 vs Qwen 3: thinking mode implications for the pipeline
 - Luigi's commercial framing: "verification layer as drop-in module" — paper validates, product packages
