@@ -598,7 +598,7 @@ def tab_distributions() -> None:
             sub = active[active["run_name"] == run_names[idx]]
             with col:
                 st.plotly_chart(_round_hover(_msp_hist(sub, _run_label(run_names[idx]))),
-                                use_container_width=True)
+                                width="stretch")
 
     # --- Agreement (only for multi-query runs, 2 per row) ---
     multi = active[(active["num_queries"] > 1) & active["agreement"].notna()]
@@ -614,7 +614,7 @@ def tab_distributions() -> None:
                 sub = multi[multi["run_name"] == multi_runs[idx]]
                 with col:
                     st.plotly_chart(_round_hover(_agree_hist(sub, _run_label(multi_runs[idx]))),
-                                    use_container_width=True)
+                                    width="stretch")
 
     # --- Fragile confidence: MSP by agreement bin ---
     st.subheader("Fragile Confidence: MSP by Agreement Level")
@@ -649,7 +649,7 @@ def tab_distributions() -> None:
                 sub = multi_fc[multi_fc["run_name"] == fc_runs[idx]].dropna(subset=["agreement", "msp"])
                 with col:
                     st.plotly_chart(_round_hover(_fragile_box(sub, _run_label(fc_runs[idx]))),
-                                    use_container_width=True)
+                                    width="stretch")
     else:
         st.caption("Requires multi-query runs (shuffle conditions).")
 
@@ -787,7 +787,7 @@ def tab_comparison() -> None:
             df_summary = pd.DataFrame(summary_rows)
             if "accuracy" in df_summary.columns:
                 df_summary = df_summary.sort_values("accuracy", ascending=False, key=lambda s: pd.to_numeric(s, errors="coerce"))
-            st.dataframe(df_summary, use_container_width=True, hide_index=True)
+            st.dataframe(df_summary, width="stretch", hide_index=True)
 
     # Calibration curves
     st.subheader("Calibration: Reliability Diagram")
@@ -894,7 +894,7 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
         height=450,
     ))
 
-    st.plotly_chart(_round_hover(fig), use_container_width=True)
+    st.plotly_chart(_round_hover(fig), width="stretch")
 
 
 # ---------------------------------------------------------------------------
@@ -996,7 +996,7 @@ def tab_explorer() -> None:
                 xaxis_title="Query", yaxis_title="Probability",
                 barmode="stack", height=220, showlegend=True,
             ))
-            st.plotly_chart(_round_hover(fig), use_container_width=True)
+            st.plotly_chart(_round_hover(fig), width="stretch")
 
         # Reasoning trace (CoT / think modes)
         if prompt_mode in ("cot", "cot_structured") or (cfg and cfg.get("think")):
@@ -1085,7 +1085,7 @@ def tab_effects() -> None:
     if summary_rows:
         df_runs = pd.DataFrame(summary_rows)
         df_runs = df_runs.sort_values("Accuracy", ascending=False, key=lambda s: pd.to_numeric(s.str.rstrip("%"), errors="coerce"))
-        st.dataframe(df_runs, use_container_width=True, hide_index=True)
+        st.dataframe(df_runs, width="stretch", hide_index=True)
 
     # --- Matched pair analysis ---
     st.subheader("Matched Pair Effects")
@@ -1154,7 +1154,7 @@ def tab_effects() -> None:
         })
 
     if effect_rows:
-        st.dataframe(pd.DataFrame(effect_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(effect_rows), width="stretch", hide_index=True)
 
     # --- Per-run distribution comparison ---
     st.subheader("MSP Distributions by Run")
@@ -1184,7 +1184,7 @@ def tab_effects() -> None:
         xaxis_title="MSP", yaxis_title="",
         height=max(250, 80 * len(active["run_name"].unique())),
     ))
-    st.plotly_chart(_round_hover(fig), use_container_width=True)
+    st.plotly_chart(_round_hover(fig), width="stretch")
 
 
 # ---------------------------------------------------------------------------
