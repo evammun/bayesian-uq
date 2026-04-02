@@ -28,7 +28,7 @@ fi
 # Step 2: Run all experiments (auto-resume skips completed ones)
 echo ""
 echo "[$(date)] Running experiments..."
-bash scripts/run_all_pilots.sh
+bash scripts/run_experiments.sh
 EXP_EXIT=$?
 
 if [ $EXP_EXIT -ne 0 ]; then

@@ -69,7 +69,7 @@ The Python script does this per question:
 | Max runtime | Unlimited (until eviction) | 36 hours (gpusmall) |
 | GPU | RTX 5090 (rented) | A100 40GB (allocated) |
 
-**Key insight:** Instead of `run_all_pilots.sh` (one loop doing everything), each experiment becomes a separate SLURM job. This is better — jobs run independently, can be parallel, and wall-time limits are per-experiment.
+**Key insight:** Instead of `run_experiments.sh` (one loop doing everything), each experiment becomes a separate SLURM job. This is better — jobs run independently, can be parallel, and wall-time limits are per-experiment.
 
 ---
 

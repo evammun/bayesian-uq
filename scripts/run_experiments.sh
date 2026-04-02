@@ -3,7 +3,7 @@
 # Run all experiment configs with automatic resume support
 # ============================================================================
 # Usage:
-#   bash scripts/run_all_pilots.sh
+#   bash scripts/run_experiments.sh
 #
 # For each config, this script:
 #   1. Checks if a COMPLETE result file exists → skips if done
@@ -21,7 +21,7 @@
 # NOTE: no set -e — if one experiment fails, continue with the rest
 
 # --- Lock file to prevent duplicate instances ---
-LOCKFILE="/tmp/run_all_pilots.lock"
+LOCKFILE="/tmp/run_experiments.lock"
 if [ -f "$LOCKFILE" ]; then
     OLD_PID=$(cat "$LOCKFILE" 2>/dev/null)
     if kill -0 "$OLD_PID" 2>/dev/null; then
