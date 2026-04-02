@@ -269,10 +269,27 @@ Dropped all 8 insufficient configs (4 regular + 4 Mahti). Sufficient-only going 
 - Early results (50 questions): 80% accuracy, 97.6% Pass 1/2 agreement, no duplicates, clean reasoning traces
 - Estimated ~77h total compute, will need 2-3 submissions with auto-resume
 
+### Replaced two-pass anti-leak with single-pass natural reasoning
+Old architecture: CoT anti-leak prompt ("do NOT name the answer letter") + separate Pass 2 with stripped reasoning. New: model reasons freely, logprobs extracted at the answer position conditioned on FULL reasoning output. Same method for CoT (visible reasoning) and think mode (internal `<think>` blocks). Simpler, more natural, consistent across modes.
+
+### Think mode: scaffolding absorption confirmed
+- 85.5% accuracy (vs 75% direct) — think improves answers
+- But 802/820 questions at >99% confidence. Logprobs nearly always 1.0 — completely uninformative for UQ
+- The think block always commits ("So the answer is C") before the answer token, collapsing the distribution
+- **Key exception:** 2/830 Pass 1/2 disagreements (`61405_DPAPHI73_8`, `60507_QOO9BH2K_10`). Both cases show genuine deliberative uncertainty in the think block ("not 100% sure", flip-flopping between options). The uncertainty survived into the logprobs (0.89/0.11 and 0.65/0.35). Worth revisiting with full results — rare cases where think mode logprobs ARE informative may correspond to detectable hedging patterns.
+
+### CoT natural: conciseness preserves uncertainty
+- The "3-4 bullet points" instruction naturally prevents scaffolding absorption — model doesn't have space to commit before "Answer:"
+- CoT logprobs show real variance: mean 0.938, min 0.437 (vs think mean 0.997)
+- 96.5% Pass 1/2 agreement — 3.5% disagreements are temperature sampling cases
+- The conciseness constraint is the actual anti-leak mechanism, not the explicit instruction we dropped
+
 ### Dashboard fixes
 - Progress bar: clamp pct to [0, 1.0] (was crashing on pre-dedup files with count > total)
-- CoT explorer: Pass 1/2 comparison now in canonical space (was comparing display letter vs canonical letter — every shuffled result looked like a disagreement)
-- Effects tab: delta direction now consistent (sufficient-insufficient, not arbitrary pair ordering)
+- CoT explorer: Pass 1/2 comparison now in canonical space (was comparing display vs canonical letter)
+- Effects tab: pairwise mode comparisons (CoT vs direct, think vs direct, think vs CoT) + MSP delta
+- Think mode shows as its own mode in all tables (not "direct + think=true")
+- All accuracy tables sorted by descending accuracy
 
 ---
 
@@ -284,6 +301,8 @@ Dropped all 8 insufficient configs (4 regular + 4 Mahti). Sufficient-only going 
 | 2026-04-02 | Single sbatch instead of submit_all.sh | Prevents accidental double-submission that may have caused duplicates |
 | 2026-04-02 | 3-layer duplicate prevention | Belt-and-suspenders: pre-filter + in-loop skip + per-question set tracking |
 | 2026-04-02 | Stable RNG seeding via original index map | Ensures shuffle permutations are reproducible across resume cycles |
+| 2026-04-02 | Replace two-pass anti-leak with single-pass natural reasoning | Anti-leak was artificial; conciseness instruction naturally prevents absorption. Consistent extraction across CoT and think modes |
+| 2026-04-02 | Think mode as separate experimental condition | Tests Qwen3 internal reasoning vs visible CoT vs direct. Finding: improves accuracy but destroys logprob uncertainty signal |
 
 ---
 
