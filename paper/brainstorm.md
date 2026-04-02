@@ -86,6 +86,19 @@ The experimental manipulation is *ours*, not the dataset's. For each QuALITY que
 - C4 (counterfactual): hardest to construct automatically. Options: entity swap (replace key names/dates), negation insertion, or manual for pilot. Park for later — C1/C2/C3 are enough to start.
 - **Start with C1 and C2 only.** Sufficient vs fully insufficient is the cleanest comparison and the easiest to construct. Add C3/C4 once we have baseline results.
 
+**C5: Topically-relevant insufficient (April 2 idea)**
+
+C2 tests "retrieval completely failed" (wrong article). But real RAG failures are subtler: the retrieved context is thematically related but doesn't contain the specific answer. The model's world knowledge fills the gap — confidently and incorrectly.
+
+*Motivating example:* Article 61007 is a Garden of Eden retelling (man named Ha-Adamah, woman named Hawwah, forbidden fruit, naming animals). Q: "Why does the crew refer to Ha-Adamah as Adam?" Correct answer: Father Briton (the linguist) confirms Ha-Adamah is the Hebrew form of Adam — it's an etymological recognition. But Qwen 8B (CoT, sufficient context, 0.603 confidence, 6/10 agreement) chose: "The planet feels like Eden, so they begin to believe he IS Adam." The model latched onto the thematic reading from its Genesis training data instead of tracking the specific dialogue. Claude Opus, given the same question cold, cited the exact dialogue and got it right.
+
+This matters because it mirrors the real failure mode: a legal assistant retrieves topically relevant docs about contract law, but the specific clause the user asked about isn't there. The model answers anyway from its legal training data. The answer sounds authoritative and is thematically consistent — but wrong.
+
+*Design options:*
+- Construct questions about familiar themes (religion, history, law) that are answerable from world knowledge but where the article's actual content diverges
+- Check if existing QuALITY hard-wrong cases already correlate with "world-knowledge-plausible" wrong answers
+- Could generate these automatically: take an article touching a well-known topic, ask questions the model's priors would answer differently than the text
+
 ### 4.2 Additional design axes
 - **Easy vs hard questions:** QuALITY provides this split. Speed-reader accuracy as difficulty proxy. Key prediction: signals more discriminative on hard subset.
 - **Think vs no-think:** Scaffolding absorption in comprehension setting. Does thinking mode suppress uncertainty the same way it did in MMLU?
