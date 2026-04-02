@@ -40,13 +40,10 @@ mkdir -p "$RESULTS_DIR"
 
 CONFIGS=(
     "experiments/configs/quality_direct_noshuffle_sufficient.yaml"
-    "experiments/configs/quality_direct_noshuffle_insufficient.yaml"
     "experiments/configs/quality_direct_shuffle_sufficient.yaml"
-    "experiments/configs/quality_direct_shuffle_insufficient.yaml"
     "experiments/configs/quality_cot_noshuffle_sufficient.yaml"
-    "experiments/configs/quality_cot_noshuffle_insufficient.yaml"
     "experiments/configs/quality_cot_shuffle_sufficient.yaml"
-    "experiments/configs/quality_cot_shuffle_insufficient.yaml"
+    "experiments/configs/quality_think_noshuffle_sufficient.yaml"
 )
 
 # Total questions in QuALITY dataset
