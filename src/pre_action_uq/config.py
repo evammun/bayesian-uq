@@ -49,6 +49,8 @@ class ExperimentConfig(BaseModel):
     seed: int = 42
     temperature: float = 0.7
     num_permutations: int = 10  # total queries per question (each with a different answer permutation)
+    use_paraphrases: bool = False  # use paraphrase bank (data/paraphrases.json) for question text
+    paraphrases_file: str = "data/paraphrases.json"
     n_ctx: int = 12288  # 12K fits all QuALITY articles; 8192 overflows ~42% of them
 
 

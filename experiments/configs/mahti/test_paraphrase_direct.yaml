@@ -1,0 +1,17 @@
+# Test: direct mode with paraphrases, 10 questions only
+# 10 paraphrases per question (3A + 3B + 4C), no shuffle
+
+run_name: test_paraphrase_direct
+model_path: auto
+model_name: qwen3:8b-q4_K_M
+think: false
+prompt_mode: direct
+dataset_file: data/quality_all.jsonl
+context_condition: sufficient
+shuffle_options: false
+use_paraphrases: true
+max_questions: 10
+seed: 42
+temperature: 0.7
+num_permutations: 10
+n_ctx: 32768

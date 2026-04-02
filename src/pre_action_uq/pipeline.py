@@ -34,6 +34,10 @@ from .config import (
 from .inference import LlamaCppClient, extract_answer_logprobs
 
 
+# Module-level paraphrase bank (loaded once per experiment)
+_paraphrase_bank: dict = {}
+
+
 # ---------------------------------------------------------------------------
 # Atomic incremental file writes (ported from v2 — O(1) per save)
 # ---------------------------------------------------------------------------
@@ -352,6 +356,7 @@ def _process_single_query(
     client: LlamaCppClient,
     config: ExperimentConfig,
     question_text_used: str = "",
+    paraphrase_category: str = "",
 ) -> QueryResult | None:
     """Send one query and process the result. Returns None on failure."""
     try:
@@ -407,6 +412,7 @@ def _process_single_query(
     return QueryResult(
         query_number=query_num,
         paraphrase_index=paraphrase_index,
+        paraphrase_category=paraphrase_category,
         query_text=stored_prompt,
         question_text_used=question_text_used,
         answer_permutation=permutation,
@@ -430,16 +436,19 @@ def _run_queries(
     client: LlamaCppClient,
     config: ExperimentConfig,
     global_query_count: list[int],
-    question_text_used: str = "",
+    question_texts_used: list[str] | None = None,
+    paraphrase_categories: list[str] | None = None,
 ) -> tuple[list[QueryResult], int]:
     """Run all queries for a question sequentially."""
     query_log: list[QueryResult] = []
     extraction_failures = 0
 
     for qn in range(len(prompts)):
+        q_text = question_texts_used[qn] if question_texts_used else ""
+        q_cat = paraphrase_categories[qn] if paraphrase_categories else ""
         result = _process_single_query(
             qn, prompts[qn], paraphrase_indices[qn], permutations[qn],
-            client, config, question_text_used=question_text_used,
+            client, config, question_text_used=q_text, paraphrase_category=q_cat,
         )
         if result is None:
             extraction_failures += 1
@@ -494,18 +503,36 @@ def run_single_question(
             question, all_questions, rng,
         )
 
-    # Build query schedule: same question text, different answer permutations
+    # Build query schedule
     prompts: list[str] = []
     paraphrase_indices: list[int] = []
     permutations: list[list[int]] = []
+    question_texts_used: list[str] = []
+    paraphrase_categories: list[str] = []
+
+    # Load paraphrases for this question if enabled
+    para_texts: list[tuple[str, str]] = []  # (text, category)
+    if config.use_paraphrases and _paraphrase_bank:
+        entry = _paraphrase_bank.get(question.question_unique_id, {})
+        for cat in ["A", "B", "C"]:
+            for p in entry.get(cat, []):
+                para_texts.append((p, cat))
 
     for qn in range(num_queries):
         if config.shuffle_options:
             perm = generate_permutation(num_choices, rng)
         else:
             perm = list(range(num_choices))  # identity permutation
+
+        # Use paraphrase if available, otherwise original
+        if para_texts and qn < len(para_texts):
+            q_text, q_cat = para_texts[qn]
+        else:
+            q_text = question.question_text
+            q_cat = ""
+
         prompt = build_prompt(
-            question.question_text,
+            q_text,
             question.options,
             article_text,
             perm,
@@ -515,12 +542,15 @@ def run_single_question(
         prompts.append(prompt)
         paraphrase_indices.append(qn)
         permutations.append(perm)
+        question_texts_used.append(q_text)
+        paraphrase_categories.append(q_cat)
 
     # Execute queries sequentially (GPU is the bottleneck)
     query_log, failures = _run_queries(
         prompts, paraphrase_indices, permutations,
         client, config, global_query_count,
-        question_text_used=question.question_text,
+        question_texts_used=question_texts_used or [question.question_text] * len(prompts),
+        paraphrase_categories=paraphrase_categories or [""] * len(prompts),
     )
 
     # Handle skipped questions (all queries failed, e.g. n_ctx overflow)
@@ -634,6 +664,18 @@ def run_experiment(
     print(f"Loading dataset: {dataset_path}")
     all_questions = load_quality_dataset(dataset_path)
     print(f"  {len(all_questions)} questions loaded")
+
+    # Load paraphrase bank if enabled
+    global _paraphrase_bank
+    if config.use_paraphrases:
+        para_path = Path(config.paraphrases_file)
+        if not para_path.is_absolute():
+            para_path = Path(__file__).resolve().parent.parent.parent / para_path
+        print(f"Loading paraphrases: {para_path}")
+        _paraphrase_bank = json.loads(para_path.read_text(encoding="utf-8"))
+        print(f"  {len(_paraphrase_bank)} questions with paraphrases")
+    else:
+        _paraphrase_bank = {}
 
     # Apply max_questions limit
     if config.max_questions and config.max_questions < len(all_questions):
