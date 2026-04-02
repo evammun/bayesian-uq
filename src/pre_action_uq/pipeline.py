@@ -351,6 +351,7 @@ def _process_single_query(
     permutation: list[int],
     client: LlamaCppClient,
     config: ExperimentConfig,
+    question_text_used: str = "",
 ) -> QueryResult | None:
     """Send one query and process the result. Returns None on failure."""
     try:
@@ -393,8 +394,8 @@ def _process_single_query(
     if extraction_mode == "cot" and len(stored_logprobs) > 1:
         stored_logprobs = [stored_logprobs[answer_idx]]
 
-    # Truncate prompt in stored result to save space (keep first 200 chars)
-    stored_prompt = prompt[:200] + "..." if len(prompt) > 200 else prompt
+    # Store passage snippet (first 80 chars) for verification, not full article
+    stored_prompt = prompt[:80] + "..." if len(prompt) > 80 else prompt
 
     # Map Pass 1 answer (CoT) to canonical index
     pass1_answer = result.get("pass1_answer", "")
@@ -407,6 +408,7 @@ def _process_single_query(
         query_number=query_num,
         paraphrase_index=paraphrase_index,
         query_text=stored_prompt,
+        question_text_used=question_text_used,
         answer_permutation=permutation,
         raw_response=result["response_text"],
         raw_logprobs=stored_logprobs,
@@ -428,6 +430,7 @@ def _run_queries(
     client: LlamaCppClient,
     config: ExperimentConfig,
     global_query_count: list[int],
+    question_text_used: str = "",
 ) -> tuple[list[QueryResult], int]:
     """Run all queries for a question sequentially."""
     query_log: list[QueryResult] = []
@@ -436,7 +439,7 @@ def _run_queries(
     for qn in range(len(prompts)):
         result = _process_single_query(
             qn, prompts[qn], paraphrase_indices[qn], permutations[qn],
-            client, config,
+            client, config, question_text_used=question_text_used,
         )
         if result is None:
             extraction_failures += 1
@@ -517,6 +520,7 @@ def run_single_question(
     query_log, failures = _run_queries(
         prompts, paraphrase_indices, permutations,
         client, config, global_query_count,
+        question_text_used=question.question_text,
     )
 
     # Handle skipped questions (all queries failed, e.g. n_ctx overflow)

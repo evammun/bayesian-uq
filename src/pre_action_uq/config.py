@@ -70,7 +70,8 @@ class QueryResult(BaseModel):
         default="",
         description="Paraphrase category: 'A' (text-grounded), 'B' (pure rephrase), 'C' (angle shift), or '' (shuffle-only/no paraphrase)",
     )
-    query_text: str  # the actual prompt sent to the model (truncated for storage)
+    query_text: str  # passage snippet for verification (truncated)
+    question_text_used: str = ""  # the actual question asked (original or paraphrase)
     answer_permutation: list[int] = Field(
         description="Display position → canonical index mapping",
     )
