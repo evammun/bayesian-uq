@@ -1090,58 +1090,67 @@ def tab_effects() -> None:
     # --- Matched pair analysis ---
     st.subheader("Matched Pair Effects")
 
-    # Detect which variables vary
+    # Build pairwise comparisons: each compares two values of one variable,
+    # matched on all other variables. Mode comparisons are pairwise against direct.
+    comparisons = []  # (var_name, val_a, val_b, label)
+
     contexts = set(m["context"] for m in run_metrics.values())
     shuffles = set(m["shuffle"] for m in run_metrics.values())
     modes = set(m["mode"] for m in run_metrics.values())
 
-    # Find matched pairs for each variable that has both levels
-    variables = []
     if len(contexts) > 1:
-        variables.append(("context", "Context: sufficient vs insufficient"))
+        comparisons.append(("context", "sufficient", "insufficient", "Sufficient vs insufficient"))
     if len(shuffles) > 1:
-        variables.append(("shuffle", "Shuffle: on vs off"))
-    if len(modes) > 1:
-        variables.append(("mode", "Mode"))
+        comparisons.append(("shuffle", True, False, "Shuffle on vs off"))
+    if "CoT" in modes and "direct" in modes:
+        comparisons.append(("mode", "CoT", "direct", "CoT vs direct"))
+    if "think" in modes and "direct" in modes:
+        comparisons.append(("mode", "think", "direct", "Think vs direct"))
+    if "think" in modes and "CoT" in modes:
+        comparisons.append(("mode", "think", "CoT", "Think vs CoT"))
 
-    if not variables:
+    if not comparisons:
         st.info("Need runs with contrasting conditions to compute effects.")
         return
 
-    # Define which value is "first" in each comparison (delta = first - second)
-    var_first_value = {
-        "context": "sufficient",
-        "shuffle": True,
-        "mode": "think",
-    }
-
+    match_vars = ["context", "shuffle", "mode"]
     effect_rows = []
-    for var_name, var_label in variables:
-        pairs_found = 0
-        acc_deltas = []
+    run_list = list(run_metrics.items())
 
-        first_val = var_first_value.get(var_name)
-        run_list = list(run_metrics.items())
+    for var_name, val_a, val_b, label in comparisons:
+        acc_deltas = []
+        msp_deltas = []
+        pairs_found = 0
+
         for i, (name_a, m_a) in enumerate(run_list):
             for name_b, m_b in run_list[i+1:]:
-                diff_on_var = m_a[var_name] != m_b[var_name]
-                other_vars = [v for v in ["context", "shuffle", "mode"] if v != var_name]
-                match_on_rest = all(m_a[v] == m_b[v] for v in other_vars)
+                # One must have val_a, the other val_b
+                a_has_a = m_a[var_name] == val_a and m_b[var_name] == val_b
+                b_has_a = m_b[var_name] == val_a and m_a[var_name] == val_b
+                if not (a_has_a or b_has_a):
+                    continue
+                # Must match on all other variables
+                other = [v for v in match_vars if v != var_name]
+                if not all(m_a[v] == m_b[v] for v in other):
+                    continue
+                pairs_found += 1
+                # Delta = val_a - val_b
+                if a_has_a:
+                    ma, mb = m_a, m_b
+                else:
+                    ma, mb = m_b, m_a
+                if ma["accuracy"] is not None and mb["accuracy"] is not None:
+                    acc_deltas.append(ma["accuracy"] - mb["accuracy"])
+                if ma["msp_correct"] is not None and mb["msp_correct"] is not None:
+                    msp_deltas.append(ma["msp_correct"] - mb["msp_correct"])
 
-                if diff_on_var and match_on_rest:
-                    pairs_found += 1
-                    if m_a["accuracy"] is not None and m_b["accuracy"] is not None:
-                        # Consistent direction: first_val - other_val
-                        if m_a[var_name] == first_val:
-                            acc_deltas.append(m_a["accuracy"] - m_b["accuracy"])
-                        else:
-                            acc_deltas.append(m_b["accuracy"] - m_a["accuracy"])
-
-        avg_delta = sum(acc_deltas) / len(acc_deltas) if acc_deltas else None
+        avg_acc = sum(acc_deltas) / len(acc_deltas) if acc_deltas else None
+        avg_msp = sum(msp_deltas) / len(msp_deltas) if msp_deltas else None
         effect_rows.append({
-            "Effect": var_label,
+            "Effect": label,
             "Pairs": pairs_found,
-            "Accuracy Delta": f"{avg_delta:+.1%}" if avg_delta is not None else "-",
+            "Acc. Delta": f"{avg_acc:+.1%}" if avg_acc is not None else "-",
+            "MSP Delta": f"{avg_msp:+.3f}" if avg_msp is not None else "-",
         })
 
     if effect_rows:
