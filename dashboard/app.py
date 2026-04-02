@@ -277,10 +277,10 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
             key = f"_rate_hist_{file_path.name}"
             history = st.session_state.get(key, [])
 
-            # Append current observation, keep last 10
+            # Append current observation, keep last 30 (~15 min at 30s refresh)
             history.append((done_q, now))
-            if len(history) > 10:
-                history = history[-10:]
+            if len(history) > 30:
+                history = history[-30:]
             st.session_state[key] = history
 
             # Use the observation closest to 5 minutes ago for a stable rate
@@ -305,9 +305,20 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
                 remaining_sec = remaining_q / rate
                 remaining_str = f"~{_fmt_sec(remaining_sec)}"
                 rate_str = f"{rate * 60:.0f} q/min"
-            elif len(history) < 3:
-                remaining_str = "measuring..."
-            # else: leave as empty (no rate yet, don't show stalled)
+            else:
+                # Fallback: elapsed time / questions done (works for
+                # uninterrupted runs like Mahti, inaccurate after vast.ai resumes)
+                parts = file_path.stem.split("_")
+                if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
+                    start = datetime.strptime(parts[-2] + "_" + parts[-1], "%Y%m%d_%H%M%S")
+                    elapsed_sec = (datetime.now() - start).total_seconds()
+                    if done_q > 0 and elapsed_sec > 0:
+                        fallback_rate = done_q / elapsed_sec
+                        remaining_sec = (total_q - done_q) / fallback_rate
+                        remaining_str = f"~{_fmt_sec(remaining_sec)}*"
+                        rate_str = f"{fallback_rate * 60:.1f} q/min*"
+                if not remaining_str and len(history) < 3:
+                    remaining_str = "measuring..."
     except Exception:
         pass
 
