@@ -1,0 +1,15 @@
+# QuALITY full (Mahti A100): direct + think mode, shuffle, sufficient
+# n_ctx=32768 for A100 40GB headroom
+
+run_name: quality_think_shuffle_sufficient
+model_path: auto
+model_name: qwen3:8b-q4_K_M
+think: true
+prompt_mode: direct
+dataset_file: data/quality_all.jsonl
+context_condition: sufficient
+shuffle_options: true
+seed: 42
+temperature: 0.7
+num_permutations: 10
+n_ctx: 32768
