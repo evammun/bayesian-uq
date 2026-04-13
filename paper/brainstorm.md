@@ -111,10 +111,19 @@ C2 tests "retrieval completely failed" (wrong article). But real RAG failures ar
 
 This matters because it mirrors the real failure mode: a legal assistant retrieves topically relevant docs about contract law, but the specific clause the user asked about isn't there. The model answers anyway from its legal training data. The answer sounds authoritative and is thematically consistent — but wrong.
 
+*The core test:* Given the article text, ask a question that is thematically on-point, references the right characters/setting, but cannot be answered from the text alone. The model must either admit it can't answer from the context, or it reveals that it's drawing from pretraining. This is the "am I allowed to eat apples at work" test — the RAG has docs about apples and legality, the model KNOWS the answer from training, but the specific question isn't covered by the retrieved docs. Does the model follow its mandate (admit insufficient context) or answer from pretraining?
+
+*Why current signals might fail here:* The model isn't confused — it has a confident answer from world knowledge. MSP is high, agreement is high, epistemic is low. All our signals say "trust this." But the answer comes from the wrong source. This is the hardest adversarial case for UQ.
+
+*Potential detection approaches:*
+- **With/without context comparison** (parking lot idea): run the same question with NO article. If the model gives the same answer and confidence, it's not using the context at all. Delta between with-context and without-context logprobs as a signal.
+- **Context perturbation**: slightly modify the article (change a name, swap a detail) and re-ask. If the answer doesn't change, the model isn't reading the context.
+- **Explicit grounding probe**: "Based ONLY on the passage, can this question be answered?" as a meta-question.
+
 *Design options:*
-- Construct questions about familiar themes (religion, history, law) that are answerable from world knowledge but where the article's actual content diverges
-- Check if existing QuALITY hard-wrong cases already correlate with "world-knowledge-plausible" wrong answers
-- Could generate these automatically: take an article touching a well-known topic, ask questions the model's priors would answer differently than the text
+- Use Sonnet to generate C5 questions per article: "Given this article about [theme], write questions that are thematically plausible but NOT answerable from the text. The questions should be ones the model could answer from general knowledge."
+- Check if existing QuALITY hard-wrong cases already correlate with "world-knowledge-plausible" wrong answers — might find natural C5 examples in our data
+- Start with articles touching well-known themes (Garden of Eden, space exploration tropes, war) where the model's priors are strongest
 
 ### 4.2 Additional design axes
 - **Easy vs hard questions:** QuALITY provides this split. Speed-reader accuracy as difficulty proxy. Key prediction: signals more discriminative on hard subset.
