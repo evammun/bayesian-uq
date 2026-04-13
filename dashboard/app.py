@@ -365,8 +365,20 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
             if query_probs:
                 per_query_argmax = [int(np.argmax(p)) for p in query_probs]
                 agreement = sum(1 for a in per_query_argmax if a == final_answer) / len(per_query_argmax)
+
+                # Epistemic/aleatoric decomposition
+                qp = np.array(query_probs)
+                qp = np.clip(qp, 1e-12, None)  # avoid log(0)
+                mean_dist = qp.mean(axis=0)
+                total_entropy = -float(np.sum(mean_dist * np.log(mean_dist)))
+                per_query_entropy = -np.sum(qp * np.log(qp), axis=1)
+                aleatoric = float(per_query_entropy.mean())
+                epistemic = total_entropy - aleatoric
             else:
                 agreement = float("nan")
+                total_entropy = float("nan")
+                aleatoric = float("nan")
+                epistemic = float("nan")
 
             mode = _effective_mode(cfg)
 
@@ -389,7 +401,11 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
                 "num_queries": n_queries,
                 "mean_probs": mean_probs,
                 "msp": max(mean_probs) if mean_probs else float("nan"),
+                "single_entropy": -float(np.sum(np.array(mean_probs).clip(1e-12) * np.log(np.array(mean_probs).clip(1e-12)))) if mean_probs else float("nan"),
                 "agreement": agreement,
+                "total_entropy": total_entropy,
+                "aleatoric": aleatoric,
+                "epistemic": epistemic,
                 "query_log": query_log,
             })
 
@@ -970,7 +986,8 @@ def tab_explorer() -> None:
 
         correct_str = "Correct" if row["is_correct"] else "Wrong"
         correct_color = TEAL if row["is_correct"] else ROSE
-        agree_str = f'{row["agreement"]:.2f}' if not math.isnan(row["agreement"]) else "-"
+        agree_str = f'{row["agreement"]:.2f}' if not math.isnan(row.get("agreement", float("nan"))) else "-"
+        epist_str = f'{row["epistemic"]:.3f}' if not math.isnan(row.get("epistemic", float("nan"))) else "-"
 
         st.markdown(
             f'<div style="font-size:14px; margin-bottom:4px;">'
@@ -978,7 +995,8 @@ def tab_explorer() -> None:
             f'Answer: <b>{ANSWER_LETTERS[row["final_answer"]]}</b> · '
             f'<span style="color:{correct_color};">{correct_str}</span> · '
             f'MSP: {row["msp"]:.3f} · '
-            f'Agreement: {agree_str}'
+            f'Agreement: {agree_str} · '
+            f'Epistemic: {epist_str}'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1063,6 +1081,9 @@ def tab_effects() -> None:
             "msp_incorrect": incorrect_sub["msp"].mean() if len(incorrect_sub) > 0 else None,
             "agreement_correct": correct_sub["agreement"].mean() if len(correct_sub[correct_sub["agreement"].notna()]) > 0 else None,
             "agreement_incorrect": incorrect_sub["agreement"].mean() if len(incorrect_sub[incorrect_sub["agreement"].notna()]) > 0 else None,
+            "epistemic": sub["epistemic"].mean() if "epistemic" in sub.columns and len(sub["epistemic"].dropna()) > 0 else None,
+            "epistemic_correct": correct_sub["epistemic"].mean() if "epistemic" in correct_sub.columns and len(correct_sub["epistemic"].dropna()) > 0 else None,
+            "epistemic_incorrect": incorrect_sub["epistemic"].mean() if "epistemic" in incorrect_sub.columns and len(incorrect_sub["epistemic"].dropna()) > 0 else None,
             "mode": sub["mode"].iloc[0] if "mode" in sub.columns else "direct",
             "shuffle": sub["shuffle"].iloc[0] if "shuffle" in sub.columns else True,
             "paraphrase": sub["paraphrase"].iloc[0] if "paraphrase" in sub.columns else False,
@@ -1087,6 +1108,8 @@ def tab_effects() -> None:
             "MSP (incorrect)": f"{m['msp_incorrect']:.3f}" if m["msp_incorrect"] is not None else "-",
             "Agreement (correct)": f"{m['agreement_correct']:.3f}" if m["agreement_correct"] is not None else "-",
             "Agreement (incorrect)": f"{m['agreement_incorrect']:.3f}" if m["agreement_incorrect"] is not None else "-",
+            "Epist. (correct)": f"{m['epistemic_correct']:.4f}" if m["epistemic_correct"] is not None else "-",
+            "Epist. (incorrect)": f"{m['epistemic_incorrect']:.4f}" if m["epistemic_incorrect"] is not None else "-",
         })
 
     if summary_rows:
@@ -1130,6 +1153,7 @@ def tab_effects() -> None:
     for var_name, val_a, val_b, label in comparisons:
         acc_deltas = []
         msp_deltas = []
+        epist_deltas = []
         pairs_found = 0
 
         for i, (name_a, m_a) in enumerate(run_list):
@@ -1153,14 +1177,18 @@ def tab_effects() -> None:
                     acc_deltas.append(ma["accuracy"] - mb["accuracy"])
                 if ma["msp_correct"] is not None and mb["msp_correct"] is not None:
                     msp_deltas.append(ma["msp_correct"] - mb["msp_correct"])
+                if ma["epistemic"] is not None and mb["epistemic"] is not None:
+                    epist_deltas.append(ma["epistemic"] - mb["epistemic"])
 
         avg_acc = sum(acc_deltas) / len(acc_deltas) if acc_deltas else None
         avg_msp = sum(msp_deltas) / len(msp_deltas) if msp_deltas else None
+        avg_epist = sum(epist_deltas) / len(epist_deltas) if epist_deltas else None
         effect_rows.append({
             "Effect": label,
             "Pairs": pairs_found,
             "Acc. Delta": f"{avg_acc:+.1%}" if avg_acc is not None else "-",
             "MSP Delta": f"{avg_msp:+.3f}" if avg_msp is not None else "-",
+            "Epistemic Delta": f"{avg_epist:+.4f}" if avg_epist is not None else "-",
         })
 
     if effect_rows:
