@@ -1402,7 +1402,7 @@ def tab_signals() -> None:
             else:
                 bg = "transparent"
 
-            html += f'<td style="background:{bg};">{v:+.3f}</td>'
+            html += f'<td style="background:{bg};">{v:+.2f}</td>'
         html += "</tr>"
 
     html += "</table>"
