@@ -156,6 +156,24 @@ NOT doing: production system (paper = empirical validation), training anything (
 
 ---
 
+## 7b. Analysis TODO (once experiments complete)
+
+**AUROC table** — the paper's key quantitative result. Every signal × every condition → AUROC for "can it separate correct from incorrect?" Then logistic regression on signal combinations to show complementarity. The 2D space (confidence × consistency) is a special case. This is what reviewers will look at first.
+
+**Selective prediction curves (AUARC)** — "refuse the most uncertain X% of questions, what's accuracy on the rest?" Plot accuracy vs coverage for each signal and condition. Most practically relevant metric — directly answers "how useful is this signal for a production system?" A signal with high AUROC but flat selective prediction curve is theoretically interesting but useless in practice.
+
+**Easy vs hard breakdown** — QuALITY provides this split. Run the full signal battery separately on easy and hard subsets. Prediction: signals are more discriminative on hard questions (where the model is more likely to be wrong and where UQ matters most). If signals only work on easy questions, the whole framework is less useful.
+
+**N-query sensitivity** — how many shuffle permutations do you actually need? Subsample from our 10-permutation data: compute AUROC at N=2,3,5,7,10. If N=3 gets 90% of the signal, the adaptive escalation can be much cheaper. Pure analysis on existing data, no new experiments.
+
+**Think trace content analysis** — we know trace LENGTH is a strong signal (+1976 chars when wrong). What about CONTENT? Count hedging phrases ("I'm not sure", "could be", "on the other hand", "wait") in the think block. Hypothesis: hedging frequency correlates with incorrectness. Cheap to compute, potentially powerful, and uniquely available from think mode.
+
+**Calibration reliability diagrams** — is MSP=0.8 actually correct 80% of the time? Per-condition calibration. Think mode will be badly calibrated (MSP≈1.0 regardless of correctness). Direct mode should be better. ECE (expected calibration error) as summary stat.
+
+**Cross-mode disagreement as feature** — we showed CoT vs direct disagreement → 44.9% accuracy. Can we use the PATTERN of disagreement (which modes agree/disagree) as a feature? A question where all three modes agree is very likely correct. A question where all three disagree is very likely wrong. The sensitivity profile vector from v2 spec (S25).
+
+---
+
 ## 8. Adaptive Escalation Experiment (future)
 
 **Idea:** Compare flat inference (run every question at one mode) against an uncertainty-led escalation strategy that starts cheap and only spends compute when signals say the answer is weak.
