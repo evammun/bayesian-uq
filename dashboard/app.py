@@ -1232,6 +1232,30 @@ def tab_effects() -> None:
 ANSWER_TOKENS = {" A", " B", " C", " D", "A", "B", "C", "D"}
 
 
+def _html_table(rows: list[dict]) -> None:
+    """Render a list of dicts as a simple copyable HTML table."""
+    if not rows:
+        return
+    cols = list(rows[0].keys())
+    html = """<style>
+    .sig-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
+    .sig-table th, .sig-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
+    .sig-table th { color: #8B95A1; font-weight: 500; }
+    .sig-table td:first-child { text-align: left; font-weight: 500; }
+    .sig-table tr:hover { background: #F5F3F1; }
+    </style><table class="sig-table"><tr>"""
+    for c in cols:
+        html += f"<th>{c}</th>"
+    html += "</tr>"
+    for r in rows:
+        html += "<tr>"
+        for c in cols:
+            html += f"<td>{r.get(c, '-')}</td>"
+        html += "</tr>"
+    html += "</table>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _compute_signal_battery(df: pd.DataFrame) -> list[dict]:
     """Compute per-run signal deltas (incorrect - correct) from the main dataframe."""
     rows = []
@@ -1502,9 +1526,7 @@ def tab_signals() -> None:
         })
 
     if cross_rows:
-        cross_df = pd.DataFrame(cross_rows)
-        st.dataframe(cross_df, width="stretch", hide_index=True)
-        st.download_button("Download CSV", cross_df.to_csv(index=False), "cross_mode.csv", key="dl_cross")
+        _html_table(cross_rows)
         st.markdown("When modes **agree**, accuracy is high. When they **disagree**, accuracy drops — the disagreement itself is a strong uncertainty signal.")
     else:
         st.info("Need at least 2 modes (direct, CoT, think) with noshuffle runs to compare.")
@@ -1560,9 +1582,7 @@ def tab_signals() -> None:
         })
 
     if pos_rows:
-        pos_df = pd.DataFrame(pos_rows)
-        st.dataframe(pos_df, width="stretch", hide_index=True)
-        st.download_button("Download CSV", pos_df.to_csv(index=False), "position_loyalty.csv", key="dl_pos")
+        _html_table(pos_rows)
         st.markdown("Higher position variance on incorrect answers means the model's wrong answers are more position-dependent — relying on heuristics rather than comprehension.")
     else:
         st.info("Need shuffle runs to compute position loyalty.")
@@ -1637,9 +1657,7 @@ def tab_signals() -> None:
         })
 
     if trace_rows:
-        trace_df = pd.DataFrame(trace_rows)
-        st.dataframe(trace_df, width="stretch", hide_index=True)
-        st.download_button("Download CSV", trace_df.to_csv(index=False), "reasoning_signals.csv", key="dl_trace")
+        _html_table(trace_rows)
         st.markdown(
             "**Trace Delta**: positive = model writes more when wrong. "
             "**P1/P2 disagree**: rate at which the model's free answer differs from logprob answer. "
