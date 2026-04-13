@@ -1118,9 +1118,12 @@ def tab_effects() -> None:
         })
 
     if summary_rows:
-        # Sort by accuracy descending
         summary_rows.sort(key=lambda r: float(r["Accuracy"].rstrip("%")) if r["Accuracy"] != "-" else 0, reverse=True)
-        _html_table(summary_rows)
+        _html_table(summary_rows, highlight={
+            "MSP delta": "neg_good",
+            "Agree delta": "neg_good",
+            "Epist. delta": "pos_good",
+        })
 
     # --- Matched pair analysis ---
     st.subheader("Matched Pair Effects")
@@ -1197,7 +1200,11 @@ def tab_effects() -> None:
         })
 
     if effect_rows:
-        _html_table(effect_rows)
+        _html_table(effect_rows, highlight={
+            "Acc. Delta": "pos_good",
+            "MSP Delta": "pos_good",
+            "Epistemic Delta": "pos_good",
+        })
 
     # --- Per-run distribution comparison ---
     st.subheader("MSP Distributions by Run")
@@ -1237,11 +1244,34 @@ def tab_effects() -> None:
 ANSWER_TOKENS = {" A", " B", " C", " D", "A", "B", "C", "D"}
 
 
-def _html_table(rows: list[dict]) -> None:
-    """Render a list of dicts as a simple copyable HTML table."""
+def _html_table(rows: list[dict], highlight: dict[str, str] | None = None) -> None:
+    """Render a list of dicts as a simple copyable HTML table.
+
+    Args:
+        rows: List of dicts, one per row.
+        highlight: Optional dict of column_name -> "neg_good" or "pos_good".
+            "neg_good": negative values get teal (good), positive get rose.
+            "pos_good": positive values get teal (good), negative get rose.
+    """
     if not rows:
         return
+    highlight = highlight or {}
     cols = list(rows[0].keys())
+
+    # Collect max absolute value across highlighted columns for scaling
+    max_abs = 0.0
+    if highlight:
+        for r in rows:
+            for c in highlight:
+                val = r.get(c, "-")
+                if isinstance(val, str) and val not in ("-", ""):
+                    try:
+                        max_abs = max(max_abs, abs(float(val.replace("%", "").replace("+", ""))))
+                    except ValueError:
+                        pass
+    if max_abs == 0:
+        max_abs = 1.0
+
     html = """<style>
     .sig-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
     .sig-table th, .sig-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
@@ -1255,7 +1285,24 @@ def _html_table(rows: list[dict]) -> None:
     for r in rows:
         html += "<tr>"
         for c in cols:
-            html += f"<td>{r.get(c, '-')}</td>"
+            val = r.get(c, "-")
+            bg = ""
+            if c in highlight and isinstance(val, str) and val not in ("-", ""):
+                try:
+                    fval = float(val.replace("%", "").replace("+", ""))
+                    direction = highlight[c]
+                    # "neg_good": negative is good (teal), positive is bad (rose)
+                    # "pos_good": positive is good (teal), negative is bad (rose)
+                    good = (fval < 0 and direction == "neg_good") or (fval > 0 and direction == "pos_good")
+                    strength = min(abs(fval) / max_abs, 1.0)
+                    alpha = min(strength * 0.5, 0.30)
+                    if good and alpha > 0.02:
+                        bg = f' style="background:rgba(42,140,143,{alpha:.2f});"'
+                    elif not good and alpha > 0.02:
+                        bg = f' style="background:rgba(220,100,100,{alpha:.2f});"'
+                except ValueError:
+                    pass
+            html += f"<td{bg}>{val}</td>"
         html += "</tr>"
     html += "</table>"
     st.markdown(html, unsafe_allow_html=True)
@@ -1587,7 +1634,7 @@ def tab_signals() -> None:
         })
 
     if pos_rows:
-        _html_table(pos_rows)
+        _html_table(pos_rows, highlight={"Delta": "pos_good"})
         st.markdown("Higher position variance on incorrect answers means the model's wrong answers are more position-dependent — relying on heuristics rather than comprehension.")
     else:
         st.info("Need shuffle runs to compute position loyalty.")
