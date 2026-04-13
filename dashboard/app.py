@@ -1350,72 +1350,83 @@ def tab_signals() -> None:
         return
 
     rows.sort(key=lambda r: r["N"], reverse=True)
-    signal_cols = ["MSP", "Epistemic", "2nd Gap", "Coverage", "Conf Var", "Agree-Conf"]
 
-    # Build HTML table with colour highlighting
-    html = """<style>
-    .sig-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
-    .sig-table th, .sig-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
-    .sig-table th { color: #8B95A1; font-weight: 500; }
-    .sig-table td.cond { text-align: left; font-weight: 500; }
-    .sig-table tr:hover { background: #F5F3F1; }
-    </style><table class="sig-table">"""
+    single_cols = ["MSP", "2nd Gap", "Coverage"]
+    multi_cols = ["Epistemic", "Conf Var", "Agree-Conf"]
 
-    html += "<tr><th>Mode</th><th>Shuffle</th><th>Para</th><th>N</th>"
-    for col in signal_cols:
-        html += f"<th>{col}</th>"
-    html += "</tr>"
+    def _signal_table(title: str, caption: str, cols: list[str], neg_good: set[str]) -> None:
+        """Render one signal table with colour highlighting."""
+        st.subheader(title)
+        st.caption(caption)
 
-    # Collect all absolute deltas to find the max for colour scaling
-    all_abs = []
-    for r in rows:
-        for col in signal_cols:
-            v = r.get(col)
-            if v is not None:
-                all_abs.append(abs(v))
-    max_abs = max(all_abs) if all_abs else 1.0
+        all_abs = []
+        for r in rows:
+            for col in cols:
+                v = r.get(col)
+                if v is not None:
+                    all_abs.append(abs(v))
+        max_abs = max(all_abs) if all_abs else 1.0
 
-    for r in rows:
-        html += "<tr>"
-        html += f'<td class="cond">{r["Mode"]}</td><td>{r["Shuffle"]}</td><td>{r["Para"]}</td><td>{r["N"]}</td>'
-        for col in signal_cols:
-            v = r.get(col)
-            if v is None:
-                html += "<td>-</td>"
-                continue
-            # Determine if this direction is "good" for discrimination
-            # MSP, 2nd Gap, Coverage: negative delta = good (lower when wrong)
-            # Epistemic, Conf Var, Agree-Conf: positive delta = good (higher when wrong)
-            if col in ("MSP", "2nd Gap", "Coverage"):
-                strength = -v / max_abs  # negative v is good → positive strength
-            else:
-                strength = v / max_abs   # positive v is good → positive strength
+        html = """<style>
+        .sig-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
+        .sig-table th, .sig-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
+        .sig-table th { color: #8B95A1; font-weight: 500; }
+        .sig-table td.cond { text-align: left; font-weight: 500; }
+        .sig-table tr:hover { background: #F5F3F1; }
+        </style><table class="sig-table">"""
 
-            # Colour: teal for strong discrimination, rose for inverted, white for weak
-            strength = max(-1.0, min(1.0, strength))
-            if strength > 0.05:
-                alpha = min(strength * 0.6, 0.35)
-                bg = f"rgba(42, 140, 143, {alpha:.2f})"
-            elif strength < -0.05:
-                alpha = min(-strength * 0.6, 0.35)
-                bg = f"rgba(220, 100, 100, {alpha:.2f})"
-            else:
-                bg = "transparent"
-
-            html += f'<td style="background:{bg};">{v:+.2f}</td>'
+        html += "<tr><th>Mode</th><th>Shuffle</th><th>Para</th><th>N</th>"
+        for col in cols:
+            html += f"<th>{col}</th>"
         html += "</tr>"
 
-    html += "</table>"
-    st.markdown(html, unsafe_allow_html=True)
+        for r in rows:
+            html += "<tr>"
+            html += f'<td class="cond">{r["Mode"]}</td><td>{r["Shuffle"]}</td><td>{r["Para"]}</td><td>{r["N"]}</td>'
+            for col in cols:
+                v = r.get(col)
+                if v is None:
+                    html += "<td>-</td>"
+                    continue
+                strength = (-v if col in neg_good else v) / max_abs
+                strength = max(-1.0, min(1.0, strength))
+                if strength > 0.05:
+                    alpha = min(strength * 0.6, 0.35)
+                    bg = f"rgba(42, 140, 143, {alpha:.2f})"
+                elif strength < -0.05:
+                    alpha = min(-strength * 0.6, 0.35)
+                    bg = f"rgba(220, 100, 100, {alpha:.2f})"
+                else:
+                    bg = "transparent"
+                html += f'<td style="background:{bg};">{v:+.2f}</td>'
+            html += "</tr>"
+        html += "</table>"
+        st.markdown(html, unsafe_allow_html=True)
+
+    _signal_table(
+        "Single-Query Signals",
+        "From individual forward passes. Delta = mean(incorrect) - mean(correct). "
+        "Negative = signal is lower when wrong (good for MSP, 2nd Gap, Coverage).",
+        single_cols, neg_good={"MSP", "2nd Gap", "Coverage"},
+    )
 
     st.markdown("""
-    **Signals** (all shown as incorrect - correct delta):
-    - **MSP**: max single-token probability. Negative = less confident when wrong.
-    - **Epistemic**: mutual information across queries. Positive = more disagreement when wrong.
-    - **2nd Gap**: `top_prob - second_prob`. Negative = less decisive when wrong.
-    - **Coverage**: answer-token mass in top-20 logprobs. Negative = model hesitates more when wrong. (Direct mode only — CoT/think force commitment.)
-    - **Conf Var**: std of per-query confidence. Positive = more unstable when wrong. (Multi-query only.)
-    - **Agree-Conf**: `agreement - MSP`. Positive = agrees on answer but less confident when wrong. (Multi-query only.)
+    - **MSP**: max probability. Lower when wrong = less confident.
+    - **2nd Gap**: `top_prob - second_prob` on mean distribution. Lower when wrong = less decisive.
+    - **Coverage**: answer-token mass in top-20 logprobs. Lower when wrong = model hesitates. (Direct mode only.)
+    """)
+
+    _signal_table(
+        "Multi-Query Signals",
+        "From comparing across queries (shuffle/paraphrase). Delta = mean(incorrect) - mean(correct). "
+        "Positive = signal is higher when wrong (good for Epistemic, Conf Var, Agree-Conf).",
+        multi_cols, neg_good=set(),
+    )
+
+    st.markdown("""
+    - **Epistemic**: mutual information across queries. Higher when wrong = more disagreement.
+    - **Conf Var**: std of per-query confidence. Higher when wrong = unstable confidence.
+    - **Agree-Conf**: `agreement - MSP`. Higher when wrong = agrees on answer but not confident.
     """)
 
 
