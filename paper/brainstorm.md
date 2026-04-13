@@ -156,7 +156,32 @@ NOT doing: production system (paper = empirical validation), training anything (
 
 ---
 
-## 8. Timeline (rough)
+## 8. Adaptive Escalation Experiment (future)
+
+**Idea:** Compare flat inference (run every question at one mode) against an uncertainty-led escalation strategy that starts cheap and only spends compute when signals say the answer is weak.
+
+**Setup:**
+1. Run all 4609 questions on direct mode (cheapest: ~2.5s/q). Compute MSP and 2nd Gap.
+2. Questions where signals are confident (e.g. 2nd Gap > threshold) → accept the answer.
+3. Questions where signals are weak → escalate to shuffle (10 permutations, ~25s/q). Compute epistemic.
+4. Still weak → escalate to CoT or think (~60s/q). Check cross-mode disagreement.
+5. Still weak → flag for human review.
+
+**Comparison:**
+- **Flat direct**: all 4609 × 2.5s = ~3.2h. Accuracy ~75%.
+- **Flat CoT shuffle**: all 4609 × 60s = ~77h. Accuracy ~79%.
+- **Flat think shuffle**: all 4609 × 80s = ~100h. Accuracy ~84%.
+- **Adaptive**: most questions answered at direct speed, only hard ones escalated. Target: near-think accuracy at a fraction of compute.
+
+**Metrics:** accuracy vs total compute time. Plot Pareto frontier. The claim: adaptive escalation dominates flat strategies — you get 80%+ accuracy without paying the full CoT/think cost on every question.
+
+**Why it matters for the paper:** moves from "here are useful signals" to "here's how you'd actually deploy them." The verification layer isn't just diagnosis — it's a routing decision that saves compute. Directly addresses the commercial framing ("make your cheap local model more reliable without 10x compute").
+
+**Prerequisites:** completed experiments (have most of them), threshold calibration (need to find optimal 2nd Gap / epistemic cutoffs via held-out set or cross-validation).
+
+---
+
+## 9. Timeline (rough)
 
 - End March: lock probe design
 - Early April: pilot on ~50-100 questions
