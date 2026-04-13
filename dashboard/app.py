@@ -1001,7 +1001,8 @@ def tab_explorer() -> None:
                 xaxis_title="Query", yaxis_title="Probability",
                 barmode="stack", height=220, showlegend=True,
             ))
-            st.plotly_chart(_round_hover(fig), width="stretch")
+            fig.update_traces(hovertemplate="%{fullData.name}: %{y:.2f}<extra></extra>")
+            st.plotly_chart(fig, width="stretch")
 
         # Reasoning trace (CoT / think modes)
         if prompt_mode in ("cot", "cot_structured") or (cfg and cfg.get("think")):
