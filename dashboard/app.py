@@ -280,10 +280,12 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
             key = f"_rate_hist_{file_path.name}"
             history = st.session_state.get(key, [])
 
-            # Append current observation, keep last 60 (~30 min at 30s refresh)
+            # Think+shuffle saves every ~17 min — need a longer window
+            is_slow = "think" in file_path.name and "shuffle" in file_path.name
+            max_history = 120 if is_slow else 60  # 60 min vs 30 min
             history.append((done_q, now))
-            if len(history) > 60:
-                history = history[-60:]
+            if len(history) > max_history:
+                history = history[-max_history:]
             st.session_state[key] = history
 
             # Use the observation closest to 5 minutes ago for a stable rate
