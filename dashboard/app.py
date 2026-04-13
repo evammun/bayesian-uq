@@ -803,7 +803,7 @@ def tab_comparison() -> None:
                 row = {"Condition": cond.replace("quality_pilot_", "")}
                 for col in available:
                     vals = sub[col].dropna()
-                    row[col] = f"{vals.mean():.3f}" if len(vals) > 0 else "-"
+                    row[col] = f"{vals.mean():.2f}" if len(vals) > 0 else "-"
                 summary_rows.append(row)
             df_summary = pd.DataFrame(summary_rows)
             if "accuracy" in df_summary.columns:
@@ -902,7 +902,7 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
                 x=list(plot_x), y=list(plot_y),
                 mode="lines",
                 line=dict(color=color, width=2.5),
-                name=f"{label} (ECE={ece:.3f})",
+                name=f"{label} (ECE={ece:.2f})",
             ))
 
     fig.update_layout(**_base_layout(
@@ -987,14 +987,14 @@ def tab_explorer() -> None:
         correct_str = "Correct" if row["is_correct"] else "Wrong"
         correct_color = TEAL if row["is_correct"] else ROSE
         agree_str = f'{row["agreement"]:.2f}' if not math.isnan(row.get("agreement", float("nan"))) else "-"
-        epist_str = f'{row["epistemic"]:.3f}' if not math.isnan(row.get("epistemic", float("nan"))) else "-"
+        epist_str = f'{row["epistemic"]:.2f}' if not math.isnan(row.get("epistemic", float("nan"))) else "-"
 
         st.markdown(
             f'<div style="font-size:14px; margin-bottom:4px;">'
             f'<b>{label}</b> · '
             f'Answer: <b>{ANSWER_LETTERS[row["final_answer"]]}</b> · '
             f'<span style="color:{correct_color};">{correct_str}</span> · '
-            f'MSP: {row["msp"]:.3f} · '
+            f'MSP: {row["msp"]:.2f} · '
             f'Agreement: {agree_str} · '
             f'Epistemic: {epist_str}'
             f'</div>',
@@ -1104,12 +1104,12 @@ def tab_effects() -> None:
             "Run": label,
             "N": m["n"],
             "Accuracy": f"{m['accuracy']:.1%}" if m["accuracy"] is not None else "-",
-            "MSP (correct)": f"{m['msp_correct']:.3f}" if m["msp_correct"] is not None else "-",
-            "MSP (incorrect)": f"{m['msp_incorrect']:.3f}" if m["msp_incorrect"] is not None else "-",
-            "Agreement (correct)": f"{m['agreement_correct']:.3f}" if m["agreement_correct"] is not None else "-",
-            "Agreement (incorrect)": f"{m['agreement_incorrect']:.3f}" if m["agreement_incorrect"] is not None else "-",
-            "Epist. (correct)": f"{m['epistemic_correct']:.4f}" if m["epistemic_correct"] is not None else "-",
-            "Epist. (incorrect)": f"{m['epistemic_incorrect']:.4f}" if m["epistemic_incorrect"] is not None else "-",
+            "MSP (correct)": f"{m['msp_correct']:.2f}" if m["msp_correct"] is not None else "-",
+            "MSP (incorrect)": f"{m['msp_incorrect']:.2f}" if m["msp_incorrect"] is not None else "-",
+            "Agreement (correct)": f"{m['agreement_correct']:.2f}" if m["agreement_correct"] is not None else "-",
+            "Agreement (incorrect)": f"{m['agreement_incorrect']:.2f}" if m["agreement_incorrect"] is not None else "-",
+            "Epist. (correct)": f"{m['epistemic_correct']:.2f}" if m["epistemic_correct"] is not None else "-",
+            "Epist. (incorrect)": f"{m['epistemic_incorrect']:.2f}" if m["epistemic_incorrect"] is not None else "-",
         })
 
     if summary_rows:
@@ -1187,8 +1187,8 @@ def tab_effects() -> None:
             "Effect": label,
             "Pairs": pairs_found,
             "Acc. Delta": f"{avg_acc:+.1%}" if avg_acc is not None else "-",
-            "MSP Delta": f"{avg_msp:+.3f}" if avg_msp is not None else "-",
-            "Epistemic Delta": f"{avg_epist:+.4f}" if avg_epist is not None else "-",
+            "MSP Delta": f"{avg_msp:+.2f}" if avg_msp is not None else "-",
+            "Epistemic Delta": f"{avg_epist:+.2f}" if avg_epist is not None else "-",
         })
 
     if effect_rows:
@@ -1552,9 +1552,9 @@ def tab_signals() -> None:
             "Mode": mode,
             "Para": "Yes" if para else "No",
             "N": len(loyalty_correct) + len(loyalty_incorrect),
-            "Pos Var (correct)": f"{mean_c:.3f}" if mean_c is not None else "-",
-            "Pos Var (incorrect)": f"{mean_i:.3f}" if mean_i is not None else "-",
-            "Delta": f"{delta:+.3f}" if delta is not None else "-",
+            "Pos Var (correct)": f"{mean_c:.2f}" if mean_c is not None else "-",
+            "Pos Var (incorrect)": f"{mean_i:.2f}" if mean_i is not None else "-",
+            "Delta": f"{delta:+.2f}" if delta is not None else "-",
         })
 
     if pos_rows:
