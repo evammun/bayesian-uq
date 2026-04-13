@@ -1354,13 +1354,14 @@ def tab_signals() -> None:
     single_cols = ["MSP", "2nd Gap", "Coverage"]
     multi_cols = ["Epistemic", "Conf Var", "Agree-Conf"]
 
-    def _signal_table(title: str, caption: str, cols: list[str], neg_good: set[str]) -> None:
+    def _signal_table(title: str, caption: str, cols: list[str], neg_good: set[str], row_override: list[dict] | None = None) -> None:
         """Render one signal table with colour highlighting."""
         st.subheader(title)
         st.caption(caption)
+        table_rows = row_override if row_override is not None else rows
 
         all_abs = []
-        for r in rows:
+        for r in table_rows:
             for col in cols:
                 v = r.get(col)
                 if v is not None:
@@ -1380,7 +1381,7 @@ def tab_signals() -> None:
             html += f"<th>{col}</th>"
         html += "</tr>"
 
-        for r in rows:
+        for r in table_rows:
             html += "<tr>"
             html += f'<td class="cond">{r["Mode"]}</td><td>{r["Shuffle"]}</td><td>{r["Para"]}</td><td>{r["N"]}</td>'
             for col in cols:
@@ -1416,11 +1417,12 @@ def tab_signals() -> None:
     - **Coverage**: answer-token mass in top-20 logprobs. Lower when wrong = model hesitates. (Direct mode only.)
     """)
 
+    multi_rows = [r for r in rows if r.get("Shuffle") == "Yes" or r.get("Para") == "Yes"]
     _signal_table(
         "Multi-Query Signals",
         "From comparing across queries (shuffle/paraphrase). Delta = mean(incorrect) - mean(correct). "
         "Positive = signal is higher when wrong (good for Epistemic, Conf Var, Agree-Conf).",
-        multi_cols, neg_good=set(),
+        multi_cols, neg_good=set(), row_override=multi_rows,
     )
 
     st.markdown("""
