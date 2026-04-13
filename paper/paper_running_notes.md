@@ -293,6 +293,28 @@ Old architecture: CoT anti-leak prompt ("do NOT name the answer letter") + separ
 
 ---
 
+## April 13, 2026 — Paraphrase Experiments + Completed Runs
+
+### Completed experiments
+- **CoT shuffle sufficient** — DONE (4609q, 78.6% acc, MSP 0.904)
+- **Think noshuffle sufficient** — DONE (4609q, 80.3% acc, MSP 0.997)
+- **Think shuffle sufficient** — in progress (1130/4609, resuming)
+- **Direct noshuffle paraphrase** — in progress (40/4609, early results)
+- **Direct shuffle paraphrase** — queued
+
+### Paraphrase generation: Qwen vs Sonnet
+Generated two banks: Sonnet API ($19, 3A+3B+4C) and Qwen on Mahti (free, 3A+7B). Key findings from 100-question Sonnet test:
+- **Category C (angle shifts) is broken** — 54.5% accuracy vs 70% baseline. Counterfactuals and negation change the question, not just the phrasing.
+- **A+B are safe** — 68% accuracy (close to baseline). Meaning preserved.
+- Qwen paraphrases are formulaic but safe. Cat A = "According to the passage, [same question]". Cat B = basic synonym swaps.
+
+### Early paraphrase results (negative finding, n=40)
+Qwen paraphrases (direct noshuffle) track baseline almost exactly (68% vs 65%). 97.5% cross-query agreement — model gives same answer to all paraphrases. Meanwhile shuffle on the same questions: 80% accuracy, much more variance.
+
+**Emerging conclusion:** Naive question rephrasing doesn't surface uncertainty. Answer permutation (shuffle) does, because it disrupts position bias in the model's attention over options. Paraphrases change the question surface form but not the cognitive path. Needs more data (running full 4609) but the pattern is consistent at n=40.
+
+---
+
 ## Decision Log (updated)
 
 | Date | Decision | Rationale |
