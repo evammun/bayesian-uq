@@ -1232,8 +1232,8 @@ def tab_effects() -> None:
 ANSWER_TOKENS = {" A", " B", " C", " D", "A", "B", "C", "D"}
 
 
-def _compute_signal_battery(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-run signal metrics from the main dataframe."""
+def _compute_signal_battery(df: pd.DataFrame) -> list[dict]:
+    """Compute per-run signal deltas (incorrect - correct) from the main dataframe."""
     rows = []
     for run_name in df["run_name"].unique():
         sub = df[df["run_name"] == run_name]
@@ -1247,60 +1247,72 @@ def _compute_signal_battery(df: pd.DataFrame) -> pd.DataFrame:
             next((l for l, p in selected_paths.items()
                   if _extract_run_prefix(p.stem) == run_name), ""), None))
 
-        # --- S3: Second-choice gap (from mean probs) ---
-        gaps = []
+        def _delta(correct_vals: list, incorrect_vals: list) -> float | None:
+            """Compute incorrect_mean - correct_mean. Positive = signal is higher for wrong answers."""
+            if not correct_vals or not incorrect_vals:
+                return None
+            return sum(incorrect_vals) / len(incorrect_vals) - sum(correct_vals) / len(correct_vals)
+
+        # --- MSP delta ---
+        msp_d = _delta(
+            correct_sub["msp"].tolist(),
+            incorrect_sub["msp"].tolist(),
+        )
+
+        # --- Epistemic delta ---
+        epist_d = None
+        if "epistemic" in valid.columns:
+            c_ep = correct_sub["epistemic"].dropna().tolist()
+            i_ep = incorrect_sub["epistemic"].dropna().tolist()
+            epist_d = _delta(c_ep, i_ep)
+
+        # --- S3: Second-choice gap ---
+        gap_c, gap_i = [], []
         for _, r in valid.iterrows():
             mp = sorted(r["mean_probs"], reverse=True)
             if len(mp) >= 2:
-                gaps.append(mp[0] - mp[1])
-        gap_correct = [g for g, (_, r) in zip(gaps, valid.iterrows()) if r["is_correct"]]
-        gap_incorrect = [g for g, (_, r) in zip(gaps, valid.iterrows()) if not r["is_correct"]]
+                g = mp[0] - mp[1]
+                (gap_c if r["is_correct"] else gap_i).append(g)
+        gap_d = _delta(gap_c, gap_i)
 
-        # --- S5: Answer coverage (from raw top-20 logprobs) ---
-        coverages = []
+        # --- S5: Answer coverage ---
+        cov_c, cov_i = [], []
         for _, r in valid.iterrows():
             ql = r.get("query_log", [])
-            q_coverages = []
+            q_covs = []
             for q in ql:
                 top_lps = []
                 for entry in q.get("raw_logprobs", []):
                     for tlp in entry.get("top_logprobs", []):
-                        tok = tlp.get("token", "")
-                        lp = tlp.get("logprob", -30)
-                        top_lps.append((tok, lp))
+                        top_lps.append((tlp.get("token", ""), tlp.get("logprob", -30)))
                 if top_lps:
-                    total_mass = sum(math.exp(lp) for _, lp in top_lps)
-                    answer_mass = sum(math.exp(lp) for tok, lp in top_lps if tok.strip() in ANSWER_TOKENS)
-                    if total_mass > 0:
-                        q_coverages.append(answer_mass / total_mass)
-            if q_coverages:
-                coverages.append(sum(q_coverages) / len(q_coverages))
-        cov_correct = [c for c, (_, r) in zip(coverages, valid.iterrows()) if r["is_correct"]]
-        cov_incorrect = [c for c, (_, r) in zip(coverages, valid.iterrows()) if not r["is_correct"]]
+                    total = sum(math.exp(lp) for _, lp in top_lps)
+                    ans = sum(math.exp(lp) for tok, lp in top_lps if tok.strip() in ANSWER_TOKENS)
+                    if total > 0:
+                        q_covs.append(ans / total)
+            if q_covs:
+                (cov_c if r["is_correct"] else cov_i).append(sum(q_covs) / len(q_covs))
+        cov_d = _delta(cov_c, cov_i)
 
-        # --- S14: Confidence variance (across queries) ---
-        conf_vars = []
+        # --- S14: Confidence variance ---
+        cv_c, cv_i = [], []
         for _, r in valid.iterrows():
             ql = r.get("query_log", [])
-            per_q_confs = [max(q.get("canonical_probs", [0.25]*4)) for q in ql
-                           if len(q.get("canonical_probs", [])) == 4]
-            if len(per_q_confs) > 1:
-                conf_vars.append(float(np.std(per_q_confs)))
-        cv_correct = [v for v, (_, r) in zip(conf_vars, valid.iterrows()) if r["is_correct"] and len(r.get("query_log", [])) > 1]
-        cv_incorrect = [v for v, (_, r) in zip(conf_vars, valid.iterrows()) if not r["is_correct"] and len(r.get("query_log", [])) > 1]
+            pqc = [max(q.get("canonical_probs", [0.25]*4)) for q in ql
+                   if len(q.get("canonical_probs", [])) == 4]
+            if len(pqc) > 1:
+                v = float(np.std(pqc))
+                (cv_c if r["is_correct"] else cv_i).append(v)
+        cv_d = _delta(cv_c, cv_i)
 
         # --- S15c: Agreement-Confidence gap ---
-        ac_gaps = []
+        ac_c, ac_i = [], []
         for _, r in valid.iterrows():
             if not math.isnan(r.get("agreement", float("nan"))):
-                ac_gaps.append(r["agreement"] - r["msp"])
-        ac_correct = [g for g, (_, r) in zip(ac_gaps, valid.iterrows()) if r["is_correct"] and not math.isnan(r.get("agreement", float("nan")))]
-        ac_incorrect = [g for g, (_, r) in zip(ac_gaps, valid.iterrows()) if not r["is_correct"] and not math.isnan(r.get("agreement", float("nan")))]
+                g = r["agreement"] - r["msp"]
+                (ac_c if r["is_correct"] else ac_i).append(g)
+        ac_d = _delta(ac_c, ac_i)
 
-        def _mean(lst: list) -> str:
-            return f"{sum(lst)/len(lst):.3f}" if lst else "-"
-
-        label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
         mode = _effective_mode(cfg) if cfg else "direct"
         shuffle = cfg.get("shuffle_options", False) if cfg else False
         para = cfg.get("use_paraphrases", False) if cfg else False
@@ -1310,44 +1322,100 @@ def _compute_signal_battery(df: pd.DataFrame) -> pd.DataFrame:
             "Shuffle": "Yes" if shuffle else "No",
             "Para": "Yes" if para else "No",
             "N": len(valid),
-            "2nd Gap (correct)": _mean(gap_correct),
-            "2nd Gap (incorrect)": _mean(gap_incorrect),
-            "Coverage (correct)": _mean(cov_correct),
-            "Coverage (incorrect)": _mean(cov_incorrect),
-            "Conf Var (correct)": _mean(cv_correct),
-            "Conf Var (incorrect)": _mean(cv_incorrect),
-            "Agree-Conf Gap (correct)": _mean(ac_correct),
-            "Agree-Conf Gap (incorrect)": _mean(ac_incorrect),
+            "MSP": msp_d,
+            "Epistemic": epist_d,
+            "2nd Gap": gap_d,
+            "Coverage": cov_d,
+            "Conf Var": cv_d,
+            "Agree-Conf": ac_d,
         })
 
-    return pd.DataFrame(rows)
+    return rows
 
 
 def tab_signals() -> None:
     st.header("Signal Battery")
     st.caption(
-        "Additional uncertainty signals split by correct/incorrect. "
-        "Effective signals show a gap between the two columns."
+        "Delta = mean(incorrect) - mean(correct). Negative MSP/Gap/Coverage = signal is lower when wrong (good). "
+        "Positive Epistemic/Conf Var = signal is higher when wrong (good). Stronger colour = more discriminative."
     )
 
     if df.empty:
         st.info("No data loaded.")
         return
 
-    battery_df = _compute_signal_battery(df)
-    if battery_df.empty:
+    rows = _compute_signal_battery(df)
+    if not rows:
         st.info("No data to compute signals.")
         return
 
-    battery_df = battery_df.sort_values("N", ascending=False)
-    st.dataframe(battery_df, width="stretch", hide_index=True)
+    rows.sort(key=lambda r: r["N"], reverse=True)
+    signal_cols = ["MSP", "Epistemic", "2nd Gap", "Coverage", "Conf Var", "Agree-Conf"]
+
+    # Build HTML table with colour highlighting
+    html = """<style>
+    .sig-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
+    .sig-table th, .sig-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
+    .sig-table th { color: #8B95A1; font-weight: 500; }
+    .sig-table td.cond { text-align: left; font-weight: 500; }
+    .sig-table tr:hover { background: #F5F3F1; }
+    </style><table class="sig-table">"""
+
+    html += "<tr><th>Mode</th><th>Shuffle</th><th>Para</th><th>N</th>"
+    for col in signal_cols:
+        html += f"<th>{col}</th>"
+    html += "</tr>"
+
+    # Collect all absolute deltas to find the max for colour scaling
+    all_abs = []
+    for r in rows:
+        for col in signal_cols:
+            v = r.get(col)
+            if v is not None:
+                all_abs.append(abs(v))
+    max_abs = max(all_abs) if all_abs else 1.0
+
+    for r in rows:
+        html += "<tr>"
+        html += f'<td class="cond">{r["Mode"]}</td><td>{r["Shuffle"]}</td><td>{r["Para"]}</td><td>{r["N"]}</td>'
+        for col in signal_cols:
+            v = r.get(col)
+            if v is None:
+                html += "<td>-</td>"
+                continue
+            # Determine if this direction is "good" for discrimination
+            # MSP, 2nd Gap, Coverage: negative delta = good (lower when wrong)
+            # Epistemic, Conf Var, Agree-Conf: positive delta = good (higher when wrong)
+            if col in ("MSP", "2nd Gap", "Coverage"):
+                strength = -v / max_abs  # negative v is good → positive strength
+            else:
+                strength = v / max_abs   # positive v is good → positive strength
+
+            # Colour: teal for strong discrimination, rose for inverted, white for weak
+            strength = max(-1.0, min(1.0, strength))
+            if strength > 0.05:
+                alpha = min(strength * 0.6, 0.35)
+                bg = f"rgba(42, 140, 143, {alpha:.2f})"
+            elif strength < -0.05:
+                alpha = min(-strength * 0.6, 0.35)
+                bg = f"rgba(220, 100, 100, {alpha:.2f})"
+            else:
+                bg = "transparent"
+
+            html += f'<td style="background:{bg};">{v:+.3f}</td>'
+        html += "</tr>"
+
+    html += "</table>"
+    st.markdown(html, unsafe_allow_html=True)
 
     st.markdown("""
-    **Signals:**
-    - **2nd Gap**: `top_prob - second_prob` on mean distribution. Measures decisiveness.
-    - **Coverage**: fraction of top-20 logprob mass on answer tokens (A/B/C/D). Low = model wants to explain, not answer.
-    - **Conf Var**: std of per-query max confidence. High = unstable confidence across queries.
-    - **Agree-Conf Gap**: `agreement - MSP`. Positive = consistently picks same answer but not confident. "Fragile confidence" detector.
+    **Signals** (all shown as incorrect - correct delta):
+    - **MSP**: max single-token probability. Negative = less confident when wrong.
+    - **Epistemic**: mutual information across queries. Positive = more disagreement when wrong.
+    - **2nd Gap**: `top_prob - second_prob`. Negative = less decisive when wrong.
+    - **Coverage**: answer-token mass in top-20 logprobs. Negative = model hesitates more when wrong. (Direct mode only — CoT/think force commitment.)
+    - **Conf Var**: std of per-query confidence. Positive = more unstable when wrong. (Multi-query only.)
+    - **Agree-Conf**: `agreement - MSP`. Positive = agrees on answer but less confident when wrong. (Multi-query only.)
     """)
 
 
