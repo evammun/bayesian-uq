@@ -808,7 +808,7 @@ def tab_comparison() -> None:
             df_summary = pd.DataFrame(summary_rows)
             if "accuracy" in df_summary.columns:
                 df_summary = df_summary.sort_values("accuracy", ascending=False, key=lambda s: pd.to_numeric(s, errors="coerce"))
-            st.dataframe(df_summary, width="stretch", hide_index=True)
+            _html_table(summary_rows)
 
     # Calibration curves
     st.subheader("Calibration: Reliability Diagram")
@@ -1100,22 +1100,27 @@ def tab_effects() -> None:
                   if _extract_run_prefix(p.stem) == run_name), ""), None))
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
 
+        def _delta_str(correct_val, incorrect_val):
+            if correct_val is None or incorrect_val is None:
+                return "-"
+            return f"{incorrect_val - correct_val:+.2f}"
+
         summary_rows.append({
             "Run": label,
             "N": m["n"],
             "Accuracy": f"{m['accuracy']:.1%}" if m["accuracy"] is not None else "-",
             "MSP (correct)": f"{m['msp_correct']:.2f}" if m["msp_correct"] is not None else "-",
-            "MSP (incorrect)": f"{m['msp_incorrect']:.2f}" if m["msp_incorrect"] is not None else "-",
-            "Agreement (correct)": f"{m['agreement_correct']:.2f}" if m["agreement_correct"] is not None else "-",
-            "Agreement (incorrect)": f"{m['agreement_incorrect']:.2f}" if m["agreement_incorrect"] is not None else "-",
+            "MSP delta": _delta_str(m["msp_correct"], m["msp_incorrect"]),
+            "Agree (correct)": f"{m['agreement_correct']:.2f}" if m["agreement_correct"] is not None else "-",
+            "Agree delta": _delta_str(m["agreement_correct"], m["agreement_incorrect"]),
             "Epist. (correct)": f"{m['epistemic_correct']:.2f}" if m["epistemic_correct"] is not None else "-",
-            "Epist. (incorrect)": f"{m['epistemic_incorrect']:.2f}" if m["epistemic_incorrect"] is not None else "-",
+            "Epist. delta": _delta_str(m["epistemic_correct"], m["epistemic_incorrect"]),
         })
 
     if summary_rows:
-        df_runs = pd.DataFrame(summary_rows)
-        df_runs = df_runs.sort_values("Accuracy", ascending=False, key=lambda s: pd.to_numeric(s.str.rstrip("%"), errors="coerce"))
-        st.dataframe(df_runs, width="stretch", hide_index=True)
+        # Sort by accuracy descending
+        summary_rows.sort(key=lambda r: float(r["Accuracy"].rstrip("%")) if r["Accuracy"] != "-" else 0, reverse=True)
+        _html_table(summary_rows)
 
     # --- Matched pair analysis ---
     st.subheader("Matched Pair Effects")
@@ -1192,7 +1197,7 @@ def tab_effects() -> None:
         })
 
     if effect_rows:
-        st.dataframe(pd.DataFrame(effect_rows), width="stretch", hide_index=True)
+        _html_table(effect_rows)
 
     # --- Per-run distribution comparison ---
     st.subheader("MSP Distributions by Run")
