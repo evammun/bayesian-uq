@@ -1564,10 +1564,10 @@ def tab_signals() -> None:
         st.info("Need shuffle runs to compute position loyalty.")
 
     # --- Reasoning trace length (CoT/think only) ---
-    st.subheader("Reasoning Trace Length")
+    st.subheader("Reasoning Signals")
     st.caption(
-        "Does longer reasoning correlate with being wrong? "
-        "Mean trace length (chars) for correct vs incorrect answers. (CoT/think runs only.)"
+        "Trace length + Pass 1/2 disagreement rate for CoT and think modes. "
+        "Pass 1 = model's free answer, Pass 2 = logprob extraction. Higher disagreement on incorrect = signal works."
     )
 
     trace_rows = []
@@ -1586,18 +1586,40 @@ def tab_signals() -> None:
 
         len_correct = []
         len_incorrect = []
+        p1p2_disagree_correct = []
+        p1p2_disagree_incorrect = []
+
         for _, r in sub[sub["is_correct"].notna()].iterrows():
             ql = r.get("query_log", [])
+
+            # Trace length
             traces = [len(q.get("thinking_trace", "")) for q in ql if q.get("thinking_trace")]
             if traces:
                 mean_len = sum(traces) / len(traces)
                 (len_correct if r["is_correct"] else len_incorrect).append(mean_len)
 
+            # Pass 1/2 disagreement rate per question
+            disagree_count = 0
+            total_count = 0
+            for q in ql:
+                p1c = q.get("pass1_canonical_answer", -1)
+                p2c = q.get("canonical_answer", -1)
+                if p1c >= 0:
+                    total_count += 1
+                    if p1c != p2c:
+                        disagree_count += 1
+            if total_count > 0:
+                rate = disagree_count / total_count
+                (p1p2_disagree_correct if r["is_correct"] else p1p2_disagree_incorrect).append(rate)
+
         shuffle = cfg_r.get("shuffle_options", False)
         para = cfg_r.get("use_paraphrases", False)
         mean_c = sum(len_correct) / len(len_correct) if len_correct else None
         mean_i = sum(len_incorrect) / len(len_incorrect) if len_incorrect else None
-        delta = (mean_i - mean_c) if mean_c is not None and mean_i is not None else None
+        trace_delta = (mean_i - mean_c) if mean_c is not None and mean_i is not None else None
+
+        p1p2_c = sum(p1p2_disagree_correct) / len(p1p2_disagree_correct) if p1p2_disagree_correct else None
+        p1p2_i = sum(p1p2_disagree_incorrect) / len(p1p2_disagree_incorrect) if p1p2_disagree_incorrect else None
 
         trace_rows.append({
             "Mode": mode,
@@ -1605,14 +1627,20 @@ def tab_signals() -> None:
             "N": len(len_correct) + len(len_incorrect),
             "Trace (correct)": f"{mean_c:.0f}" if mean_c is not None else "-",
             "Trace (incorrect)": f"{mean_i:.0f}" if mean_i is not None else "-",
-            "Delta": f"{delta:+.0f}" if delta is not None else "-",
+            "Trace Delta": f"{trace_delta:+.0f}" if trace_delta is not None else "-",
+            "P1/P2 disagree (correct)": f"{p1p2_c:.1%}" if p1p2_c is not None else "-",
+            "P1/P2 disagree (incorrect)": f"{p1p2_i:.1%}" if p1p2_i is not None else "-",
         })
 
     if trace_rows:
         st.dataframe(pd.DataFrame(trace_rows), width="stretch", hide_index=True)
-        st.markdown("Positive delta = model writes more when wrong. Could indicate struggling/deliberation, or just longer passages for harder questions.")
+        st.markdown(
+            "**Trace Delta**: positive = model writes more when wrong. "
+            "**P1/P2 disagree**: rate at which the model's free answer differs from logprob answer. "
+            "Higher on incorrect = the model's commitment and its probability distribution conflict more when it's wrong."
+        )
     else:
-        st.info("Need CoT or think runs to analyse trace length.")
+        st.info("Need CoT or think runs to analyse reasoning signals.")
 
 
 # ---------------------------------------------------------------------------
