@@ -237,6 +237,8 @@ def format_run_label(cfg: dict) -> str:
     """Human-readable run label."""
     parts = [_effective_mode(cfg)]
     parts.append("shuffle" if cfg.get("shuffle_options", True) else "noshuffle")
+    if cfg.get("use_paraphrases", False):
+        parts.append("paraphrase")
     parts.append(cfg.get("context_condition", "?"))
     return " · ".join(parts)
 
@@ -340,6 +342,7 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
         think = cfg.get("think", False)
         prompt_mode = cfg.get("prompt_mode", "direct")
         shuffle = cfg.get("shuffle_options", True)
+        paraphrase = cfg.get("use_paraphrases", False)
 
         for qr in data.get("question_results", []):
             if qr.get("skipped", False) or not qr.get("mean_probs"):
@@ -374,6 +377,7 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
                 "prompt_mode": prompt_mode,
                 "mode": mode,
                 "shuffle": shuffle,
+                "paraphrase": paraphrase,
                 "question_id": qr.get("question_id", ""),
                 "article_id": qr.get("article_id", ""),
                 "question_text": qr.get("question_text", ""),
@@ -677,6 +681,7 @@ def tab_comparison() -> None:
     factor_labels = {
         "mode": "Mode",
         "shuffle": "Shuffle",
+        "paraphrase": "Paraphrase",
         "context_condition": "Context",
     }
     for col, label in factor_labels.items():
@@ -1059,6 +1064,7 @@ def tab_effects() -> None:
             "agreement_incorrect": incorrect_sub["agreement"].mean() if len(incorrect_sub[incorrect_sub["agreement"].notna()]) > 0 else None,
             "mode": sub["mode"].iloc[0] if "mode" in sub.columns else "direct",
             "shuffle": sub["shuffle"].iloc[0] if "shuffle" in sub.columns else True,
+            "paraphrase": sub["paraphrase"].iloc[0] if "paraphrase" in sub.columns else False,
             "context": sub["context_condition"].iloc[0],
         }
 
@@ -1097,11 +1103,14 @@ def tab_effects() -> None:
     contexts = set(m["context"] for m in run_metrics.values())
     shuffles = set(m["shuffle"] for m in run_metrics.values())
     modes = set(m["mode"] for m in run_metrics.values())
+    paraphrases = set(m["paraphrase"] for m in run_metrics.values())
 
     if len(contexts) > 1:
         comparisons.append(("context", "sufficient", "insufficient", "Sufficient vs insufficient"))
     if len(shuffles) > 1:
         comparisons.append(("shuffle", True, False, "Shuffle on vs off"))
+    if len(paraphrases) > 1:
+        comparisons.append(("paraphrase", True, False, "Paraphrase on vs off"))
     if "CoT" in modes and "direct" in modes:
         comparisons.append(("mode", "CoT", "direct", "CoT vs direct"))
     if "think" in modes and "direct" in modes:
@@ -1113,7 +1122,7 @@ def tab_effects() -> None:
         st.info("Need runs with contrasting conditions to compute effects.")
         return
 
-    match_vars = ["context", "shuffle", "mode"]
+    match_vars = ["context", "shuffle", "mode", "paraphrase"]
     effect_rows = []
     run_list = list(run_metrics.items())
 
