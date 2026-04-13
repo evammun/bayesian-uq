@@ -308,10 +308,18 @@ Generated two banks: Sonnet API ($19, 3A+3B+4C) and Qwen on Mahti (free, 3A+7B).
 - **A+B are safe** — 68% accuracy (close to baseline). Meaning preserved.
 - Qwen paraphrases are formulaic but safe. Cat A = "According to the passage, [same question]". Cat B = basic synonym swaps.
 
-### Early paraphrase results (negative finding, n=40)
-Qwen paraphrases (direct noshuffle) track baseline almost exactly (68% vs 65%). 97.5% cross-query agreement — model gives same answer to all paraphrases. Meanwhile shuffle on the same questions: 80% accuracy, much more variance.
+### Paraphrase results confirmed (n=190)
+Qwen paraphrases track baseline: 82.1% vs 81.6%, 95.3% agreement, epistemic 0.056. Shuffle on same questions: 87.4%, epistemic 0.136. Paraphrasing adds almost no diagnostic value — shuffle is 2-3x more effective at surfacing uncertainty.
 
-**Emerging conclusion:** Naive question rephrasing doesn't surface uncertainty. Answer permutation (shuffle) does, because it disrupts position bias in the model's attention over options. Paraphrases change the question surface form but not the cognitive path. Needs more data (running full 4609) but the pattern is consistent at n=40.
+### Dashboard: signal battery + epistemic decomposition
+Built Signal Battery tab with 9 signals across 5 tables:
+- **Single-query:** MSP, 2nd Gap, Coverage. Finding: 2nd Gap beats MSP as discriminator.
+- **Multi-query:** Epistemic, Conf Var, Agree-Conf. Finding: epistemic strongest, think shuffle +0.32.
+- **Cross-mode disagreement:** CoT vs direct disagree on 14% of questions → 44.9% accuracy on those. Strongest single signal found.
+- **Position loyalty:** incorrect answers are more position-dependent (+0.09 to +0.15 delta).
+- **Reasoning signals:** think trace length +1976 chars when wrong (2x longer). CoT P1/P2 disagreement 5.3x higher on incorrect.
+
+Added epistemic/aleatoric decomposition (mutual information) to replace simple agreement as the primary multi-query uncertainty measure.
 
 ---
 
@@ -323,6 +331,9 @@ Qwen paraphrases (direct noshuffle) track baseline almost exactly (68% vs 65%). 
 | 2026-04-02 | Single sbatch instead of submit_all.sh | Prevents accidental double-submission that may have caused duplicates |
 | 2026-04-02 | 3-layer duplicate prevention | Belt-and-suspenders: pre-filter + in-loop skip + per-question set tracking |
 | 2026-04-02 | Stable RNG seeding via original index map | Ensures shuffle permutations are reproducible across resume cycles |
+| 2026-04-13 | Epistemic decomposition as primary UQ metric | Mutual information (total - aleatoric entropy) discriminates correct/incorrect better than simple agreement |
+| 2026-04-13 | Signal battery dashboard tab | 9 signals across single-query, multi-query, cross-mode, position, and reasoning categories |
+| 2026-04-13 | Paraphrase adds minimal value | n=190: paraphrase agreement 95%, epistemic 0.056 vs shuffle 0.136. Shuffle disrupts position bias; paraphrase doesn't change cognitive path |
 | 2026-04-02 | Replace two-pass anti-leak with single-pass natural reasoning | Anti-leak was artificial; conciseness instruction naturally prevents absorption. Consistent extraction across CoT and think modes |
 | 2026-04-02 | Think mode as separate experimental condition | Tests Qwen3 internal reasoning vs visible CoT vs direct. Finding: improves accuracy but destroys logprob uncertainty signal |
 
