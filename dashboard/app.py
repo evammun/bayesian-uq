@@ -1502,7 +1502,9 @@ def tab_signals() -> None:
         })
 
     if cross_rows:
-        st.dataframe(pd.DataFrame(cross_rows), width="stretch", hide_index=True)
+        cross_df = pd.DataFrame(cross_rows)
+        st.dataframe(cross_df, width="stretch", hide_index=True)
+        st.download_button("Download CSV", cross_df.to_csv(index=False), "cross_mode.csv", key="dl_cross")
         st.markdown("When modes **agree**, accuracy is high. When they **disagree**, accuracy drops — the disagreement itself is a strong uncertainty signal.")
     else:
         st.info("Need at least 2 modes (direct, CoT, think) with noshuffle runs to compare.")
@@ -1558,7 +1560,9 @@ def tab_signals() -> None:
         })
 
     if pos_rows:
-        st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
+        pos_df = pd.DataFrame(pos_rows)
+        st.dataframe(pos_df, width="stretch", hide_index=True)
+        st.download_button("Download CSV", pos_df.to_csv(index=False), "position_loyalty.csv", key="dl_pos")
         st.markdown("Higher position variance on incorrect answers means the model's wrong answers are more position-dependent — relying on heuristics rather than comprehension.")
     else:
         st.info("Need shuffle runs to compute position loyalty.")
@@ -1633,7 +1637,9 @@ def tab_signals() -> None:
         })
 
     if trace_rows:
-        st.dataframe(pd.DataFrame(trace_rows), width="stretch", hide_index=True)
+        trace_df = pd.DataFrame(trace_rows)
+        st.dataframe(trace_df, width="stretch", hide_index=True)
+        st.download_button("Download CSV", trace_df.to_csv(index=False), "reasoning_signals.csv", key="dl_trace")
         st.markdown(
             "**Trace Delta**: positive = model writes more when wrong. "
             "**P1/P2 disagree**: rate at which the model's free answer differs from logprob answer. "
