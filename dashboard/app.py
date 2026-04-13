@@ -1295,10 +1295,11 @@ def _html_table(rows: list[dict], highlight: dict[str, str] | None = None) -> No
                     # "pos_good": positive is good (teal), negative is bad (rose)
                     good = (fval < 0 and direction == "neg_good") or (fval > 0 and direction == "pos_good")
                     strength = min(abs(fval) / max_abs, 1.0)
-                    alpha = min(strength * 0.5, 0.30)
-                    if good and alpha > 0.02:
+                    # Power curve for wider spread: weak signals stay faint, strong ones pop
+                    alpha = strength ** 2 * 0.35
+                    if good and alpha > 0.03:
                         bg = f' style="background:rgba(42,140,143,{alpha:.2f});"'
-                    elif not good and alpha > 0.02:
+                    elif not good and alpha > 0.03:
                         bg = f' style="background:rgba(220,100,100,{alpha:.2f});"'
                 except ValueError:
                     pass
@@ -1468,10 +1469,10 @@ def tab_signals() -> None:
                 strength = (-v if col in neg_good else v) / max_abs
                 strength = max(-1.0, min(1.0, strength))
                 if strength > 0.05:
-                    alpha = min(strength * 0.6, 0.35)
+                    alpha = strength ** 2 * 0.35
                     bg = f"rgba(42, 140, 143, {alpha:.2f})"
                 elif strength < -0.05:
-                    alpha = min(-strength * 0.6, 0.35)
+                    alpha = strength ** 2 * 0.35
                     bg = f"rgba(220, 100, 100, {alpha:.2f})"
                 else:
                     bg = "transparent"
