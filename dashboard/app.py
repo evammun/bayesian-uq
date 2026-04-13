@@ -993,7 +993,7 @@ def tab_explorer() -> None:
                 for li, letter in enumerate(ANSWER_LETTERS):
                     fig.add_trace(go.Bar(
                         x=[f"Q{qi}"], y=[probs[li] if li < len(probs) else 0],
-                        name=letter if qi == 0 else None,
+                        name=letter,
                         marker_color=CHOICE_COLORS[li],
                         showlegend=(qi == 0), legendgroup=letter,
                     ))
