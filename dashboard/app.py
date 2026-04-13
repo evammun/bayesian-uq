@@ -1431,6 +1431,189 @@ def tab_signals() -> None:
     - **Agree-Conf**: `agreement - MSP`. Higher when wrong = agrees on answer but not confident.
     """)
 
+    # --- Cross-mode disagreement ---
+    st.subheader("Cross-Mode Disagreement")
+    st.caption(
+        "When direct and CoT/think give different answers for the same question, "
+        "how often is the disagreeing question wrong? Computed by joining results across conditions."
+    )
+
+    # Build per-question answer lookup for each mode (noshuffle only for fair comparison)
+    mode_answers: dict[str, dict[str, int]] = {}  # mode -> {qid: final_answer}
+    mode_correct: dict[str, dict[str, bool]] = {}
+    for run_name in df["run_name"].unique():
+        sub = df[df["run_name"] == run_name]
+        if len(sub) == 0:
+            continue
+        cfg_r = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        if not cfg_r:
+            continue
+        mode = _effective_mode(cfg_r)
+        shuffle = cfg_r.get("shuffle_options", False)
+        para = cfg_r.get("use_paraphrases", False)
+        # Use noshuffle, no-para runs for clean comparison
+        if shuffle or para:
+            continue
+        answers = {}
+        corrects = {}
+        for _, r in sub.iterrows():
+            qid = r["question_id"]
+            answers[qid] = r["final_answer"]
+            corrects[qid] = r["is_correct"]
+        mode_answers[mode] = answers
+        mode_correct[mode] = corrects
+
+    cross_pairs = [
+        ("CoT", "direct"), ("think", "direct"), ("think", "CoT"),
+    ]
+    cross_rows = []
+    for mode_a, mode_b in cross_pairs:
+        if mode_a not in mode_answers or mode_b not in mode_answers:
+            continue
+        ans_a = mode_answers[mode_a]
+        ans_b = mode_answers[mode_b]
+        common = set(ans_a.keys()) & set(ans_b.keys())
+        if not common:
+            continue
+        agree_count = 0
+        disagree_count = 0
+        agree_acc = []
+        disagree_acc = []
+        for qid in common:
+            correct = mode_correct[mode_a].get(qid)  # use mode_a's correctness
+            if ans_a[qid] == ans_b[qid]:
+                agree_count += 1
+                if correct is not None:
+                    agree_acc.append(correct)
+            else:
+                disagree_count += 1
+                if correct is not None:
+                    disagree_acc.append(correct)
+        total = agree_count + disagree_count
+        cross_rows.append({
+            "Comparison": f"{mode_a} vs {mode_b}",
+            "N": total,
+            "Agree": f"{agree_count} ({agree_count/total:.0%})" if total else "-",
+            "Disagree": f"{disagree_count} ({disagree_count/total:.0%})" if total else "-",
+            "Acc (agree)": f"{sum(agree_acc)/len(agree_acc):.1%}" if agree_acc else "-",
+            "Acc (disagree)": f"{sum(disagree_acc)/len(disagree_acc):.1%}" if disagree_acc else "-",
+        })
+
+    if cross_rows:
+        st.dataframe(pd.DataFrame(cross_rows), width="stretch", hide_index=True)
+        st.markdown("When modes **agree**, accuracy is high. When they **disagree**, accuracy drops — the disagreement itself is a strong uncertainty signal.")
+    else:
+        st.info("Need at least 2 modes (direct, CoT, think) with noshuffle runs to compare.")
+
+    # --- Position loyalty (shuffle runs only) ---
+    st.subheader("Position Loyalty")
+    st.caption(
+        "How much does the correct answer's probability change based on its display position? "
+        "High variance = model relies on position, not content. (Shuffle runs only.)"
+    )
+
+    pos_rows = []
+    for run_name in df["run_name"].unique():
+        sub = df[df["run_name"] == run_name]
+        if len(sub) == 0:
+            continue
+        cfg_r = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        if not cfg_r or not cfg_r.get("shuffle_options", False):
+            continue
+
+        loyalty_correct = []
+        loyalty_incorrect = []
+        for _, r in sub[sub["is_correct"].notna()].iterrows():
+            ql = r.get("query_log", [])
+            if len(ql) < 2:
+                continue
+            correct_ans = r["correct_answer"]
+            # Get the correct answer's probability across different permutations
+            correct_probs = []
+            for q in ql:
+                probs = q.get("canonical_probs", [])
+                if len(probs) > correct_ans:
+                    correct_probs.append(probs[correct_ans])
+            if len(correct_probs) > 1:
+                var = float(np.std(correct_probs))
+                (loyalty_correct if r["is_correct"] else loyalty_incorrect).append(var)
+
+        mode = _effective_mode(cfg_r)
+        para = cfg_r.get("use_paraphrases", False)
+        mean_c = sum(loyalty_correct) / len(loyalty_correct) if loyalty_correct else None
+        mean_i = sum(loyalty_incorrect) / len(loyalty_incorrect) if loyalty_incorrect else None
+        delta = (mean_i - mean_c) if mean_c is not None and mean_i is not None else None
+
+        pos_rows.append({
+            "Mode": mode,
+            "Para": "Yes" if para else "No",
+            "N": len(loyalty_correct) + len(loyalty_incorrect),
+            "Pos Var (correct)": f"{mean_c:.3f}" if mean_c is not None else "-",
+            "Pos Var (incorrect)": f"{mean_i:.3f}" if mean_i is not None else "-",
+            "Delta": f"{delta:+.3f}" if delta is not None else "-",
+        })
+
+    if pos_rows:
+        st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
+        st.markdown("Higher position variance on incorrect answers means the model's wrong answers are more position-dependent — relying on heuristics rather than comprehension.")
+    else:
+        st.info("Need shuffle runs to compute position loyalty.")
+
+    # --- Reasoning trace length (CoT/think only) ---
+    st.subheader("Reasoning Trace Length")
+    st.caption(
+        "Does longer reasoning correlate with being wrong? "
+        "Mean trace length (chars) for correct vs incorrect answers. (CoT/think runs only.)"
+    )
+
+    trace_rows = []
+    for run_name in df["run_name"].unique():
+        sub = df[df["run_name"] == run_name]
+        if len(sub) == 0:
+            continue
+        cfg_r = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        if not cfg_r:
+            continue
+        mode = _effective_mode(cfg_r)
+        if mode == "direct":
+            continue
+
+        len_correct = []
+        len_incorrect = []
+        for _, r in sub[sub["is_correct"].notna()].iterrows():
+            ql = r.get("query_log", [])
+            traces = [len(q.get("thinking_trace", "")) for q in ql if q.get("thinking_trace")]
+            if traces:
+                mean_len = sum(traces) / len(traces)
+                (len_correct if r["is_correct"] else len_incorrect).append(mean_len)
+
+        shuffle = cfg_r.get("shuffle_options", False)
+        para = cfg_r.get("use_paraphrases", False)
+        mean_c = sum(len_correct) / len(len_correct) if len_correct else None
+        mean_i = sum(len_incorrect) / len(len_incorrect) if len_incorrect else None
+        delta = (mean_i - mean_c) if mean_c is not None and mean_i is not None else None
+
+        trace_rows.append({
+            "Mode": mode,
+            "Shuffle": "Yes" if shuffle else "No",
+            "N": len(len_correct) + len(len_incorrect),
+            "Trace (correct)": f"{mean_c:.0f}" if mean_c is not None else "-",
+            "Trace (incorrect)": f"{mean_i:.0f}" if mean_i is not None else "-",
+            "Delta": f"{delta:+.0f}" if delta is not None else "-",
+        })
+
+    if trace_rows:
+        st.dataframe(pd.DataFrame(trace_rows), width="stretch", hide_index=True)
+        st.markdown("Positive delta = model writes more when wrong. Could indicate struggling/deliberation, or just longer passages for harder questions.")
+    else:
+        st.info("Need CoT or think runs to analyse trace length.")
+
 
 # ---------------------------------------------------------------------------
 # Main
