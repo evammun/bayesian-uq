@@ -428,9 +428,9 @@ if not result_files:
     st.stop()
 
 # Auto-refresh
-auto_refresh = st.sidebar.toggle("Auto-refresh (30s)", value=False)
+auto_refresh = st.sidebar.toggle("Auto-refresh (2 min)", value=False)
 if auto_refresh:
-    st_autorefresh(interval=30_000, key="auto_refresh_counter")
+    st_autorefresh(interval=120_000, key="auto_refresh_counter")
 
 # Filter options
 hide_insufficient = st.sidebar.toggle("Hide insufficient", value=True)
