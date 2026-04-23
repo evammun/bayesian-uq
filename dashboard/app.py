@@ -53,7 +53,7 @@ TEXT = "#2C3E50"
 GRAY_LIGHT = "#8B95A1"
 GRID = "#E8E4E0"
 BORDER = "#E5E0DB"
-CONDITION_COLORS = {"sufficient": TEAL, "insufficient": ROSE}
+MODEL_COLORS = {"Qwen 3": TEAL, "Gemma 4": ROSE, "Qwen 3.5": GOLD}
 ANSWER_LETTERS = ["A", "B", "C", "D"]
 CHOICE_COLORS = [TEAL, DEEP_BLUE, GOLD, ROSE]
 
@@ -236,30 +236,51 @@ def _effective_mode(cfg: dict) -> str:
     return "CoT" if cfg.get("prompt_mode", "direct") == "cot" else "direct"
 
 
+def _short_model_name(cfg: dict) -> str:
+    """Extract a short model label from config."""
+    raw = cfg.get("model_name", "") or cfg.get("run_name", "")
+    low = raw.lower()
+    if "gemma4" in low or "gemma-4" in low:
+        return "Gemma 4"
+    if "qwen3.5" in low or "qwen3-5" in low or "qwen35" in low:
+        return "Qwen 3.5"
+    if "qwen3" in low or "qwen-3" in low:
+        return "Qwen 3"
+    return raw.split(":")[0] if ":" in raw else raw.split("_")[0]
+
+
 def format_run_label(cfg: dict) -> str:
     """Human-readable run label."""
-    parts = [_effective_mode(cfg)]
+    parts = [_short_model_name(cfg)]
+    parts.append(_effective_mode(cfg))
     parts.append("shuffle" if cfg.get("shuffle_options", True) else "noshuffle")
     if cfg.get("use_paraphrases", False):
         parts.append("paraphrase")
-    parts.append(cfg.get("context_condition", "?"))
     return " · ".join(parts)
 
 
+def _sample_inference_times(file_path: Path, tail_bytes: int = 65536) -> list[float]:
+    """Extract recent inference_time_s values from the tail of a result JSON."""
+    import re as _re
+    try:
+        size = file_path.stat().st_size
+        with open(file_path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            chunk = f.read().decode("utf-8", errors="ignore")
+        return [float(m) for m in _re.findall(r'"inference_time_s":\s*([\d.]+)', chunk)]
+    except Exception:
+        return []
+
+
 def compute_timing(file_path: Path, done_q: int, total_q: int,
-                    completed_at: str | None = None) -> dict:
-    """Compute ETA based on observed question rate between dashboard refreshes.
+                    completed_at: str | None = None,
+                    num_permutations: int = 1) -> dict:
+    """Compute ETA from per-query inference_time_s recorded in result files.
 
-    For in-progress runs: stores (count, utc_time) in session_state on each
-    refresh. Computes questions/sec from the delta between the two most recent
-    observations, then extrapolates remaining time. This is robust to
-    interruptions — it only measures the rate the run is *currently* going at,
-    not cumulative time since start.
-
-    For completed runs: shows 'Done' with elapsed if completed_at is available.
+    Primary: reads recent inference times from the file tail, computes mean
+    time per question (mean_query_time × num_permutations), extrapolates.
+    Fallback: filename timestamp + question count for runs without timing data.
     """
-    import time as _time
-
     elapsed_str = ""
     remaining_str = ""
     rate_str = ""
@@ -268,7 +289,6 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
 
     try:
         if finished and completed_at:
-            # Parse start from filename
             parts = file_path.stem.split("_")
             if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
                 start = datetime.strptime(parts[-2] + "_" + parts[-1], "%Y%m%d_%H%M%S")
@@ -278,44 +298,16 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
         elif finished:
             remaining_str = "Done"
         else:
-            # Rate-based ETA from a rolling history of observations
-            now = _time.time()
-            key = f"_rate_hist_{file_path.name}"
-            history = st.session_state.get(key, [])
-
-            # Think+shuffle saves every ~17 min — need a longer window
-            is_slow = "think" in file_path.name and "shuffle" in file_path.name
-            max_history = 120 if is_slow else 60  # 60 min vs 30 min
-            history.append((done_q, now))
-            if len(history) > max_history:
-                history = history[-max_history:]
-            st.session_state[key] = history
-
-            # Use the observation closest to 5 minutes ago for a stable rate
-            rate = None
-            for old_count, old_time in history:
-                dt = now - old_time
-                dq = done_q - old_count
-                if dt >= 240 and dq > 0:  # at least ~4min window
-                    rate = dq / dt
-                    break
-            # Fall back to any observation with progress if <5min of history
-            if rate is None:
-                for old_count, old_time in history:
-                    dt = now - old_time
-                    dq = done_q - old_count
-                    if dt > 30 and dq > 0:
-                        rate = dq / dt
-                        break
-
-            if rate is not None and rate > 0:
+            times = _sample_inference_times(file_path)
+            if times:
+                mean_query_time = sum(times) / len(times)
+                time_per_question = mean_query_time * num_permutations
                 remaining_q = total_q - done_q
-                remaining_sec = remaining_q / rate
+                remaining_sec = remaining_q * time_per_question
+                rate_q_per_min = 60.0 / time_per_question if time_per_question > 0 else 0
                 remaining_str = f"~{_fmt_sec(remaining_sec)}"
-                rate_str = f"{rate * 60:.0f} q/min"
+                rate_str = f"{rate_q_per_min:.1f} q/min"
             else:
-                # Fallback: elapsed time / questions done (works for
-                # uninterrupted runs like Mahti, inaccurate after vast.ai resumes)
                 parts = file_path.stem.split("_")
                 if len(parts) >= 2 and len(parts[-1]) == 6 and len(parts[-2]) == 8:
                     start = datetime.strptime(parts[-2] + "_" + parts[-1], "%Y%m%d_%H%M%S")
@@ -325,7 +317,7 @@ def compute_timing(file_path: Path, done_q: int, total_q: int,
                         remaining_sec = (total_q - done_q) / fallback_rate
                         remaining_str = f"~{_fmt_sec(remaining_sec)}*"
                         rate_str = f"{fallback_rate * 60:.1f} q/min*"
-                if not remaining_str and len(history) < 3:
+                if not remaining_str:
                     remaining_str = "measuring..."
     except Exception:
         pass
@@ -343,6 +335,7 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
     seen: set[tuple[str, str]] = set()
     for run_name, data in all_data.items():
         cfg = data.get("config", {})
+        model = _short_model_name(cfg)
         context = cfg.get("context_condition", "unknown")
         think = cfg.get("think", False)
         prompt_mode = cfg.get("prompt_mode", "direct")
@@ -389,6 +382,7 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
 
             rows.append({
                 "run_name": run_name,
+                "model": model,
                 "context_condition": context,
                 "think": think,
                 "prompt_mode": prompt_mode,
@@ -435,21 +429,14 @@ auto_refresh = st.sidebar.toggle("Auto-refresh (2 min)", value=False)
 if auto_refresh:
     st_autorefresh(interval=120_000, key="auto_refresh_counter")
 
-# Filter options
-hide_insufficient = st.sidebar.toggle("Hide insufficient", value=True)
-
 # Build run labels
 run_labels: dict[str, Path] = {}
 for fp in result_files:
     cfg = _extract_config_head(fp)
     if cfg:
-        if hide_insufficient and cfg.get("context_condition") == "insufficient":
-            continue
         label = format_run_label(cfg)
     else:
         label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
-        if hide_insufficient and "insufficient" in label:
-            continue
     run_labels[label] = fp
 
 # Select all checkbox + multiselect
@@ -479,6 +466,55 @@ signals_df = load_signals()
 # Tab 1: Progress
 # ---------------------------------------------------------------------------
 
+def _progress_row(label: str, fp: Path) -> dict:
+    """Compute progress info for a single run. Returns dict with display data."""
+    cfg = _extract_config_head(fp)
+    stats = _fast_file_stats(fp)
+    total_q = (cfg.get("max_questions") if cfg else None) or 4609
+    done_q = stats["count"]
+    correct = stats["correct"]
+    incorrect = stats["incorrect"]
+    acc = correct / max(correct + incorrect, 1)
+    completed_at = None
+    try:
+        with open(fp, encoding="utf-8") as _f:
+            head = _f.read(2048)
+        import re as _re
+        m = _re.search(r'"completed_at":\s*"([^"]+)"', head)
+        if m:
+            completed_at = m.group(1)
+    except Exception:
+        pass
+    num_perm = cfg.get("num_permutations", 1) if cfg else 1
+    timing = compute_timing(fp, done_q, total_q, completed_at=completed_at,
+                            num_permutations=num_perm)
+    skipped = done_q - correct - incorrect
+    is_done = done_q >= total_q or completed_at is not None
+    return {
+        "label": label, "done_q": done_q, "total_q": total_q,
+        "acc": acc, "skipped": skipped, "timing": timing, "is_done": is_done,
+    }
+
+
+def _render_progress_row(row: dict) -> None:
+    """Render a single progress row."""
+    col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+    with col1:
+        st.markdown(f"**{row['label']}**")
+        st.progress(row["timing"]["pct"])
+    with col2:
+        st.metric("Questions", f"{row['done_q']}/{row['total_q']}")
+    with col3:
+        st.metric("Accuracy", f"{row['acc']:.0%}")
+    with col4:
+        st.metric("Skipped", row["skipped"] if row["skipped"] > 0 else "-")
+    with col5:
+        st.metric("Rate", row["timing"].get("rate") or "-")
+    with col6:
+        st.metric("ETA", row["timing"]["remaining"] or "-")
+    st.divider()
+
+
 def tab_progress() -> None:
     st.header("Experiment Progress")
 
@@ -486,45 +522,19 @@ def tab_progress() -> None:
         st.info("Select at least one run.")
         return
 
-    # One row per run
-    for label, fp in selected_paths.items():
-        cfg = _extract_config_head(fp)
-        stats = _fast_file_stats(fp)
-        total_q = (cfg.get("max_questions") if cfg else None) or 4609
-        done_q = stats["count"]
-        correct = stats["correct"]
-        incorrect = stats["incorrect"]
-        acc = correct / max(correct + incorrect, 1)
-        # Read completed_at from the file head (it's near the top, before question_results)
-        completed_at = None
-        try:
-            with open(fp, encoding="utf-8") as _f:
-                head = _f.read(2048)
-            import re as _re
-            m = _re.search(r'"completed_at":\s*"([^"]+)"', head)
-            if m:
-                completed_at = m.group(1)
-        except Exception:
-            pass
-        timing = compute_timing(fp, done_q, total_q, completed_at=completed_at)
+    rows = [_progress_row(label, fp) for label, fp in selected_paths.items()]
+    in_progress = [r for r in rows if not r["is_done"]]
+    completed = [r for r in rows if r["is_done"]]
 
-        skipped = done_q - correct - incorrect
-        col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
-        with col1:
-            st.markdown(f"**{label}**")
-            st.progress(timing["pct"])
-        with col2:
-            st.metric("Questions", f"{done_q}/{total_q}")
-        with col3:
-            st.metric("Accuracy", f"{acc:.0%}")
-        with col4:
-            st.metric("Skipped", skipped if skipped > 0 else "-")
-        with col5:
-            st.metric("Rate", timing.get("rate") or "-")
-        with col6:
-            st.metric("ETA", timing["remaining"] or "-")
+    if in_progress:
+        st.subheader(f"In Progress ({len(in_progress)})")
+        for row in in_progress:
+            _render_progress_row(row)
 
-        st.divider()
+    if completed:
+        st.subheader(f"Completed ({len(completed)})")
+        for row in completed:
+            _render_progress_row(row)
 
 
 # ---------------------------------------------------------------------------
@@ -698,20 +708,23 @@ def tab_comparison() -> None:
         return
 
     # Detect which factors actually vary (only show columns that differ)
-    factor_cols = []
+    # Model is always shown first as the primary grouping dimension
+    factor_cols = ["model"] if "model" in active.columns else []
     factor_labels = {
+        "model": "Model",
         "mode": "Mode",
         "shuffle": "Shuffle",
         "paraphrase": "Paraphrase",
-        "context_condition": "Context",
     }
     for col, label in factor_labels.items():
+        if col == "model":
+            continue  # already added above
         if col in active.columns and active[col].nunique() > 1:
             factor_cols.append(col)
 
-    # If no factors vary, just show one row
+    # If no factors vary, just show model
     if not factor_cols:
-        factor_cols = ["context_condition"]
+        factor_cols = ["model"] if "model" in active.columns else ["mode"]
 
     # Group by the varying factors
     pivot_data = []
@@ -851,19 +864,29 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
         name="Perfect calibration", showlegend=True,
     ))
 
+    # Line styles for distinguishing conditions within the same model
+    LINE_STYLES = ["solid", "dash", "dot", "dashdot", "longdash"]
+
     run_names = sorted(df_valid["run_name"].unique())
+    # Track how many runs per model to cycle line styles
+    model_run_count: dict[str, int] = {}
     for ri, run_name in enumerate(run_names):
         sub = df_valid[df_valid["run_name"] == run_name]
         if len(sub) < 5:
             continue
-
-        color = PLOT_COLORS[ri % len(PLOT_COLORS)]
 
         # Build clean label from config
         cfg = _extract_config_head(selected_paths.get(
             next((l for l, p in selected_paths.items()
                   if _extract_run_prefix(p.stem) == run_name), ""), None))
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
+
+        # Color by model, cycle line styles for multiple conditions per model
+        model_name = _short_model_name(cfg) if cfg else "Unknown"
+        color = MODEL_COLORS.get(model_name, PLOT_COLORS[ri % len(PLOT_COLORS)])
+        style_idx = model_run_count.get(model_name, 0)
+        model_run_count[model_name] = style_idx + 1
+        dash_style = LINE_STYLES[style_idx % len(LINE_STYLES)]
 
         msp_vals = sub["msp"].values
         correct_vals = sub["is_correct"].astype(float).values
@@ -899,14 +922,14 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
             if not math.isnan(acc) and total_n > 0:
                 ece += (n / total_n) * abs(acc - conf)
 
-        # Plot valid bins as a clean line
+        # Plot valid bins as a clean line — color by model, style by condition
         valid = [(c, a) for c, a in zip(bin_centers, bin_accs) if not math.isnan(a)]
         if valid:
             plot_x, plot_y = zip(*valid)
             fig.add_trace(go.Scatter(
                 x=list(plot_x), y=list(plot_y),
                 mode="lines",
-                line=dict(color=color, width=2.5),
+                line=dict(color=color, width=2.5, dash=dash_style),
                 name=f"{label} (ECE={ece:.2f})",
             ))
 
@@ -1070,7 +1093,7 @@ def tab_effects() -> None:
 
     active = df[df["num_queries"] > 0].copy()
 
-    # Index runs by condition tuple: (prompt_mode, shuffle, context)
+    # Index runs by condition tuple: (model, mode, shuffle, paraphrase)
     run_metrics: dict[str, dict] = {}
     for run_name in active["run_name"].unique():
         sub = active[active["run_name"] == run_name]
@@ -1089,6 +1112,7 @@ def tab_effects() -> None:
             "epistemic": sub["epistemic"].mean() if "epistemic" in sub.columns and len(sub["epistemic"].dropna()) > 0 else None,
             "epistemic_correct": correct_sub["epistemic"].mean() if "epistemic" in correct_sub.columns and len(correct_sub["epistemic"].dropna()) > 0 else None,
             "epistemic_incorrect": incorrect_sub["epistemic"].mean() if "epistemic" in incorrect_sub.columns and len(incorrect_sub["epistemic"].dropna()) > 0 else None,
+            "model": sub["model"].iloc[0] if "model" in sub.columns else "Unknown",
             "mode": sub["mode"].iloc[0] if "mode" in sub.columns else "direct",
             "shuffle": sub["shuffle"].iloc[0] if "shuffle" in sub.columns else True,
             "paraphrase": sub["paraphrase"].iloc[0] if "paraphrase" in sub.columns else False,
@@ -1111,6 +1135,7 @@ def tab_effects() -> None:
             return f"{incorrect_val - correct_val:+.2f}"
 
         summary_rows.append({
+            "Model": m.get("model", "Unknown"),
             "Run": label,
             "N": m["n"],
             "Accuracy": f"{m['accuracy']:.1%}" if m["accuracy"] is not None else "-",
@@ -1137,13 +1162,10 @@ def tab_effects() -> None:
     # matched on all other variables. Mode comparisons are pairwise against direct.
     comparisons = []  # (var_name, val_a, val_b, label)
 
-    contexts = set(m["context"] for m in run_metrics.values())
     shuffles = set(m["shuffle"] for m in run_metrics.values())
     modes = set(m["mode"] for m in run_metrics.values())
     paraphrases = set(m["paraphrase"] for m in run_metrics.values())
 
-    if len(contexts) > 1:
-        comparisons.append(("context", "sufficient", "insufficient", "Sufficient vs insufficient"))
     if len(shuffles) > 1:
         comparisons.append(("shuffle", True, False, "Shuffle on vs off"))
     if len(paraphrases) > 1:
@@ -1159,7 +1181,7 @@ def tab_effects() -> None:
         st.info("Need runs with contrasting conditions to compute effects.")
         return
 
-    match_vars = ["context", "shuffle", "mode", "paraphrase"]
+    match_vars = ["model", "context", "shuffle", "mode", "paraphrase"]
     effect_rows = []
     run_list = list(run_metrics.items())
 
@@ -1225,7 +1247,9 @@ def tab_effects() -> None:
             next((l for l, p in selected_paths.items()
                   if _extract_run_prefix(p.stem) == run_name), ""), None))
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
-        color = PLOT_COLORS[ri % len(PLOT_COLORS)]
+        # Color by model for visual grouping
+        model_name = _short_model_name(cfg) if cfg else "Unknown"
+        color = MODEL_COLORS.get(model_name, PLOT_COLORS[ri % len(PLOT_COLORS)])
 
         fig.add_trace(go.Violin(
             x=sub["msp"], name=label,
@@ -1395,11 +1419,13 @@ def _compute_signal_battery(df: pd.DataFrame) -> list[dict]:
                 (ac_c if r["is_correct"] else ac_i).append(g)
         ac_d = _delta(ac_c, ac_i)
 
+        model_name = _short_model_name(cfg) if cfg else "Unknown"
         mode = _effective_mode(cfg) if cfg else "direct"
         shuffle = cfg.get("shuffle_options", False) if cfg else False
         para = cfg.get("use_paraphrases", False) if cfg else False
 
         rows.append({
+            "Model": model_name,
             "Mode": mode,
             "Shuffle": "Yes" if shuffle else "No",
             "Para": "Yes" if para else "No",
@@ -1458,14 +1484,14 @@ def tab_signals() -> None:
         .sig-table tr:hover { background: #F5F3F1; }
         </style><table class="sig-table">"""
 
-        html += "<tr><th>Mode</th><th>Shuffle</th><th>Para</th><th>N</th>"
+        html += "<tr><th>Model</th><th>Mode</th><th>Shuffle</th><th>Para</th><th>N</th>"
         for col in cols:
             html += f"<th>{col}</th>"
         html += "</tr>"
 
         for r in table_rows:
             html += "<tr>"
-            html += f'<td class="cond">{r["Mode"]}</td><td>{r["Shuffle"]}</td><td>{r["Para"]}</td><td>{r["N"]}</td>'
+            html += f'<td class="cond">{r.get("Model", "")}</td><td class="cond">{r["Mode"]}</td><td>{r["Shuffle"]}</td><td>{r["Para"]}</td><td>{r["N"]}</td>'
             for col in cols:
                 v = r.get(col)
                 if v is None:
@@ -2709,7 +2735,7 @@ def tab_adaptive() -> None:
 # ---------------------------------------------------------------------------
 
 st.title("Pre-Action Uncertainty Quantification")
-st.caption("QuALITY dataset | Context sufficiency experiments")
+st.caption("QuALITY dataset | Multi-model uncertainty quantification")
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Progress", "Uncertainty Distributions",

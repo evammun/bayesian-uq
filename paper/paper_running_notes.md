@@ -522,6 +522,22 @@ Reviewed Luigi's full `bayesian.py` (1321 lines) and exceedance approximation do
 - **Gemma 4 observation:** Very overconfident — mean max-prob confidence 0.961 with 72% accuracy. Even wrong answers have 0.894 mean confidence. Expected for single-query direct mode, but more extreme than Qwen 3. Good signal for the paper: different models have different calibration profiles under the same pipeline.
 - **llama-cpp-python upgraded to 0.3.36** (JamePeng fork) on Mahti. Built from source with CUDA 80 (A100). Fixes Gemma 4 support but not Qwen 3.5.
 
+### Dashboard multi-model refactor
+- **Model always visible:** All 3 models shown simultaneously, no model dropdown. Condition is the filtered dimension.
+- **Model colors:** Qwen 3 = teal, Gemma 4 = rose, Qwen 3.5 = amber. Consistent across all charts.
+- **Labels:** `Qwen 3 · direct · noshuffle` (removed "sufficient" — vestigial from dropped insufficient experiments)
+- **Tab 1 Progress:** Split into In Progress / Completed sections. ETA now computed from actual `inference_time_s` per query (reads file tail), not dashboard refresh deltas.
+- **Tab 3 Condition Comparison:** Model is first column in accuracy table. Calibration diagram: color = model, linestyle = condition.
+- **Tab 5 Effect Analysis:** Model column in summary table. Violin plot colored by model. Matched pairs within model.
+- **Tab 6 Signal Battery:** Model column in all signal tables.
+- **Deleted:** All insufficient result files (local + Mahti), insufficient configs, hide_insufficient toggle.
+
+### Full Gemma 4 runs launched on Mahti
+- 4 conditions: direct × {noshuffle, shuffle, noshuffle+para, shuffle+para}
+- All sufficient-only (no insufficient)
+- Jobs: 6383926 (noshuffle ~75 min), 6383927/28/29 (10-perm, ~12h each)
+- Early validation at 720 questions: 81.5% accuracy, all logprobs valid, mean 1.03s/q
+
 ### Decision Log (updated)
 
 | Date | Decision | Rationale |

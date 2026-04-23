@@ -1,0 +1,19 @@
+# Gemma 4 E4B full (Mahti A100): direct mode, shuffle + paraphrases, sufficient context
+# 10 queries per question: each gets a different paraphrase AND a different answer order
+# Submit: sbatch --export=CONFIG=experiments/configs/mahti/gemma4_direct_shuffle_paraphrase_sufficient.yaml,MODEL_FILE=gemma-4-E4B-it-Q4_K_M.gguf scripts/mahti/slurm_single.sh
+
+run_name: gemma4_direct_shuffle_paraphrase_sufficient
+model_path: auto
+model_name: gemma4:e4b-q4_K_M
+model_family: auto
+think: false
+prompt_mode: direct
+dataset_file: data/quality_all.jsonl
+context_condition: sufficient
+shuffle_options: true
+use_paraphrases: true
+paraphrases_file: data/paraphrases_qwen.json
+seed: 42
+temperature: 0.7
+num_permutations: 10
+n_ctx: 12288
