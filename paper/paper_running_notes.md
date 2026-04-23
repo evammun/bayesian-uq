@@ -461,12 +461,14 @@ Beyond pure posterior, additional veto signals for the stopping decision:
 - **All Luigi items now integrated:** MLE ✓, copula exceedance ✓, augmented escalation ✓, regularisation ✓.
 - Paper comparison: Product (with temp) vs Sum (no temp) vs MLE (no temp) vs Composite, Pareto frontier in dashboard.
 
-### Next steps (adaptive) — updated Apr 23 afternoon
+### Next steps (adaptive) — updated Apr 23 evening
 - [x] ~~Implement signal-augmented stopping~~ — done: Composite method (gap + flip veto)
 - [x] ~~Implement Dirichlet MLE~~ — done: Minka 2000, batch-vectorised (1.5s for 18K fits)
 - [x] ~~Implement Luigi-style escalation~~ — done: augment α with esc prob vector, both CoT + think
-- [ ] Multi-model expansion — Qwen 3.5 9B and Gemma 4, running through Mahti
-- [ ] Per-query cost instrumentation — added inference_time_s, prompt_tokens, output_tokens fields (not yet collected)
+- [x] ~~Per-query cost instrumentation~~ — done: inference_time_s, prompt_tokens, output_tokens. Validated in Gemma 4 test run.
+- [x] ~~Multi-model: Gemma 4~~ — 100-question test passed, 72% accuracy. Ready for full runs.
+- [ ] Multi-model: Qwen 3.5 — blocked on llama.cpp recurrent memory bug. Options: wait for upstream fix, try different quant, or use transformers+bitsandbytes
+- [ ] Launch full Gemma 4 runs (all conditions) on Mahti
 - [ ] Determine optimal (T, τ) for specific deployment scenarios (cheap-and-fast vs max-accuracy)
 
 ### Claude Code workflow note
@@ -510,11 +512,15 @@ Reviewed Luigi's full `bayesian.py` (1321 lines) and exceedance approximation do
 - Zero overhead — fields are Optional with None defaults for backward compat
 - Not yet collected — will populate on next experiment runs (Qwen 3.5 9B, Gemma 4)
 
-### Multi-model expansion: next up
-- **Qwen 3.5 9B** and **Gemma 4** — Luigi's two requested additions
-- Strategy: keep pipeline identical, collect full data (all permutations), retroactively compute adaptive stopping in dashboard — always better to have more data than less
-- Need to audit: chat template, think tags, logprob extraction (model-specific token IDs)
-- Running through Mahti (A100 40GB) — see `csc_mahti_setup_spec.md`
+### Multi-model expansion: Gemma 4 working, Qwen 3.5 blocked
+- **Gemma 4 E4B (Q4_K_M):** 100-question test run PASSED. 72% accuracy, all logprobs valid, mean 0.96s/question on A100.
+- **Qwen 3.5 9B (Q4_K_M):** BLOCKED by llama.cpp bug. `llama-memory-recurrent.cpp:544` assertion failure — Qwen 3.5's hybrid recurrent attention architecture not properly supported. Crashes after 1-2 questions. Tested on both llama-cpp-python 0.3.19 and 0.3.36 (JamePeng fork). Pipeline code is fine (the 2 questions it processed have valid logprobs and timing).
+- Chat templates implemented: Qwen 3 (ChatML + `/no_think`), Qwen 3.5 (ChatML + plain-text "answer directly"), Gemma 4 (`<start_of_turn>`/`<end_of_turn>`)
+- Model family auto-detection from GGUF filename stem
+- SLURM script made model-generic via `MODEL_FILE` env var
+- **Bug fix:** `completed_at` timestamp was never written because incremental writer skips when no new results to append. Added `finalize()` method.
+- **Gemma 4 observation:** Very overconfident — mean max-prob confidence 0.961 with 72% accuracy. Even wrong answers have 0.894 mean confidence. Expected for single-query direct mode, but more extreme than Qwen 3. Good signal for the paper: different models have different calibration profiles under the same pipeline.
+- **llama-cpp-python upgraded to 0.3.36** (JamePeng fork) on Mahti. Built from source with CUDA 80 (A100). Fixes Gemma 4 support but not Qwen 3.5.
 
 ### Decision Log (updated)
 
@@ -526,4 +532,7 @@ Reviewed Luigi's full `bayesian.py` (1321 lines) and exceedance approximation do
 | 2026-04-23 | Augmented escalation (not replace) | α_aug = α_cap + p_esc preserves accumulated evidence. Luigi's design. Applied to both CoT and think. |
 | 2026-04-23 | Keep pipeline as-is for multi-model, retroactive adaptive | Always better to have more data. Adaptive stopping computed retroactively from full permutation data. |
 | 2026-04-23 | Per-query timing instrumentation | Need cost baselines for each query to compare adaptive approaches. inference_time_s + token counts. |
+| 2026-04-23 | llama-cpp-python 0.3.36 (JamePeng fork) on Mahti | PyPI 0.3.20 too old for Qwen 3.5 and Gemma 4 architectures. JamePeng fork built from source with CUDA. |
+| 2026-04-23 | Qwen 3.5 deferred — llama.cpp recurrent memory bug | GGML_ASSERT in llama-memory-recurrent.cpp. Hybrid attention not supported. Will revisit when upstream fixes land. |
+| 2026-04-23 | Gemma 4 E4B validated as second model | 72% accuracy, valid logprobs, fast inference (0.96s/q). Very overconfident — good calibration contrast with Qwen 3. |
 

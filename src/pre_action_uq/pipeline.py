@@ -60,6 +60,14 @@ class _IncrementalWriter:
         lines = json_str.split("\n")
         return "\n".join("    " + line for line in lines)
 
+    def finalize(self, path: Path, completed_at: str) -> None:
+        """Patch the completed_at field in the existing JSON file."""
+        if self._n_written == 0:
+            return
+        raw = path.read_text(encoding="utf-8")
+        raw = raw.replace('"completed_at": null', f'"completed_at": "{completed_at}"', 1)
+        path.write_text(raw, encoding="utf-8")
+
     def write(self, path: Path, data: ExperimentResult) -> None:
         """Append new question results to the JSON file on disk."""
         new_results = data.question_results[self._n_written:]
@@ -785,14 +793,15 @@ def run_experiment(
             writer.write(output_file, experiment_result)
 
     # Final save — stamp completion time
+    completed_at = datetime.now(timezone.utc).isoformat()
+    writer.finalize(output_file, completed_at)
     experiment_result = ExperimentResult(
         run_name=config.run_name,
         config=config,
         timestamp=timestamp,
-        completed_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=completed_at,
         question_results=question_results,
     )
-    writer.write(output_file, experiment_result)
 
     # Summary
     total = len(question_results)
