@@ -454,24 +454,76 @@ Beyond pure posterior, additional veto signals for the stopping decision:
 - **Joint Optimization section**: Product sweeps T×τ, Sum sweeps τ only, both on same Pareto frontier chart with escalation cost slider
 - Pareto tables side by side for both methods
 
-### Luigi's Bayesian library comparison (April 23)
-- Luigi uses **Dirichlet Sum** (same as our Sum) and **Dirichlet MLE** (Minka's fixed-point iteration). We have Sum + Product.
-- Luigi uses **exceedance probability** (P(leader is true mode)) not max posterior. We now also use exceedance for Sum.
-- Key insight: our Product approach is theoretically correct but breaks on overconfident logprobs (need temperature). Sum sidesteps this because evidence accumulates linearly not exponentially.
-- Luigi's MLE fits concentration from data — potentially the most principled approach. TODO: implement as third option.
-- Luigi's escalation augments α with weighted CoT vector (preserves evidence) vs our replace-answer approach. TODO: adopt.
-- Paper comparison: Product (with temp) vs Sum (no temp) vs MLE, same Pareto frontier.
+### Luigi's Bayesian library comparison (April 23) — now integrated
+- Luigi uses **Dirichlet Sum** and **Dirichlet MLE** (Minka's fixed-point). We now have all four: Product, Sum, MLE, Composite.
+- Luigi uses **exceedance probability** (P(leader is true mode)) not max posterior. We use exceedance for Sum + MLE (copula), max posterior for Product, vetoed posterior for Composite.
+- Key insight: Product is theoretically correct but breaks on overconfident logprobs (need temperature). Sum/MLE sidestep this because evidence accumulates linearly/via distribution fitting.
+- **All Luigi items now integrated:** MLE ✓, copula exceedance ✓, augmented escalation ✓, regularisation ✓.
+- Paper comparison: Product (with temp) vs Sum (no temp) vs MLE (no temp) vs Composite, Pareto frontier in dashboard.
 
-### Next steps (adaptive)
-- [ ] Implement signal-augmented stopping in dashboard (2nd Gap, flip detection, epistemic veto)
-- [ ] Design new adaptive pipeline with timing instrumentation for publishable results
-- [ ] Multi-model expansion — audit Qwen3-specific code (chat template, think tags), pick 2 additional models
+### Next steps (adaptive) — updated Apr 23 afternoon
+- [x] ~~Implement signal-augmented stopping~~ — done: Composite method (gap + flip veto)
+- [x] ~~Implement Dirichlet MLE~~ — done: Minka 2000, batch-vectorised (1.5s for 18K fits)
+- [x] ~~Implement Luigi-style escalation~~ — done: augment α with esc prob vector, both CoT + think
+- [ ] Multi-model expansion — Qwen 3.5 9B and Gemma 4, running through Mahti
+- [ ] Per-query cost instrumentation — added inference_time_s, prompt_tokens, output_tokens fields (not yet collected)
 - [ ] Determine optimal (T, τ) for specific deployment scenarios (cheap-and-fast vs max-accuracy)
-- [ ] Implement Dirichlet MLE (Minka iteration) as third aggregation method
-- [ ] Implement Luigi-style escalation: augment α with weighted CoT vector instead of replace
 
 ### Claude Code workflow note
 - **Opus** for: architecture decisions, judgment calls, synthesis, reviewing Sonnet's work, anything where getting it wrong costs time
 - **Sonnet** for: implementation, boilerplate, data exploration, running tests — treat as a capable intern nearing end of internship. Don't hand-hold, do verify. Have it write tests for its own code.
 - Pattern: Opus designs and specifies → Sonnet implements → Opus reviews → ship
+
+---
+
+## April 23, 2026 (afternoon) — Luigi's Methods + Multi-Model Prep
+
+### Integrated Luigi's Bayesian library improvements
+Reviewed Luigi's full `bayesian.py` (1321 lines) and exceedance approximation doc. Three changes integrated into dashboard:
+
+**1. Damped Gaussian-copula exceedance** — replaces Bonferroni bound for Sum and MLE methods.
+- Exact pairwise Beta marginals + first-order Gaussian copula correction with K-dependent damping
+- Damping: `d(K) = 0.637 + 0.206 × exp(-0.587 × (K-3))`, calibrated against MC ground truth
+- K=4 validation: errors ±0.002-0.004 vs MC (Bonferroni was -0.028 to -0.382)
+- The K=4 moderate case is striking: Bonferroni gives 0.062 (useless), copula gives 0.440 (near-exact 0.444)
+- From Luigi's derivation: the first-order truncation benefits from error cancellation — higher-order terms converge toward the wrong (MVN) target
+
+**2. MLE regularisation** — uniform pseudo-observation + label smoothing.
+- `suff_stats = (log_p_sum + prior_strength × log(1/K)) / (N + prior_strength)`, prior_strength=1.0
+- Label smoothing: `p_smooth = ε/K + (1-ε)p`, ε=10⁻³ — prevents log(0) without distorting high-N fits
+- Luigi's design from his `dirichlet_mle()`: standard Bayesian regularisation
+
+**3. Luigi's trigamma/inverse-digamma** — pure numpy, replaces scipy.special.polygamma.
+- `_trigamma()`: recurrence + asymptotic series (Abramowitz & Stegun 6.4.12)
+- `_inverse_digamma()`: Minka 2003 initialisation + 8 Newton iterations
+- Used in both per-question and batch MLE paths
+
+### 2nd Gap replaced by MLE (earlier this session)
+- Luigi called 2nd Gap a "hack" — not wrong, the gap signal is captured by the other methods
+- MLE is the formally correct approach: fits the Dirichlet concentration from observed variation
+- Batch-vectorised: 18,436 MLE fits in 1.5s (was 60s+ per-question loop)
+
+### Per-query cost instrumentation added
+- Added `inference_time_s`, `prompt_tokens`, `output_tokens` to `QueryResult` (config.py)
+- Wrapped inference calls with `time.time()` in inference.py (both direct and two-pass paths)
+- Token counts extracted from existing llama-cpp-python internals (already computed, just not saved)
+- Zero overhead — fields are Optional with None defaults for backward compat
+- Not yet collected — will populate on next experiment runs (Qwen 3.5 9B, Gemma 4)
+
+### Multi-model expansion: next up
+- **Qwen 3.5 9B** and **Gemma 4** — Luigi's two requested additions
+- Strategy: keep pipeline identical, collect full data (all permutations), retroactively compute adaptive stopping in dashboard — always better to have more data than less
+- Need to audit: chat template, think tags, logprob extraction (model-specific token IDs)
+- Running through Mahti (A100 40GB) — see `csc_mahti_setup_spec.md`
+
+### Decision Log (updated)
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-04-23 | Damped Gaussian-copula exceedance replaces Bonferroni | RMSE 0.005 vs 0.04 for K=4. Luigi's derivation + validation. Conservative Bonferroni was giving misleading low exceedance values. |
+| 2026-04-23 | MLE regularisation with prior_strength=1.0 | Stabilises low-N fits. Luigi's approach: uniform pseudo-observation in sufficient statistics. |
+| 2026-04-23 | 2nd Gap dropped, replaced by Dirichlet MLE | Gap is a heuristic captured by other methods. MLE is the principled approach — fits concentration from observed variation. |
+| 2026-04-23 | Augmented escalation (not replace) | α_aug = α_cap + p_esc preserves accumulated evidence. Luigi's design. Applied to both CoT and think. |
+| 2026-04-23 | Keep pipeline as-is for multi-model, retroactive adaptive | Always better to have more data. Adaptive stopping computed retroactively from full permutation data. |
+| 2026-04-23 | Per-query timing instrumentation | Need cost baselines for each query to compare adaptive approaches. inference_time_s + token counts. |
 

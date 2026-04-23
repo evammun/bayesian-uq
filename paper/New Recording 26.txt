@@ -1,0 +1,267 @@
+00:00 SPEAKER_01
+Okay.
+
+00:03 SPEAKER_01
+So, this essentially, natural contains, like, includes, entails the fact that if your current posterior over histograms, let's say, cannot distinguish between two of them, when you compute this existence probability, it will be close to, let's say, 50%, in the sense that, I mean... That sometimes it picks C and sometimes it doesn't.
+
+00:25 SPEAKER_00
+Exactly.
+
+00:25 SPEAKER_01
+So, let's say, so it's 50%, you know, 51% C, but let's say, so it's not enough.
+
+00:30 SPEAKER_00
+So...
+
+00:31 SPEAKER_01
+for example, the threshold, you know, the criteria I'm saying is, you know, okay, I want to put as a criteria that I want to be 90% sure that this is the maximum.
+
+00:41 SPEAKER_01
+Even though the maximum itself, that might be, you know, 51, but I'm very certain that, you know, it's 51 and not, you know, and not 49. But in order to get there, of course, you know, you need a lot of, if it's really 51 versus 49, that, you know, you need a lot of
+
+00:58 SPEAKER_01
+samples to get to that level of precision. In practice, essentially, 51 is effectively 0.5 and you cannot distinguish it. Okay.
+
+01:07 SPEAKER_00
+That was when we were Monte Carloing.
+
+01:09 SPEAKER_01
+So that's when we were potentially. So in order to do it, so this is analytical for if you have two choices. Yes. It's called the beta ink, but the 4K greater than two, that is not analytical. I was using Monte Carlo, then with Claude, we derived an analytical solution, which is good enough. and then I've been using that and that's I think it's a minor thing in itself anyways so that's that's what I've been using and so there's the exceedance probability I mean I like it because of course it's yes it's it's all very kind of mathematically principled but this all makes sense it is actually it's like this is totally kind of makes sense if we are sampling
+
+01:53 SPEAKER_01
+If we don't have log probes, so you only get, you have a known, you extract, you know, it's a C, it's a D, etc. And then you want to infer the probability. But that's not our case. No, we have log probes. Exactly. Our case is that instead of getting samples, we get samples of, so essentially, instead of observing one outcome at a time, what we observe is a histogram at a time.
+
+02:14 SPEAKER_00
+Yes.
+
+02:15 SPEAKER_01
+Because that's a histogram. Okay. All right. So this is essentially, so what I've been doing is very anchor share.
+
+02:24 SPEAKER_01
+uh which is i'm going to treat these histograms exactly as if these were samples from a node yes and so i'm just adding them essentially so just like you know i mean essentially i'm doing this kind of you know i mean other people have done it before it's mathematically you can do it in the sense that you know instead of saying that this is a one and a zero it's 0.7 and 0.3 and i can add it and then also essentially um now why it's incorrect
+
+02:50 SPEAKER_01
+because it's incorrect, but let's say because we're actually doing something a bit weird, which is this should give us more information than a single sample. When I get a single sample, A, B, C, or D, I don't know that, but I know it's... But here I'm getting the full histogram, but then what I'm doing, I'm actually kind of...
+
+03:10 SPEAKER_01
+Overall, to the alphas, I'm only adding one in total, as if this was a single sample. So that's odd, because I'm kind of partly throwing away this information. And that's why I was saying that if I was doing it that way, this is accumulating evidence more slowly than it should, because we should have more information. So if we do the Dirichlet MLE, the idea is
+
+03:44 SPEAKER_01
+there is again starting point the same there is an underlying true histogram but we don't know which one it is we want to infer it but now what we are observing are not samples but actual sample histograms so we want to find i mean let's say we want to find the distribution which is most consistent with this
+
+04:04 SPEAKER_01
+sampled histograms.
+
+04:06 SPEAKER_01
+And so now that doesn't have a closed form solution, unlike, you know, this thing, which was nice, we can do some. So I say, so you need to effectively solve, you know, an optimization problem. You can solve a problem that tells you what are the alphas that could generate these different histograms. Now, for that to be stable, what I don't know if you've done, is that you need to regularize this. Otherwise, this is going to be shit. Because, which one is it?
+
+04:48 SPEAKER_01
+Yeah, so first of all, this one, I mean, how is he computing it? Because, let's say, unless he's using the formula we found, let's say, it's... What about the point for any exceedance?
+
+05:00 SPEAKER_01
+Yeah, how is he computing that? Yes.
+
+05:34 SPEAKER_01
+Yeah, that's the point I was about to make, which is this one.
+
+05:43 SPEAKER_01
+So the practical thing I was suggesting is to start with a fake suit observation of 1 over k over all the thing.
+
+05:55 SPEAKER_00
+Mm-hmm.
+
+05:55 SPEAKER_01
+Essentially, so that's... Yeah, it's 25%. Yes. Okay, here's what it says.
+
+06:03 SPEAKER_01
+We have a derelict. I'm still going to call it derelict. Posterior.
+
+06:08 SPEAKER_00
+Four parameters, one per answer choice. If we sample the true answer probabilities, what's the answer? Yeah, okay. Why it's hard? Blah, blah. Yeah, okay, great. The Bonferroni trick. Instead of computing P lead beats all three others directly, use the union bound. P lead leads us to at least one is smaller or equal to P. Yeah, that's wrong.
+
+06:26 SPEAKER_01
+That's wrong? Yeah, so that's wrong. I mean, that's an approximation, but I have a way better one. Okay.
+
+06:33 SPEAKER_00
+Okay.
+
+06:39 SPEAKER_01
+That's how I talk to God.
+
+06:43 SPEAKER_00
+That's how I talk to God.
+
+06:45 SPEAKER_01
+Oh, well done. Oh, yeah, yeah, you're a much better soul than me.
+
+06:50 SPEAKER_01
+So what's yours? I mean, I'll give it. No, don't have it to read it. It's long. Okay. Okay. We'll later give you one.
+
+07:01 SPEAKER_01
+yeah but i and i understand yeah i can't i couldn't derive this from first principles but i understand okay exactly but that's so i think that regardless of how we get there i think it's nice to have the concert that we have a additional posterior and then you know however we get there and which are essentially because then you know then a lot of stuff we can do you know it's it's got for example the external probability is nice
+
+07:28 SPEAKER_01
+And then maybe we can use other criteria. Not saying that we should use that one, but say, you know, this is kind of like a natural one.
+
+07:35 SPEAKER_01
+And, you know, we can... So, yeah, the point is, yeah, exactly. So the point is using MLE is that, yeah, it's...
+
+07:42 SPEAKER_01
+I would add one, effectively, I would start one pseudo-observation as prior. Now, it's not a pseudo-observation, it's like, I don't know, anyways, I would start with this one, so that even if you have one observation, and then you're, so essentially, so you start with the idea that, so this is a bit hacky, so let's say, so not as happy as the other one, but I mean, I'm just essentially, I would like to see what empirically how it works effectively. Can you give me what report have you done?
+
+08:11 SPEAKER_01
+Then let me try it out and let me understand it. Yeah, so which one? You're not using Bonfer... So that's just essentially, so the tree is essentially...
+
+08:23 SPEAKER_01
+The idea is that, yeah, so conceptually, I mean, you understand, right? So you want, so you have this, you have the posterior dirichlet, whatever, which is, you know, 1, 3, 2, 5, whatever. Yeah. And, you know, then, you know, this encodes a distribution over histograms. I can sample from it. So, you know, one sample can be this.
+
+08:47 SPEAKER_01
+Yeah, just a sample. And then another sample can be a bit different.
+
+08:52 SPEAKER_01
+this one is still higher because I think this is larger than the other, so we'll tend to generate a larger one. It's not a history, it's a distribution. Yes. This sum to one. The larger these numbers, the more precise the distribution is. Yes. So if these are all very large,
+
+09:09 SPEAKER_01
+this converges to a distribution where essentially this sum to one and then, you know, this is, okay, this is the total is actually whatever, 11. So this will converge to one 11th, three 11th, you know, two 11th, exactly. So if this is 100, 300, 200 and 500, you know, okay.
+
+09:29 SPEAKER_01
+So the smaller they are, the more variability there is between them. And, okay. So the other thing, so what I want to say, so yeah, so the point is,
+
+09:40 SPEAKER_01
+how do I calculate the probability to say that this guy is higher than all the other guys?
+
+09:46 SPEAKER_01
+And the point is that what it's doing, I mean, it's an approximation, but the problem is that all of these numbers are not independent because they need to sum to one, and that's where it comes down. So you cannot consider them independently, and that's where you lose.
+
+10:00 SPEAKER_01
+So what you can do is do an approximation where you take into account the correlation between these guys.
+
+10:07 SPEAKER_00
+Okay.
+
+10:09 SPEAKER_01
+Now, correlations work. For example, if everything was a Gaussian, then that would be enough, and that you have actually, what you're doing is exact. This is a Dirichlet, it's not Gaussian, it's not even, you know, it's a different space, so it's a bit of a mess. But one magical thing that you can do in statistics or mathematics, you can build mappings between spaces.
+
+10:33 SPEAKER_01
+So this lives in a very complicated space. We can map this to a nice...
+
+10:38 SPEAKER_01
+continuous space and then essentially approximate this with a Gaussian, then compute all the math you can compute. When you use Gaussians, everything is analytical, and then you can map back to this space. So effectively what I'm doing is,
+
+10:55 SPEAKER_01
+I'm taking this, mapping it to the other space, computing analytically which one was the probability of this being larger than this one, and then I map it back to the space. It works in the sense that, of course, it's an approximation because in this other space,
+
+11:15 SPEAKER_01
+It's not true that this is Gaussian, but what happens is that when you map things between spaces, often the things kind of get nicer if they're mapped to a nice space. And so let's say, so the Gaussian approximation works quite well so that effectively you end up with an approximation which is correct with errors or whatever, 2%.
+
+11:35 SPEAKER_01
+And the point is that we don't care about errors about 2% because let's say we're not going to make decisions
+
+11:41 SPEAKER_01
+which is this tiny. Anyways, so I think that was it. Yeah, that's all. Okay. And then, you know, I can send you the... Yeah, send it to me, I'll have a look. Okay. Yeah, I want to get the pipelines going for the other models, because that's going to take forever to... Okay.
+
+11:58 SPEAKER_00
+So I'm less bothered about this.
+
+12:00 SPEAKER_01
+The calibration thing as well. Yeah. So, yeah, when I said the calibration is... So calibration is done. i mean in principle then you know of course you know you can always do whatever you want but the calibration is that the idea is that you do it at the level of a single response yeah so that's what i've changed it to okay so and then okay
+
+12:45 SPEAKER_01
+For any single question, the model says 0.8, 0.2, blah, blah, blah. Is that actually right for this question? Population calibration says on average. Well, it matters for us. The product method multiplies these per-career probability vectors as likelihood. Bayes' theorem is only correct if each likelihood function is well-specified.
+
+13:01 SPEAKER_01
+If the model says 80% with a true per-career, we're feeding garbage.
+
+13:05 SPEAKER_01
+Practical implication is actually an argument for the sum method over product. Sum accumulates evidence linearly, so individual miscalibration doesn't compound the way multiplicative does.
+
+13:17 SPEAKER_00
+And then there's the MLE business. If per-query calibration were perfect, the pseudo-counterproximation would be fine.
+
+13:24 SPEAKER_01
+Because it isn't perfect, you would ideally use MLE to infer the true direct parameters from the observed imperfect probability vectors. Blue genosis shortcut works in practice, but isn't formally justified. The MLE fix would be more rigorous.
+
+13:37 SPEAKER_01
+That's all, Claude. Sorry? That's all, Claude. That's all, Claude. Yeah, quite clever, eh? I know.
+
+13:44 SPEAKER_00
+I've stopped thinking. I don't need to think anymore.
+
+13:46 SPEAKER_01
+It's great. Yeah. Yeah, I agree with Claude. Yeah.
+
+13:50 SPEAKER_01
+Um... So, yeah, the idea... The idea of calibration, yeah. Luigi, if you have data leaning in your mouth, then this is not going to capture anything that can be turned into a transcript. Sorry. The idea of calibration is that... I know you know but I'm just telling you more clearly Here you have confidence and here we have accuracy Confidence, we take it
+
+14:34 SPEAKER_01
+the probability that the model assigns to the correct answer? Yes.
+
+14:38 SPEAKER_01
+And accuracy is the accuracy?
+
+14:39 SPEAKER_00
+Yes.
+
+14:40 SPEAKER_01
+Okay. And the idea, of course, is the same.
+
+14:42 SPEAKER_00
+So if you're at 0, 1, 1, it's 45 degrees. Okay.
+
+14:48 SPEAKER_01
+In reality, you will see stuff like this. Yes, I have many beautiful examples of that. So what you want to do is you get a lot of questions, I mean a corpus, and you compute this curve here, which you can maybe just do with some histograms again. And the idea is simply Okay, now that you have this curve, I want essentially a complete inverse curve that if I see that the confidence is six, whatever, 0.6,
+
+15:23 SPEAKER_01
+I know that the accuracy is not 0.6, but it's 0.3 or 0.4, whatever. So you're building a mapping that maps what the mobile thinks to the actual probability. That's it. So you have a function of C. So what we're doing simply is, okay, let's get all the data and then we need to fit this curve.
+
+15:45 SPEAKER_00
+Yeah.
+
+15:46 SPEAKER_01
+Okay.
+
+15:49 SPEAKER_01
+point is for example if using temperature calibration that's just that's literally one single parameter so your curve is you know it's a very simple curve yeah but in practice we can use literally whatever we want to fit it's a curve fitting problem so for example i've been using other other functions to also try to fit this that's it that's one of the issues so let's say so temperature
+
+16:11 SPEAKER_01
+Actually, for example, it doesn't work for Gemma because, you know, Gemma is a bit of a... So, you know, if this curve, you know, in practice could be something like this, right?
+
+16:18 SPEAKER_00
+Yeah, yeah.
+
+16:18 SPEAKER_01
+Could be like this. And then, you know, you need a curve of this shape, which temperature will not... So I'm using other nonlinear curves and kind of playing it out. So also you don't want them to be too complex because otherwise you can overfit. Yes. I mean, this sounds very overfitty. Yeah. Well, anyway, so I'm trying to limit, you know, to simple curves. That's it. Yeah.
+
+16:39 SPEAKER_01
+But, you know, that's what calibration is. So I wanted to make another point. Ah, yes. So there's an additional point that maybe you're not having because you have K, which is the number of choice, which is fixed throughout your corpus. But there is a big issue, which apparently not many people are working on, which is when you have a corpus where K changes.
+
+17:00 SPEAKER_00
+Yeah.
+
+17:01 SPEAKER_01
+Because...
+
+17:04 SPEAKER_01
+there is an obvious thing that probability actually has a different meaning because, of course, you know, 0.5 probability accuracy on a set of 100 choices is much better than if you have two choices.
+
+17:18 SPEAKER_00
+Exactly, yeah.
+
+17:19 SPEAKER_01
+So...
+
+17:20 SPEAKER_01
+So in my case, I'm doing some sort of normalization in such a way that then I can put everything on the same axis. Yeah, but that's not a problem with mine. Yeah, but it will be. The thing that's really getting me is that we're assuming multiple choice for all of this and the real world doesn't offer many opportunities for multiple choice, right?
+
+17:44 SPEAKER_01
+It does. I mean, that's an example. It's tool calling. You literally have... Yeah, okay, tool calling, yes. But, I mean, in rag stuff.
+
+17:54 SPEAKER_01
+No, I agree. I mean, I don't know. Again, it does even... Say, if you have a set of creative questions with...
+
+18:01 SPEAKER_01
+By create a question, I mean, let's say you have a pipeline where you want to extract specific things like, you know, sentiment and, you know, then you have like, whatever, six categories for sentiment, you know, you can now, I don't know, I mean, to me, since, I mean, if you have everything that before, you know, was still kind of automatized, I mean, now it's the same.
+
+18:20 SPEAKER_00
+Okay. Okay. Let me, let me deal with this now. And I want to build the pipelines and stuff. Yes, that was very coherent. Thank you.
+
