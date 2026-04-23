@@ -560,3 +560,36 @@ Reviewed Luigi's full `bayesian.py` (1321 lines) and exceedance approximation do
 - **Full runs launched on Mahti:** Same 4 conditions as Gemma 4 (direct × {noshuffle, shuffle, noshuffle+para, shuffle+para}). Jobs 6384215-6384218. Pending behind Gemma 4 runs.
 - **Gemma 4 progress at time of launch:** noshuffle at 2539/4609 (~55%), shuffle/para runs at ~224/4609 (~5%)
 
+---
+
+## April 23, 2026 (evening) — CoT/Think Modes, Bug Fixes, Dashboard Polish
+
+### Dashboard improvements
+- **Calibration reliability diagram split by prompt mode:** Replaced single unreadable chart with 3 separate charts (direct/cot/think). Each 380px, own color scheme per model.
+- **Accuracy table heatmaps:** Column-wise min-max blue shading (rgba(42,100,160,alpha)). Model-colored left borders (teal=Qwen3, rose=Gemma4, amber=Qwen3.5). Bold highlighting for best values.
+- **Progress tab compaction:** Metric boxes padding/font reduced (22px→16px values, 11px→10px labels) to fit 8 concurrent runs on screen.
+
+### Qwen 3.5 think leak in CoT mode (critical fix)
+Qwen 3.5 was generating `<think>` blocks even in CoT mode — 8372-char think blocks in some responses. Template-level suppression fix: empty `<think>\n\n</think>\n\n` block as assistant turn prefix (matches official Jinja template `enable_thinking=false` behavior). Also added CoT-mode think-stripping: Pass 2 eval uses `visible_output` only (strips any spontaneous think blocks). Validated: 0/20 think blocks after fix. Synced to Mahti via scp.
+
+### Incremental writer last-batch data loss (fix)
+Gemma 4 direct noshuffle saved only 4600/4609 questions. Root cause: incremental writer saves every 10 questions, `finalize()` only patches `completed_at` without flushing remaining results. Fix: added `writer.write()` before `writer.finalize()` in pipeline.py. Synced to Mahti, then resumed the run — all 4609 questions confirmed.
+
+### CoT + Think production runs launched
+4 new conditions submitted on Mahti (no shuffle, no paraphrase, sufficient-only):
+- Gemma 4 CoT (job 6384486), Gemma 4 Think (6384487)
+- Qwen 3.5 CoT (6384489), Qwen 3.5 Think (6384490)
+Think configs use `think: true, prompt_mode: direct`. CoT configs use `think: false, prompt_mode: cot`. All n_ctx=12288.
+
+### Test validation summary
+All 4 conditions tested on 20 questions before production launch:
+- Gemma 4 CoT: 75%, pass1+pass2 logprobs captured
+- Gemma 4 Think: 85%, thinking_trace present in all questions
+- Qwen 3.5 CoT (post-fix): 90%, 0 think blocks (was leaking before fix)
+- Qwen 3.5 Think: 75%, thinking traces valid
+
+### Job status at session end
+- 7 prior runs still running (Gemma 4 shuffle/para, Qwen 3.5 all 4 direct conditions)
+- 4 new CoT/Think runs queued (pending priority)
+- Gemma 4 direct noshuffle: COMPLETE (4609/4609 after resume)
+

@@ -468,16 +468,20 @@ class LlamaCppClient:
             pass1_answer = matches[-1].group(1).upper()
 
         # --- Step 2: eval full output up to "Answer:", extract logprobs ---
-        # Keep everything (including <think> block), strip only the answer letter.
-        # Find the last "Answer:" in the RAW output (before think/visible split).
+        # For think mode: keep everything (including <think> block) — logprobs
+        # should be conditioned on the model's full internal reasoning.
+        # For CoT mode: use visible_output only — strip any spontaneous <think>
+        # blocks that models like Qwen 3.5 may generate despite being told not to.
+        eval_text = raw_output if think else visible_output
+
         last_answer_pos = -1
-        for m in re.finditer(r'[Aa]nswer:', raw_output):
+        for m in re.finditer(r'[Aa]nswer:', eval_text):
             last_answer_pos = m.start()
 
         if last_answer_pos > 0:
-            output_prefix = raw_output[:last_answer_pos].rstrip()
+            output_prefix = eval_text[:last_answer_pos].rstrip()
         else:
-            output_prefix = raw_output.rstrip()
+            output_prefix = eval_text.rstrip()
 
         eval_prompt = chat_prompt + output_prefix + "\n\nAnswer:"
 
@@ -590,25 +594,22 @@ class LlamaCppClient:
             )
 
         elif self._model_family == "qwen3.5":
-            # Qwen3.5 uses the same ChatML format but does NOT support /no_think
-            # as a control token — include a plain-text instruction instead.
-            # When think=True, omit the "do not think" instruction so the model
-            # reasons naturally.
+            # Qwen3.5 uses ChatML. Thinking is controlled via the assistant
+            # turn prefix — an empty <think></think> block suppresses reasoning
+            # (matches the official Jinja template's enable_thinking=false).
+            sys_turn = f"{_IM_START}system\n{system_message}{_IM_END}\n"
             if think:
-                # Thinking is on by default in Qwen3.5 — no special instruction needed
-                sys_turn = f"{_IM_START}system\n{system_message}{_IM_END}\n"
+                # Open <think> block — model generates reasoning inside it
+                assistant_prefix = f"{_IM_START}assistant\n<think>\n"
             else:
-                no_think_msg = (
-                    f"{system_message} "
-                    "Do not use any thinking or reasoning blocks. Answer directly."
-                )
-                sys_turn = f"{_IM_START}system\n{no_think_msg}{_IM_END}\n"
+                # Closed empty <think> block — suppresses model reasoning
+                assistant_prefix = f"{_IM_START}assistant\n<think>\n\n</think>\n\n"
 
             return (
                 sys_turn
                 + f"{_IM_START}user\n"
                 + f"{user_message}{_IM_END}\n"
-                + f"{_IM_START}assistant\n"
+                + assistant_prefix
             )
 
         elif self._model_family == "gemma4":

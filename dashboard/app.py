@@ -87,10 +87,10 @@ h3 { font-family: 'Inter', sans-serif !important; font-weight: 500 !important; f
 h4 { font-family: 'Inter', sans-serif !important; font-weight: 500 !important; font-size: 0.9rem !important; }
 .stApp { background-color: #FDFCFB; }
 [data-testid="stMetric"] { background: transparent; border: 1px solid #E5E0DB;
-    border-radius: 8px; padding: 10px; }
-[data-testid="stMetricLabel"] { font-size: 11px; text-transform: uppercase;
+    border-radius: 6px; padding: 5px 8px; }
+[data-testid="stMetricLabel"] { font-size: 10px; text-transform: uppercase;
     letter-spacing: 0.04em; color: #8B95A1; }
-[data-testid="stMetricValue"] { font-size: 22px; font-weight: 400; }
+[data-testid="stMetricValue"] { font-size: 16px; font-weight: 400; }
 [data-testid="stSidebar"] { background-color: #F5F3F1; }
 footer, #MainMenu, [data-testid="stDeployButton"] { display: none !important; }
 </style>
@@ -497,10 +497,11 @@ def _progress_row(label: str, fp: Path) -> dict:
 
 
 def _render_progress_row(row: dict) -> None:
-    """Render a single progress row."""
-    col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+    """Render a single compact progress row."""
+    col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1], gap="small")
     with col1:
-        st.markdown(f"**{row['label']}**")
+        st.markdown(f"<p style='font-size:13px;font-weight:500;margin:0 0 4px 0'>{row['label']}</p>",
+                    unsafe_allow_html=True)
         st.progress(row["timing"]["pct"])
     with col2:
         st.metric("Questions", f"{row['done_q']}/{row['total_q']}")
@@ -512,7 +513,8 @@ def _render_progress_row(row: dict) -> None:
         st.metric("Rate", row["timing"].get("rate") or "-")
     with col6:
         st.metric("ETA", row["timing"]["remaining"] or "-")
-    st.divider()
+    st.markdown("<hr style='margin:4px 0;border:none;border-top:1px solid #E5E0DB'>",
+                unsafe_allow_html=True)
 
 
 def tab_progress() -> None:
@@ -768,6 +770,49 @@ def tab_comparison() -> None:
         factor_hdrs = [factor_labels.get(c, c) for c in factor_cols]
         n_factors = len(factor_hdrs)
 
+        # Collect numeric accuracy values for heatmap scaling
+        acc_vals = []
+        for row in pivot_data:
+            for key in ("Accuracy", "Acc Easy", "Acc Hard"):
+                v = row.get(key, "-")
+                if v != "-":
+                    try:
+                        acc_vals.append(float(v.replace("%", "")) / 100)
+                    except ValueError:
+                        pass
+        acc_min = min(acc_vals) if acc_vals else 0.5
+        acc_max = max(acc_vals) if acc_vals else 1.0
+        acc_range = max(acc_max - acc_min, 0.01)
+
+        def _acc_bg(val_str: str) -> str:
+            if val_str == "-":
+                return ""
+            try:
+                v = float(val_str.replace("%", "")) / 100
+                t = (v - acc_min) / acc_range
+                t = max(0.0, min(1.0, t))
+                r = int(220 - t * 178)
+                g = int(100 + t * 40)
+                b = int(100 - t * 57)
+                alpha = 0.18 + t * 0.17
+                return f' style="background:rgba({r},{g},{b},{alpha:.2f})"'
+            except ValueError:
+                return ""
+
+        # Best values per column for bold highlighting
+        best = {}
+        for key in ("Accuracy", "Acc Easy", "Acc Hard"):
+            vals = []
+            for row in pivot_data:
+                v = row.get(key, "-")
+                if v != "-":
+                    try:
+                        vals.append(float(v.replace("%", "")))
+                    except ValueError:
+                        pass
+            if vals:
+                best[key] = f"{max(vals):.0f}%"
+
         html = """<style>
         .cond-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
         .cond-table th, .cond-table td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
@@ -792,14 +837,22 @@ def tab_comparison() -> None:
             html += "<th>Acc</th><th>Conf</th>"
         html += "</tr>"
 
-        # Data rows
+        # Data rows with model-colored left border and heatmap accuracy cells
         for row in pivot_data:
-            html += "<tr>"
+            model_val = row.get("Model", "")
+            border_color = MODEL_COLORS.get(model_val, "#E5E0DB")
+            html += f'<tr style="border-left:4px solid {border_color}">'
             for h in factor_hdrs:
                 html += f'<td class="factor">{row.get(h, "")}</td>'
-            html += f'<td>{row["Accuracy"]}</td><td>{row["Confidence"]}</td>'
-            html += f'<td>{row["Acc Easy"]}</td><td>{row["Conf Easy"]}</td>'
-            html += f'<td>{row["Acc Hard"]}</td><td>{row["Conf Hard"]}</td>'
+            for acc_key, conf_key in [("Accuracy", "Confidence"), ("Acc Easy", "Conf Easy"), ("Acc Hard", "Conf Hard")]:
+                acc_v = row[acc_key]
+                bold = " font-weight:600;" if acc_v == best.get(acc_key) else ""
+                bg = _acc_bg(acc_v)
+                if bold and bg:
+                    bg = bg.replace('"', f'{bold}"')
+                elif bold:
+                    bg = f' style="{bold}"'
+                html += f'<td{bg}>{acc_v}</td><td>{row[conf_key]}</td>'
             html += f'<td>{row["N"]}</td>'
             html += "</tr>"
 
@@ -823,18 +876,12 @@ def tab_comparison() -> None:
                     vals = sub[col].dropna()
                     row[col] = f"{vals.mean():.2f}" if len(vals) > 0 else "-"
                 summary_rows.append(row)
-            df_summary = pd.DataFrame(summary_rows)
-            if "accuracy" in df_summary.columns:
-                df_summary = df_summary.sort_values("accuracy", ascending=False, key=lambda s: pd.to_numeric(s, errors="coerce"))
-            _html_table(summary_rows)
+            _html_table(summary_rows, heatmap_cols=available)
 
-    # Calibration curves
+    # Calibration curves — one chart per prompt mode
     st.subheader("Calibration: Reliability Diagram")
-    st.caption(
-        "Top: binned reliability (mean confidence vs observed accuracy). "
-        "Bottom: bin counts. ECE = weighted mean |accuracy - confidence|."
-    )
-    _plot_calibration_reliability(df)
+    st.caption("ECE = weighted mean |accuracy - confidence|. One chart per prompt mode.")
+    _plot_calibration_by_mode(df)
 
 
 def _wilson_ci(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, float]:
@@ -848,40 +895,46 @@ def _wilson_ci(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, fl
     return max(0.0, centre - spread), min(1.0, centre + spread)
 
 
-def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count: int = 2) -> None:
-    """Binned reliability diagram — clean lines, no bin count panel."""
+def _plot_calibration_by_mode(df: pd.DataFrame) -> None:
+    """Render one reliability diagram per prompt mode (direct / cot / think)."""
     df_valid = df[(df["num_queries"] > 0) & df["is_correct"].notna()].copy()
     if df_valid.empty:
         st.info("No data for calibration.")
         return
 
+    modes_present = sorted(df_valid["mode"].unique()) if "mode" in df_valid.columns else ["direct"]
+    for mode in modes_present:
+        mode_df = df_valid[df_valid["mode"] == mode] if "mode" in df_valid.columns else df_valid
+        if mode_df.empty:
+            continue
+        _plot_calibration_single(mode_df, title=f"{mode.capitalize()} — Confidence vs Accuracy")
+
+
+def _plot_calibration_single(df_valid: pd.DataFrame, title: str = "Calibration",
+                             n_bins: int = 16, min_count: int = 2) -> None:
+    """Binned reliability diagram for a single prompt-mode subset."""
     fig = go.Figure()
 
-    # Perfect calibration diagonal
     fig.add_trace(go.Scatter(
         x=[0.25, 1], y=[0.25, 1], mode="lines",
         line=dict(color=GRAY_LIGHT, dash="dash", width=1),
-        name="Perfect calibration", showlegend=True,
+        name="Perfect", showlegend=True,
     ))
 
-    # Line styles for distinguishing conditions within the same model
     LINE_STYLES = ["solid", "dash", "dot", "dashdot", "longdash"]
 
     run_names = sorted(df_valid["run_name"].unique())
-    # Track how many runs per model to cycle line styles
     model_run_count: dict[str, int] = {}
     for ri, run_name in enumerate(run_names):
         sub = df_valid[df_valid["run_name"] == run_name]
         if len(sub) < 5:
             continue
 
-        # Build clean label from config
         cfg = _extract_config_head(selected_paths.get(
             next((l for l, p in selected_paths.items()
                   if _extract_run_prefix(p.stem) == run_name), ""), None))
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
 
-        # Color by model, cycle line styles for multiple conditions per model
         model_name = _short_model_name(cfg) if cfg else "Unknown"
         color = MODEL_COLORS.get(model_name, PLOT_COLORS[ri % len(PLOT_COLORS)])
         style_idx = model_run_count.get(model_name, 0)
@@ -891,13 +944,9 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
         msp_vals = sub["msp"].values
         correct_vals = sub["is_correct"].astype(float).values
 
-        # Fixed bins across 0.25–1.0
         lo, hi = 0.25, 1.0
         bin_edges = np.linspace(lo, hi, n_bins + 1)
-
-        bin_centers = []
-        bin_accs = []
-        bin_counts = []
+        bin_centers, bin_accs, bin_counts = [], [], []
 
         for b in range(n_bins):
             if b < n_bins - 1:
@@ -910,19 +959,16 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
                 bin_centers.append(float((bin_edges[b] + bin_edges[b + 1]) / 2))
                 bin_counts.append(int(n_in_bin))
                 continue
-
             bin_centers.append(float(msp_vals[mask].mean()))
             bin_accs.append(float(correct_vals[mask].mean()))
             bin_counts.append(int(n_in_bin))
 
-        # ECE
         ece = 0.0
         total_n = sum(bin_counts)
         for acc, conf, n in zip(bin_accs, bin_centers, bin_counts):
             if not math.isnan(acc) and total_n > 0:
                 ece += (n / total_n) * abs(acc - conf)
 
-        # Plot valid bins as a clean line — color by model, style by condition
         valid = [(c, a) for c, a in zip(bin_centers, bin_accs) if not math.isnan(a)]
         if valid:
             plot_x, plot_y = zip(*valid)
@@ -934,13 +980,13 @@ def _plot_calibration_reliability(df: pd.DataFrame, n_bins: int = 16, min_count:
             ))
 
     fig.update_layout(**_base_layout(
-        title="Calibration: Confidence vs Accuracy",
+        title=title,
         xaxis_title="MSP (model confidence)",
         yaxis_title="Accuracy in bin",
         xaxis=dict(range=[0.2, 1.02], gridcolor=GRID),
         yaxis=dict(range=[0, 1.05], gridcolor=GRID),
         legend=dict(x=0.02, y=0.98),
-        height=450,
+        height=380,
     ))
 
     st.plotly_chart(_round_hover(fig), width="stretch")
@@ -1273,21 +1319,38 @@ def tab_effects() -> None:
 ANSWER_TOKENS = {" A", " B", " C", " D", "A", "B", "C", "D"}
 
 
-def _html_table(rows: list[dict], highlight: dict[str, str] | None = None) -> None:
-    """Render a list of dicts as a simple copyable HTML table.
+def _html_table(rows: list[dict], highlight: dict[str, str] | None = None,
+                heatmap_cols: list[str] | None = None) -> None:
+    """Render a list of dicts as a styled HTML table.
 
     Args:
         rows: List of dicts, one per row.
-        highlight: Optional dict of column_name -> "neg_good" or "pos_good".
-            "neg_good": negative values get teal (good), positive get rose.
-            "pos_good": positive values get teal (good), negative get rose.
+        highlight: Optional dict of column_name -> "neg_good" or "pos_good" for
+            directional coloring (teal for good, rose for bad).
+        heatmap_cols: Optional list of columns to apply neutral blue heatmap
+            (column-wise min-max scaling). Useful for signal tables.
     """
     if not rows:
         return
     highlight = highlight or {}
+    heatmap_cols = heatmap_cols or []
     cols = list(rows[0].keys())
 
-    # Collect max absolute value across highlighted columns for scaling
+    # Pre-compute per-column min/max for heatmap
+    col_range: dict[str, tuple[float, float]] = {}
+    for c in heatmap_cols:
+        vals = []
+        for r in rows:
+            v = r.get(c, "-")
+            if isinstance(v, str) and v not in ("-", ""):
+                try:
+                    vals.append(float(v.replace("%", "").replace("+", "")))
+                except ValueError:
+                    pass
+        if vals:
+            col_range[c] = (min(vals), max(vals))
+
+    # Collect max absolute value across highlight columns
     max_abs = 0.0
     if highlight:
         for r in rows:
@@ -1316,20 +1379,30 @@ def _html_table(rows: list[dict], highlight: dict[str, str] | None = None) -> No
         for c in cols:
             val = r.get(c, "-")
             bg = ""
+            # Directional highlight (for effect-size tables)
             if c in highlight and isinstance(val, str) and val not in ("-", ""):
                 try:
                     fval = float(val.replace("%", "").replace("+", ""))
                     direction = highlight[c]
-                    # "neg_good": negative is good (teal), positive is bad (rose)
-                    # "pos_good": positive is good (teal), negative is bad (rose)
                     good = (fval < 0 and direction == "neg_good") or (fval > 0 and direction == "pos_good")
                     strength = min(abs(fval) / max_abs, 1.0)
-                    # Power curve for wider spread: weak signals stay faint, strong ones pop
                     alpha = strength ** 2 * 0.35
                     if good and alpha > 0.03:
                         bg = f' style="background:rgba(42,140,143,{alpha:.2f});"'
                     elif not good and alpha > 0.03:
                         bg = f' style="background:rgba(220,100,100,{alpha:.2f});"'
+                except ValueError:
+                    pass
+            # Neutral heatmap (for signal overview tables)
+            elif c in col_range and isinstance(val, str) and val not in ("-", ""):
+                try:
+                    fval = float(val.replace("%", "").replace("+", ""))
+                    cmin, cmax = col_range[c]
+                    span = cmax - cmin
+                    if span > 0:
+                        t = (fval - cmin) / span
+                        alpha = 0.06 + t * 0.24
+                        bg = f' style="background:rgba(42,100,160,{alpha:.2f});"'
                 except ValueError:
                     pass
             html += f"<td{bg}>{val}</td>"

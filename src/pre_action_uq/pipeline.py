@@ -792,7 +792,14 @@ def run_experiment(
             )
             writer.write(output_file, experiment_result)
 
-    # Final save — stamp completion time
+    # Final save — flush any remaining results, then stamp completion time
+    experiment_result = ExperimentResult.model_construct(
+        run_name=config.run_name,
+        config=config,
+        timestamp=timestamp,
+        question_results=question_results,
+    )
+    writer.write(output_file, experiment_result)
     completed_at = datetime.now(timezone.utc).isoformat()
     writer.finalize(output_file, completed_at)
     experiment_result = ExperimentResult(

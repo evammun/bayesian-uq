@@ -1,0 +1,17 @@
+# Gemma 4 E4B full (Mahti A100): Think mode, sufficient context
+# Two-pass: Pass 1 captures internal thinking, Pass 2 extracts logprobs
+# Submit: sbatch --export=CONFIG=experiments/configs/mahti/gemma4_think_noshuffle_sufficient.yaml,MODEL_FILE=gemma-4-E4B-it-Q4_K_M.gguf scripts/mahti/slurm_single.sh
+
+run_name: gemma4_think_noshuffle_sufficient
+model_path: auto
+model_name: gemma4:e4b-q4_K_M
+model_family: auto
+think: true
+prompt_mode: direct
+dataset_file: data/quality_all.jsonl
+context_condition: sufficient
+shuffle_options: false
+seed: 42
+temperature: 0.7
+num_permutations: 1
+n_ctx: 12288
