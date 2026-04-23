@@ -896,7 +896,12 @@ def _wilson_ci(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, fl
 
 
 def _plot_calibration_by_mode(df: pd.DataFrame) -> None:
-    """Render one reliability diagram per prompt mode (direct / cot / think)."""
+    """Render one reliability diagram per prompt mode (direct / cot / think).
+
+    Filtering per mode to reduce clutter:
+    - Direct: base (noshuffle, nopara) + shuffle+para
+    - CoT / Think: base only (noshuffle, nopara)
+    """
     df_valid = df[(df["num_queries"] > 0) & df["is_correct"].notna()].copy()
     if df_valid.empty:
         st.info("No data for calibration.")
@@ -905,6 +910,14 @@ def _plot_calibration_by_mode(df: pd.DataFrame) -> None:
     modes_present = sorted(df_valid["mode"].unique()) if "mode" in df_valid.columns else ["direct"]
     for mode in modes_present:
         mode_df = df_valid[df_valid["mode"] == mode] if "mode" in df_valid.columns else df_valid
+        if mode_df.empty:
+            continue
+        base_mask = (~mode_df["shuffle"]) & (~mode_df["paraphrase"])
+        if mode == "direct":
+            both_mask = mode_df["shuffle"] & mode_df["paraphrase"]
+            mode_df = mode_df[base_mask | both_mask]
+        else:
+            mode_df = mode_df[base_mask]
         if mode_df.empty:
             continue
         _plot_calibration_single(mode_df, title=f"{mode.capitalize()} — Confidence vs Accuracy")
@@ -1859,26 +1872,26 @@ def tab_adaptive() -> None:
                 "context": cfg.get("context_condition", "unknown"),
             }
 
-    shuffle_runs = {k: v for k, v in run_meta.items() if v["shuffle"]}
-    if not shuffle_runs:
-        st.info("Need at least one shuffle run for adaptive sampling.")
+    direct_runs = {k: v for k, v in run_meta.items() if v["mode"] == "direct"}
+    if not direct_runs:
+        st.info("Need at least one direct run for adaptive sampling.")
         return
 
     # --- Selectors ---
     sel_cols = st.columns(3)
 
-    base_opts = {v["label"]: k for k, v in shuffle_runs.items()}
+    base_opts = {v["label"]: k for k, v in direct_runs.items()}
     default_base = next(
-        (k for k, v in shuffle_runs.items()
-         if v["mode"] == "direct" and not v["paraphrase"] and v["context"] == "sufficient"),
-        next(iter(shuffle_runs)),
+        (k for k, v in direct_runs.items()
+         if v["shuffle"] and not v["paraphrase"] and v["context"] == "sufficient"),
+        next(iter(direct_runs)),
     )
     base_label_list = list(base_opts.keys())
     with sel_cols[0]:
         chosen_base = st.selectbox(
-            "Base run (shuffle)", base_label_list,
-            index=base_label_list.index(shuffle_runs[default_base]["label"])
-            if shuffle_runs[default_base]["label"] in base_label_list else 0,
+            "Base run (direct)", base_label_list,
+            index=base_label_list.index(direct_runs[default_base]["label"])
+            if direct_runs[default_base]["label"] in base_label_list else 0,
         )
     base_run = base_opts[chosen_base]
 
@@ -2613,12 +2626,17 @@ def tab_adaptive() -> None:
         "All four Pareto frontiers on one chart."
     )
 
-    esc_cost = st.slider(
-        "Escalation cost (× base query)", 5.0, 40.0, 10.0, 1.0,
-        help="How many base permutations one escalation call costs. "
-             "CoT ≈ 10×, think ≈ 24×.",
-        key="esc_cost_slider",
+    # Measured cost multipliers (Gemma 4, preliminary: CoT n=80, Think n=20)
+    # TODO: update with final estimates from full runs
+    ESC_COSTS = {"CoT (2.4×)": 2.4, "Think (7.1×)": 7.1}
+    esc_mode = st.selectbox(
+        "Escalation mode",
+        list(ESC_COSTS.keys()),
+        help="Measured cost relative to one direct query. "
+             "Gemma 4 A100: direct 0.96s, CoT 2.27s, Think 6.82s.",
+        key="esc_cost_select",
     )
+    esc_cost = ESC_COSTS[esc_mode]
 
     temps_grid = np.arange(1.0, 5.5, 0.5)
     taus_grid = [0.60, 0.70, 0.80, 0.90, 0.95, 0.99]

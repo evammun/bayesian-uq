@@ -14,4 +14,4 @@ shuffle_options: false
 seed: 42
 temperature: 0.7
 num_permutations: 1
-n_ctx: 12288
+n_ctx: 32768

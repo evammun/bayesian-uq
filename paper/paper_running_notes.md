@@ -588,8 +588,21 @@ All 4 conditions tested on 20 questions before production launch:
 - Qwen 3.5 CoT (post-fix): 90%, 0 think blocks (was leaking before fix)
 - Qwen 3.5 Think: 75%, thinking traces valid
 
+### Measured escalation cost multipliers (preliminary)
+From `inference_time_s` in result files (Gemma 4, A100):
+- **Direct:** 0.96s/query (n=4609)
+- **CoT:** 2.27s/query → **2.4× direct** (n=80)
+- **Think:** 6.82s/query → **7.1× direct** (n=20)
+- Qwen 3.5 direct: 1.61s/query (n=1840), CoT/Think not yet available
+- **TODO:** Update dashboard `ESC_COSTS` with final estimates from full runs (all models, all questions). Current values are Gemma 4 only, small-n for CoT/Think.
+
+Dashboard updated: replaced escalation cost slider with selectbox using measured values. Base run dropdown now allows any direct run (was filtering to shuffle-only).
+
+### Think n_ctx fix
+Gemma 4 and Qwen 3.5 think configs had `n_ctx: 12288` — too tight for two-pass think (worst-case Pass 2 ~11.9K tokens). Bumped to `n_ctx: 32768` to match Qwen 3 think setup. Cancelled partial runs (~100q Gemma, ~0q Qwen 3.5), deleted results, resubmitted fresh (jobs 6384556, 6384557).
+
 ### Job status at session end
 - 7 prior runs still running (Gemma 4 shuffle/para, Qwen 3.5 all 4 direct conditions)
-- 4 new CoT/Think runs queued (pending priority)
+- 4 new CoT/Think runs (2 CoT running, 2 Think resubmitted with n_ctx fix)
 - Gemma 4 direct noshuffle: COMPLETE (4609/4609 after resume)
 
