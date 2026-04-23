@@ -1962,74 +1962,50 @@ def tab_adaptive() -> None:
             prefix = _extract_run_prefix(fp.stem)
             run_meta[prefix] = {
                 "label": format_run_label(cfg),
+                "model": _short_model_name(cfg),
                 "mode": _effective_mode(cfg),
                 "shuffle": cfg.get("shuffle_options", False),
                 "paraphrase": cfg.get("use_paraphrases", False),
                 "context": cfg.get("context_condition", "unknown"),
             }
 
-    direct_runs = {k: v for k, v in run_meta.items() if v["mode"] == "direct"}
-    if not direct_runs:
-        st.info("Need at least one direct run for adaptive sampling.")
+    # --- Auto-discover per-model configs ---
+    models_found: dict[str, dict] = {}  # model -> {base, esc1, esc2}
+    for model_name in sorted({v["model"] for v in run_meta.values()}):
+        model_runs = {k: v for k, v in run_meta.items() if v["model"] == model_name}
+        base = next(
+            (k for k, v in model_runs.items()
+             if v["mode"] == "direct" and v["shuffle"] and not v["paraphrase"]),
+            None,
+        )
+        if not base:
+            continue
+        esc1 = next(
+            (k for k, v in model_runs.items()
+             if v["mode"] == "CoT" and not v["shuffle"] and not v["paraphrase"]),
+            None,
+        )
+        esc2 = next(
+            (k for k, v in model_runs.items()
+             if v["mode"] == "think" and not v["shuffle"] and not v["paraphrase"]),
+            None,
+        )
+        models_found[model_name] = {"base": base, "esc1": esc1, "esc2": esc2}
+
+    if not models_found:
+        st.info("Need at least one model with a shuffle direct run for adaptive sampling.")
         return
 
-    # --- Selectors ---
-    sel_cols = st.columns(3)
-
-    base_opts = {v["label"]: k for k, v in direct_runs.items()}
-    default_base = next(
-        (k for k, v in direct_runs.items()
-         if v["shuffle"] and not v["paraphrase"] and v["context"] == "sufficient"),
-        next(iter(direct_runs)),
-    )
-    base_label_list = list(base_opts.keys())
-    with sel_cols[0]:
-        chosen_base = st.selectbox(
-            "Base run (direct)", base_label_list,
-            index=base_label_list.index(direct_runs[default_base]["label"])
-            if direct_runs[default_base]["label"] in base_label_list else 0,
-        )
-    base_run = base_opts[chosen_base]
-
-    esc_pool = {k: v for k, v in run_meta.items() if k != base_run}
-    esc_opts = {"None": None} | {v["label"]: k for k, v in esc_pool.items()}
-    esc_list = list(esc_opts.keys())
-
-    def _esc_default(mode: str) -> int:
-        for k, v in esc_pool.items():
-            if v["mode"] == mode and not v["shuffle"] and not v["paraphrase"]:
-                try:
-                    return esc_list.index(v["label"])
-                except ValueError:
-                    pass
-        return 0
-
-    with sel_cols[1]:
-        esc1_label = st.selectbox("Escalation 1", esc_list, index=_esc_default("CoT"))
-    with sel_cols[2]:
-        esc2_label = st.selectbox("Escalation 2", esc_list, index=_esc_default("think"))
-
-    esc1_run = esc_opts[esc1_label]
-    esc2_run = esc_opts[esc2_label]
-
-    opt_cols = st.columns([1, 1, 1, 3])
+    # --- Selectors (just parameters, no run pickers) ---
+    opt_cols = st.columns([1, 1, 3])
     with opt_cols[0]:
         n_max = st.select_slider("N_max", options=list(range(2, 11)), value=10)
     with opt_cols[1]:
         temperature = st.slider("Temperature (Product)", 0.5, 5.0, 3.0, 0.1,
-                                help="Calibration temperature for Product & Composite. "
-                                     "T=3.0 optimal. Sum/Gap don't use this.")
-    with opt_cols[2]:
-        gap_min = st.slider("Gap veto (Composite)", 0.0, 0.6, 0.3, 0.05,
-                            help="Composite: don't stop if mean 2nd Gap < this. "
-                                 "0.3 = good default from signal battery deltas.")
+                                help="Calibration temperature for Product. "
+                                     "T=3.0 optimal. Sum/MLE don't use this.")
 
-    # --- Build per-question data ---
-    base_df = df[df["run_name"] == base_run]
-    if base_df.empty:
-        st.info("No data for selected base run.")
-        return
-
+    # --- Build per-model question data ---
     def _answer_map(rn):
         if not rn:
             return {}
@@ -2050,41 +2026,50 @@ def tab_adaptive() -> None:
                     break
         return out
 
-    esc1_map = _answer_map(esc1_run)
-    esc2_map = _answer_map(esc2_run)
-    esc1_probs = _probs_map(esc1_run)
-    esc2_probs = _probs_map(esc2_run)
-
-    questions = []
-    for _, row in base_df.iterrows():
-        qlog = row.get("query_log", [])
-        probs = [q["canonical_probs"] for q in qlog
-                 if q.get("canonical_probs") and len(q["canonical_probs"]) == 4]
-        if len(probs) < 2:
+    model_data: dict[str, dict] = {}
+    for model_name, cfg in models_found.items():
+        base_df = df[df["run_name"] == cfg["base"]]
+        if base_df.empty:
             continue
-        qid = row["question_id"]
-        questions.append({
-            "correct": row["correct_answer"],
-            "difficult": row.get("difficult", False),
-            "probs": probs[:n_max],
-            "esc1": esc1_map.get(qid),
-            "esc2": esc2_map.get(qid),
-            "esc1_probs": esc1_probs.get(qid),
-            "esc2_probs": esc2_probs.get(qid),
-        })
+        esc1_map = _answer_map(cfg["esc1"])
+        esc2_map = _answer_map(cfg["esc2"])
+        esc1_probs = _probs_map(cfg["esc1"])
+        esc2_probs = _probs_map(cfg["esc2"])
+        questions = []
+        for _, row in base_df.iterrows():
+            qlog = row.get("query_log", [])
+            probs = [q["canonical_probs"] for q in qlog
+                     if q.get("canonical_probs") and len(q["canonical_probs"]) == 4]
+            if len(probs) < 2:
+                continue
+            qid = row["question_id"]
+            questions.append({
+                "correct": row["correct_answer"],
+                "difficult": row.get("difficult", False),
+                "probs": probs[:n_max],
+                "esc1": esc1_map.get(qid),
+                "esc2": esc2_map.get(qid),
+                "esc1_probs": esc1_probs.get(qid),
+                "esc2_probs": esc2_probs.get(qid),
+            })
+        if not questions:
+            continue
+        n_q = len(questions)
+        baseline_correct = sum(
+            1 for q in questions
+            if int(np.argmax(np.mean(q["probs"], axis=0))) == q["correct"]
+        )
+        model_data[model_name] = {
+            "questions": questions, "n_q": n_q,
+            "baseline_acc": baseline_correct / n_q,
+            "has_esc1": cfg["esc1"] is not None,
+            "has_esc2": cfg["esc2"] is not None,
+            "esc1_run": cfg["esc1"], "esc2_run": cfg["esc2"],
+        }
 
-    if not questions:
-        st.info("No questions with multiple permutations.")
+    if not model_data:
+        st.info("No models with enough data for adaptive sampling.")
         return
-
-    n_q = len(questions)
-
-    # --- Baseline: mean probs across all permutations (current behavior) ---
-    baseline_correct = sum(
-        1 for q in questions
-        if int(np.argmax(np.mean(q["probs"], axis=0))) == q["correct"]
-    )
-    baseline_acc = baseline_correct / n_q
 
     # --- Helpers ---
     def _trigamma(x):
@@ -2244,7 +2229,6 @@ def tab_adaptive() -> None:
 
     def _compute_trajectory(
         probs: list, method: str, temp: float,
-        gmin: float = 0.3,
     ) -> list[tuple[float, int]]:
         """Compute (confidence, argmax) at each permutation step.
 
@@ -2252,14 +2236,11 @@ def tab_adaptive() -> None:
           product   — Bayesian posterior, confidence = max P(k|data)
           sum       — Dirichlet pseudo-counts, confidence = copula exceedance
           mle       — Dirichlet MLE fit, confidence = copula exceedance
-          composite — Product posterior + veto if gap < gmin or argmax flipped
         """
         traj: list[tuple[float, int]] = []
 
-        if method in ("product", "composite"):
+        if method == "product":
             log_post = np.log(np.full(4, 0.25))
-            cum_probs = np.zeros(4)
-            prev_leader, had_flip = -1, False
 
             for n in range(len(probs)):
                 p = np.array(probs[n])
@@ -2276,21 +2257,7 @@ def tab_adaptive() -> None:
                 post = np.exp(lp)
                 post /= post.sum()
 
-                conf = float(post.max())
-                leader = int(np.argmax(post))
-
-                if method == "composite":
-                    cum_probs += p
-                    mean_p = cum_probs / (n + 1)
-                    sp = np.sort(mean_p)[::-1]
-                    cur_gap = sp[0] - sp[1]
-                    if prev_leader >= 0 and leader != prev_leader:
-                        had_flip = True
-                    prev_leader = leader
-                    if cur_gap < gmin or had_flip:
-                        conf = 0.0
-
-                traj.append((conf, leader))
+                traj.append((float(post.max()), int(np.argmax(post))))
 
         elif method == "mle":
             K = 4
@@ -2362,40 +2329,40 @@ def tab_adaptive() -> None:
             "esc2": sum(esc2_c) / n_q if esc2_run else None,
         }
 
-    # --- Pre-compute trajectories for ALL methods ---
-    prod_trajs = [
-        _compute_trajectory(q["probs"], "product", temperature)
-        for q in questions
-    ]
-    sum_trajs = [
-        _compute_trajectory(q["probs"], "sum", 1.0)
-        for q in questions
-    ]
-    mle_trajs = _batch_mle_trajectories(questions)
-    comp_trajs = [
-        _compute_trajectory(q["probs"], "composite", temperature, gmin=gap_min)
-        for q in questions
-    ]
+    # --- Compute trajectories per model (Product, Sum, MLE) ---
+    for mn, mdata in model_data.items():
+        qs = mdata["questions"]
+        mdata["prod_trajs"] = [
+            _compute_trajectory(q["probs"], "product", temperature) for q in qs
+        ]
+        mdata["sum_trajs"] = [
+            _compute_trajectory(q["probs"], "sum", 1.0) for q in qs
+        ]
+        mdata["mle_trajs"] = _batch_mle_trajectories(qs)
 
-    # --- Adaptive stopping: sweep thresholds for all methods ---
+    # --- Adaptive stopping: sweep τ per model ---
     tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
+    METHODS = [("Product", "prod"), ("Sum", "sum"), ("Dirichlet MLE", "mle")]
+    MCOLORS = {"prod": TEAL, "sum": ROSE, "mle": GOLD}
 
-    def _sweep_all(trajs, taus):
-        results = []
-        for tau in taus:
-            r = _sweep_tau(questions, trajs, tau, n_q, esc1_run, esc2_run)
-            r["tau"] = tau
-            results.append(r)
-        return results
+    for mn, mdata in model_data.items():
+        qs, n_q_m = mdata["questions"], mdata["n_q"]
+        er1, er2 = mdata["esc1_run"], mdata["esc2_run"]
+        for _, mkey in METHODS:
+            results = []
+            for tau in tau_values:
+                r = _sweep_tau(qs, mdata[f"{mkey}_trajs"], tau, n_q_m, er1, er2)
+                r["tau"] = tau
+                results.append(r)
+            mdata[f"{mkey}_results"] = results
 
-    prod_results = _sweep_all(prod_trajs, tau_values)
-    sum_results = _sweep_all(sum_trajs, tau_values)
-    mle_results = _sweep_all(mle_trajs, tau_values)
-    comp_results = _sweep_all(comp_trajs, tau_values)
+    model_names = list(model_data.keys())
 
-    # --- Cross-method relative highlighting ---
-    esc1_mode = esc_pool.get(esc1_run, {}).get("mode") if esc1_run else None
-    esc2_mode = esc_pool.get(esc2_run, {}).get("mode") if esc2_run else None
+    # --- Cross-model/method highlighting ---
+    all_result_lists = []
+    for mn in model_names:
+        for _, mkey in METHODS:
+            all_result_lists.append(model_data[mn][f"{mkey}_results"])
 
     def _make_highlight(result_lists, keys_good, keys_bad, skip_tau_zero=True):
         all_keys = keys_good + keys_bad
@@ -2430,10 +2397,7 @@ def tab_adaptive() -> None:
             return f' style="background:rgba(42,140,143,{opacity:.2f})"'
         return _hl
 
-    _cs = _make_highlight(
-        [prod_results, sum_results, mle_results, comp_results],
-        ["acc", "esc1", "esc2"], ["cap"],
-    )
+    _cs = _make_highlight(all_result_lists, ["acc", "esc1", "esc2"], ["cap"])
 
     _at_css = """<style>
     .at { border-collapse: collapse; width: 100%%; font-family: Inter, sans-serif; font-size: 13px; }
@@ -2444,64 +2408,58 @@ def tab_adaptive() -> None:
     .at .bl td { border-top: 2px solid #ccc; font-style: italic; color: #8B95A1; }
     </style>"""
 
-    def _build_table(results_list):
-        html = _at_css + '<table class="at"><tr>'
-        html += "<th>\u03c4</th><th>avg_N</th><th>accuracy</th><th>cap_rate</th>"
-        if esc1_mode:
-            html += f"<th>+{esc1_mode}</th>"
-        if esc2_mode:
-            html += f"<th>+{esc2_mode}</th>"
+    # --- τ-sweep tables: one per method, models side by side ---
+    for method_label, mkey in METHODS:
+        desc = {"prod": f"multiply likelihoods, T={temperature:.1f}",
+                "sum": "Dirichlet pseudo-counts",
+                "mle": "fit α from data"}[mkey]
+        st.markdown(f"**{method_label}** ({desc})")
+        html = _at_css + '<table class="at"><tr><th rowspan="2">\u03c4</th>'
+        for mn in model_names:
+            ncols = 3
+            if model_data[mn]["has_esc1"]:
+                ncols += 1
+            if model_data[mn]["has_esc2"]:
+                ncols += 1
+            html += f'<th colspan="{ncols}">{mn}</th>'
+        html += "</tr><tr>"
+        for mn in model_names:
+            html += "<th>N</th><th>acc</th><th>cap</th>"
+            if model_data[mn]["has_esc1"]:
+                html += "<th>+CoT</th>"
+            if model_data[mn]["has_esc2"]:
+                html += "<th>+think</th>"
         html += "</tr>"
-        for r in results_list:
-            is_zero = (r["tau"] == 0.0)
-            html += "<tr>"
-            html += f'<td>{r["tau"]:.2f}</td><td>{r["avg_n"]:.2f}</td>'
-            html += f'<td{_cs("acc", r["acc"], is_zero)}>{r["acc"]:.1%}</td>'
-            html += f'<td{_cs("cap", r["cap"], is_zero)}>{r["cap"]:.1%}</td>'
-            if esc1_mode:
-                if r["esc1"] is not None:
-                    html += f'<td{_cs("esc1", r["esc1"], is_zero)}>{r["esc1"]:.1%}</td>'
-                else:
-                    html += "<td>-</td>"
-            if esc2_mode:
-                if r["esc2"] is not None:
-                    html += f'<td{_cs("esc2", r["esc2"], is_zero)}>{r["esc2"]:.1%}</td>'
-                else:
-                    html += "<td>-</td>"
+        for ti, tau in enumerate(tau_values):
+            is_zero = (tau == 0.0)
+            html += f"<tr><td>{tau:.2f}</td>"
+            for mn in model_names:
+                r = model_data[mn][f"{mkey}_results"][ti]
+                html += f'<td>{r["avg_n"]:.2f}</td>'
+                html += f'<td{_cs("acc", r["acc"], is_zero)}>{r["acc"]:.1%}</td>'
+                html += f'<td{_cs("cap", r["cap"], is_zero)}>{r["cap"]:.1%}</td>'
+                if model_data[mn]["has_esc1"]:
+                    v = r["esc1"]
+                    if v is not None:
+                        html += f'<td{_cs("esc1", v, is_zero)}>{v:.1%}</td>'
+                    else:
+                        html += "<td>-</td>"
+                if model_data[mn]["has_esc2"]:
+                    v = r["esc2"]
+                    if v is not None:
+                        html += f'<td{_cs("esc2", v, is_zero)}>{v:.1%}</td>'
+                    else:
+                        html += "<td>-</td>"
             html += "</tr>"
-        html += '<tr class="bl">'
-        html += f"<td>all</td><td>{n_max}</td>"
-        html += f"<td>{baseline_acc:.1%}</td>"
-        html += "<td>-</td>"
-        if esc1_mode:
-            html += "<td>-</td>"
-        if esc2_mode:
-            html += "<td>-</td>"
+        html += '<tr class="bl"><td>all</td>'
+        for mn in model_names:
+            html += f'<td>{n_max}</td><td>{model_data[mn]["baseline_acc"]:.1%}</td><td>-</td>'
+            if model_data[mn]["has_esc1"]:
+                html += "<td>-</td>"
+            if model_data[mn]["has_esc2"]:
+                html += "<td>-</td>"
         html += "</tr></table>"
-        return html
-
-    tcol1, tcol2 = st.columns(2)
-    with tcol1:
-        st.markdown(f"**Product** (multiply likelihoods, T={temperature:.1f})")
-        st.markdown(_build_table(prod_results), unsafe_allow_html=True)
-        st.caption(f"Confidence = max posterior · {n_q} questions")
-    with tcol2:
-        st.markdown("**Sum** (Dirichlet pseudo-counts, no temperature)")
-        st.markdown(_build_table(sum_results), unsafe_allow_html=True)
-        st.caption(f"Confidence = exceedance prob (Gaussian copula) · {n_q} questions")
-
-    tcol3, tcol4 = st.columns(2)
-    with tcol3:
-        st.markdown("**Dirichlet MLE** (fit α from data, no temperature)")
-        st.markdown(_build_table(mle_results), unsafe_allow_html=True)
-        st.caption(f"Confidence = exceedance prob on MLE-fitted α · {n_q} questions")
-    with tcol4:
-        st.markdown(
-            f"**Composite** (Product T={temperature:.1f} + "
-            f"gap≥{gap_min:.2f} veto + flip veto)"
-        )
-        st.markdown(_build_table(comp_results), unsafe_allow_html=True)
-        st.caption(f"Confidence = max posterior, vetoed to 0 if gap narrow or leader flipped · {n_q} questions")
+        st.markdown(html, unsafe_allow_html=True)
 
     # --- Method explanations ---
     with st.expander("How it works — Product (multiply likelihoods)"):
@@ -2592,138 +2550,63 @@ def tab_adaptive() -> None:
             "pseudo-count approximation may work just as well in practice with our "
             "sample sizes (N ≤ 10)."
         )
-    with st.expander("How it works — Composite (Product + signal vetos)"):
-        st.markdown(
-            "**Model:** Uses Product (Bayesian posterior with temperature) as the "
-            "base confidence, then applies veto rules that can override the stop "
-            "decision. Even if the posterior says 'confident enough', the vetos "
-            "say 'but there's other evidence of trouble.'\n\n"
-            "**Veto 1 — 2nd Gap:** If the mean gap across observed permutations "
-            "is below the gap\\_min threshold, set confidence to 0 (force cap). "
-            "Rationale: a high posterior with a narrow gap means the model is "
-            "consistently picking between two close options — it might be "
-            "consistently wrong.\n\n"
-            "**Veto 2 — Argmax flip:** If the leading answer changed at any point "
-            "during the permutation sequence, set confidence to 0 for all "
-            "remaining steps. Once instability is observed, we don't trust this "
-            "question — escalate it. 15.1% of questions have flips, and these "
-            "are disproportionately incorrect.\n\n"
-            "**Stopping criterion:** max P(k | data) > τ AND no active veto.\n\n"
-            "**Why this works:** The Product posterior measures consistency across "
-            "permutations. The gap measures decisiveness per query. The flip "
-            "detector catches transient instability. Together they cover three "
-            "different failure modes:\n"
-            "- High posterior, narrow gap → consistently close call (gap veto)\n"
-            "- High posterior, then flip → transient agreement (flip veto)\n"
-            "- Low posterior → genuine disagreement (base τ)\n\n"
-            "**Tradeoff:** More hyperparameters (T, τ, gap\\_min) but captures "
-            "the most information. The veto approach only makes stopping stricter "
-            "(more caps → more escalation), so base accuracy can only go up. The "
-            "question is whether the extra escalation cost is worth the accuracy gain."
-        )
 
-    # --- Combined accuracy vs compute chart ---
+    # --- Accuracy vs Compute: one chart per model ---
     st.subheader("Accuracy vs Compute")
 
-    fig = go.Figure()
-    px = [r["avg_n"] for r in prod_results]
-    sx = [r["avg_n"] for r in sum_results]
-
-    # Product lines (teal)
-    fig.add_trace(go.Scatter(
-        x=px, y=[r["acc"] for r in prod_results],
-        mode="lines+markers", name="Product (base)",
-        line=dict(color=TEAL, width=2.5), marker=dict(size=8),
-        hovertemplate="Product τ=%{customdata:.2f}<br>avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>",
-        customdata=[r["tau"] for r in prod_results],
-    ))
-    if esc2_run and esc2_mode:
-        ys = [r["esc2"] for r in prod_results if r["esc2"] is not None]
+    for mn in model_names:
+        mdata = model_data[mn]
+        fig = go.Figure()
+        for method_label, mkey in METHODS:
+            color = MCOLORS[mkey]
+            results = mdata[f"{mkey}_results"]
+            xs = [r["avg_n"] for r in results]
+            fig.add_trace(go.Scatter(
+                x=xs, y=[r["acc"] for r in results],
+                mode="lines+markers", name=f"{method_label} (base)",
+                line=dict(color=color, width=2.5), marker=dict(size=8),
+                hovertemplate=(
+                    f"{method_label} \u03c4=%{{customdata:.2f}}<br>"
+                    "avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>"
+                ),
+                customdata=[r["tau"] for r in results],
+            ))
+            if mdata["has_esc2"]:
+                ys = [r["esc2"] for r in results if r["esc2"] is not None]
+                if ys:
+                    fig.add_trace(go.Scatter(
+                        x=xs[:len(ys)], y=ys,
+                        mode="lines+markers", name=f"{method_label} +think",
+                        line=dict(color=color, width=2, dash="dash"),
+                        marker=dict(size=6, symbol="diamond"),
+                    ))
+        baseline = mdata["baseline_acc"]
         fig.add_trace(go.Scatter(
-            x=px[:len(ys)], y=ys,
-            mode="lines+markers", name=f"Product +{esc2_mode}",
-            line=dict(color=TEAL, width=2, dash="dash"), marker=dict(size=6, symbol="diamond"),
+            x=[n_max], y=[baseline],
+            mode="markers", name=f"All-{n_max} baseline",
+            marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
         ))
-
-    # Sum lines (rose)
-    fig.add_trace(go.Scatter(
-        x=sx, y=[r["acc"] for r in sum_results],
-        mode="lines+markers", name="Sum (base)",
-        line=dict(color=ROSE, width=2.5), marker=dict(size=8),
-        hovertemplate="Sum τ=%{customdata:.2f}<br>avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>",
-        customdata=[r["tau"] for r in sum_results],
-    ))
-    if esc2_run and esc2_mode:
-        ys = [r["esc2"] for r in sum_results if r["esc2"] is not None]
-        fig.add_trace(go.Scatter(
-            x=sx[:len(ys)], y=ys,
-            mode="lines+markers", name=f"Sum +{esc2_mode}",
-            line=dict(color=ROSE, width=2, dash="dash"), marker=dict(size=6, symbol="diamond"),
+        fig.add_hline(
+            y=baseline, line_dash="dash", line_color=GRAY_LIGHT,
+            annotation_text=f"all-{n_max} baseline ({baseline:.1%})",
+            annotation_position="bottom right",
+        )
+        fig.update_layout(**_base_layout(
+            title=f"{mn} — Accuracy vs Compute",
+            xaxis_title="avg_N", yaxis_title="Accuracy",
+            height=350,
+            yaxis=dict(tickformat=".0%", gridcolor=GRID),
+            xaxis=dict(range=[0.5, n_max + 0.5], gridcolor=GRID),
         ))
+        st.plotly_chart(_round_hover(fig), width="stretch")
 
-    # MLE lines (gold)
-    mx = [r["avg_n"] for r in mle_results]
-    fig.add_trace(go.Scatter(
-        x=mx, y=[r["acc"] for r in mle_results],
-        mode="lines+markers", name="MLE (base)",
-        line=dict(color=GOLD, width=2.5), marker=dict(size=8),
-        hovertemplate="MLE τ=%{customdata:.2f}<br>avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>",
-        customdata=[r["tau"] for r in mle_results],
-    ))
-    if esc2_run and esc2_mode:
-        ys = [r["esc2"] for r in mle_results if r["esc2"] is not None]
-        fig.add_trace(go.Scatter(
-            x=mx[:len(ys)], y=ys,
-            mode="lines+markers", name=f"MLE +{esc2_mode}",
-            line=dict(color=GOLD, width=2, dash="dash"), marker=dict(size=6, symbol="diamond"),
-        ))
-
-    # Composite lines (purple)
-    cx = [r["avg_n"] for r in comp_results]
-    fig.add_trace(go.Scatter(
-        x=cx, y=[r["acc"] for r in comp_results],
-        mode="lines+markers", name="Composite (base)",
-        line=dict(color=PURPLE, width=2.5), marker=dict(size=8),
-        hovertemplate="Comp τ=%{customdata:.2f}<br>avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>",
-        customdata=[r["tau"] for r in comp_results],
-    ))
-    if esc2_run and esc2_mode:
-        ys = [r["esc2"] for r in comp_results if r["esc2"] is not None]
-        fig.add_trace(go.Scatter(
-            x=cx[:len(ys)], y=ys,
-            mode="lines+markers", name=f"Composite +{esc2_mode}",
-            line=dict(color=PURPLE, width=2, dash="dash"), marker=dict(size=6, symbol="diamond"),
-        ))
-
-    fig.add_trace(go.Scatter(
-        x=[n_max], y=[baseline_acc],
-        mode="markers", name=f"All-{n_max} baseline",
-        marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
-    ))
-    fig.add_hline(
-        y=baseline_acc, line_dash="dash", line_color=GRAY_LIGHT,
-        annotation_text=f"all-{n_max} baseline ({baseline_acc:.1%})",
-        annotation_position="bottom right",
-    )
-
-    fig.update_layout(**_base_layout(
-        title="Accuracy vs Compute — Product / Sum / Gap / Composite",
-        xaxis_title="avg_N", yaxis_title="Accuracy",
-        height=420,
-        yaxis=dict(tickformat=".0%", gridcolor=GRID),
-        xaxis=dict(range=[0.5, n_max + 0.5], gridcolor=GRID),
-    ))
-    st.plotly_chart(_round_hover(fig), width="stretch")
-
-    # --- Joint optimization: all methods compared ---
+    # --- Joint Optimization ---
     st.subheader("Joint Optimization — All Methods")
     st.caption(
-        "Product & Composite sweep T × τ. Sum & MLE sweep threshold only. "
-        "All four Pareto frontiers on one chart."
+        "Product sweeps T × τ. Sum & MLE sweep τ only. "
+        "Pareto frontiers per model."
     )
 
-    # Measured cost multipliers (Gemma 4, preliminary: CoT n=80, Think n=20)
-    # TODO: update with final estimates from full runs
     ESC_COSTS = {"CoT (2.4×)": 2.4, "Think (7.1×)": 7.1}
     esc_mode = st.selectbox(
         "Escalation mode",
@@ -2739,15 +2622,14 @@ def tab_adaptive() -> None:
 
     def _grid_sweep(questions, method, temps, taus, n_q, esc_cost,
                     pre_trajs=None):
-        """Sweep (T, τ) for Product/Composite or just τ for Sum/MLE."""
         grid = []
-        t_list = temps if method in ("product", "composite") else [0.0]
+        t_list = temps if method == "product" else [0.0]
         for t in t_list:
             if pre_trajs is not None:
                 trajs_t = pre_trajs
             else:
                 trajs_t = [
-                    _compute_trajectory(q["probs"], method, t, gmin=gap_min)
+                    _compute_trajectory(q["probs"], method, t)
                     for q in questions
                 ]
             for tau_g in taus:
@@ -2787,12 +2669,6 @@ def tab_adaptive() -> None:
                 })
         return grid
 
-    prod_grid = _grid_sweep(questions, "product", temps_grid, taus_grid, n_q, esc_cost)
-    sum_grid = _grid_sweep(questions, "sum", temps_grid, taus_grid, n_q, esc_cost)
-    mle_grid = _grid_sweep(questions, "mle", temps_grid, taus_grid, n_q, esc_cost,
-                           pre_trajs=mle_trajs)
-    comp_grid = _grid_sweep(questions, "composite", temps_grid, taus_grid, n_q, esc_cost)
-
     def _pareto(grid):
         pareto = []
         by_cost = sorted(grid, key=lambda r: (r["total_cost"], -r["acc_esc"]))
@@ -2803,15 +2679,16 @@ def tab_adaptive() -> None:
                 pareto.append(r)
         return pareto
 
-    prod_pareto = _pareto(prod_grid)
-    sum_pareto = _pareto(sum_grid)
-    mle_pareto = _pareto(mle_grid)
-    comp_pareto = _pareto(comp_grid)
-
-    fig2 = go.Figure()
+    for mn, mdata in model_data.items():
+        qs, n_q_m = mdata["questions"], mdata["n_q"]
+        mdata["prod_grid"] = _grid_sweep(qs, "product", temps_grid, taus_grid, n_q_m, esc_cost)
+        mdata["sum_grid"] = _grid_sweep(qs, "sum", temps_grid, taus_grid, n_q_m, esc_cost)
+        mdata["mle_grid"] = _grid_sweep(qs, "mle", temps_grid, taus_grid, n_q_m, esc_cost,
+                                         pre_trajs=mdata["mle_trajs"])
+        for _, mkey in METHODS:
+            mdata[f"{mkey}_pareto"] = _pareto(mdata[f"{mkey}_grid"])
 
     def _add_method_traces(fig, grid, pareto, color, name, has_temp):
-        """Add background + Pareto frontier traces for one method."""
         p_keys = {(r["T"], r["tau"]) for r in pareto}
         non_p = [r for r in grid if (r["T"], r["tau"]) not in p_keys]
         t_fmt = f"{name} T=%{{customdata[0]:.1f}}, " if has_temp else f"{name} "
@@ -2846,37 +2723,45 @@ def tab_adaptive() -> None:
             name=f"{name} Pareto",
         ))
 
-    _add_method_traces(fig2, prod_grid, prod_pareto, TEAL, "Product", True)
-    _add_method_traces(fig2, sum_grid, sum_pareto, ROSE, "Sum", False)
-    _add_method_traces(fig2, mle_grid, mle_pareto, GOLD, "MLE", False)
-    _add_method_traces(fig2, comp_grid, comp_pareto, PURPLE, "Composite", True)
+    for mn in model_names:
+        mdata = model_data[mn]
+        fig2 = go.Figure()
+        for method_label, mkey in METHODS:
+            _add_method_traces(
+                fig2, mdata[f"{mkey}_grid"], mdata[f"{mkey}_pareto"],
+                MCOLORS[mkey], method_label, mkey == "prod",
+            )
+        baseline = mdata["baseline_acc"]
+        fig2.add_trace(go.Scatter(
+            x=[float(n_max)], y=[baseline],
+            mode="markers", name=f"All-{n_max} baseline",
+            marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
+        ))
+        fig2.update_layout(**_base_layout(
+            title=f"{mn} — Accuracy vs Total Cost",
+            xaxis_title="Total cost per question (base-query units)",
+            yaxis_title="Accuracy (with best escalation)",
+            height=400,
+            yaxis=dict(tickformat=".1%", gridcolor=GRID),
+            xaxis=dict(gridcolor=GRID),
+        ))
+        st.plotly_chart(_round_hover(fig2), width="stretch")
 
-    fig2.add_trace(go.Scatter(
-        x=[float(n_max)], y=[baseline_acc],
-        mode="markers", name=f"All-{n_max} baseline",
-        marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
-    ))
+    # --- Pareto tables: per method, models side by side ---
+    all_pareto_lists = []
+    for mn in model_names:
+        for _, mkey in METHODS:
+            all_pareto_lists.append(model_data[mn][f"{mkey}_pareto"])
 
-    fig2.update_layout(**_base_layout(
-        title="All Methods: Accuracy vs Total Cost",
-        xaxis_title="Total cost per question (base-query units)",
-        yaxis_title="Accuracy (with best escalation)",
-        height=500,
-        yaxis=dict(tickformat=".1%", gridcolor=GRID),
-        xaxis=dict(gridcolor=GRID),
-    ))
-    st.plotly_chart(_round_hover(fig2), width="stretch")
-
-    # Pareto tables: 2×2 grid with cross-method highlighting
     _pcs = _make_highlight(
-        [prod_pareto, sum_pareto, mle_pareto, comp_pareto],
+        all_pareto_lists,
         ["acc", "acc_esc"], ["cap_rate"],
         skip_tau_zero=False,
     )
 
     def _pareto_table_t(pareto_list):
         h = _at_css + '<table class="at"><tr>'
-        h += '<th>T</th><th>\u03c4</th><th>avg_N</th><th>cap</th>'
+        h += '<th>T</th><th>\u03c4</th><th>N</th><th>cap</th>'
         h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
         for r in pareto_list:
             h += f'<tr><td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
@@ -2890,7 +2775,7 @@ def tab_adaptive() -> None:
 
     def _pareto_table_notau(pareto_list):
         h = _at_css + '<table class="at"><tr>'
-        h += '<th>\u03c4</th><th>avg_N</th><th>cap</th>'
+        h += '<th>\u03c4</th><th>N</th><th>cap</th>'
         h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
         for r in pareto_list:
             h += f'<tr><td>{r["tau"]:.2f}</td>'
@@ -2902,19 +2787,18 @@ def tab_adaptive() -> None:
         h += '</table>'
         return h
 
-    pcol1, pcol2, pcol3, pcol4 = st.columns(4)
-    with pcol1:
-        st.markdown("**Product**")
-        st.markdown(_pareto_table_t(prod_pareto), unsafe_allow_html=True)
-    with pcol2:
-        st.markdown("**Sum**")
-        st.markdown(_pareto_table_notau(sum_pareto), unsafe_allow_html=True)
-    with pcol3:
-        st.markdown("**Dirichlet MLE**")
-        st.markdown(_pareto_table_notau(mle_pareto), unsafe_allow_html=True)
-    with pcol4:
-        st.markdown("**Composite**")
-        st.markdown(_pareto_table_t(comp_pareto), unsafe_allow_html=True)
+    for method_label, mkey in METHODS:
+        st.markdown(f"**{method_label} — Pareto Frontiers**")
+        cols = st.columns(len(model_names))
+        for ci, mn in enumerate(model_names):
+            with cols[ci]:
+                st.markdown(f"*{mn}*")
+                if mkey == "prod":
+                    st.markdown(_pareto_table_t(model_data[mn][f"{mkey}_pareto"]),
+                                unsafe_allow_html=True)
+                else:
+                    st.markdown(_pareto_table_notau(model_data[mn][f"{mkey}_pareto"]),
+                                unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
