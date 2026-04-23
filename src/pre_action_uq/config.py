@@ -42,6 +42,7 @@ class ExperimentConfig(BaseModel):
     model_name: str = "qwen3:8b-q4_K_M"  # model identifier (for logging/reference)
     model_family: str = "auto"  # "auto", "qwen3", "qwen3.5", "gemma4"
     think: bool = False
+    think_max_tokens: int = 4096
     prompt_mode: Literal["direct", "cot"] = "direct"
     dataset_file: str = "data/quality_all.jsonl"
     context_condition: Literal["sufficient", "insufficient"] = "sufficient"

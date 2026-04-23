@@ -371,7 +371,7 @@ def _process_single_query(
         if config.think:
             result = client.generate_think(
                 prompt=prompt,
-                max_tokens=4096,
+                max_tokens=config.think_max_tokens,
                 temperature=config.temperature,
             )
         elif config.prompt_mode == "cot":

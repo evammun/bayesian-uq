@@ -1,12 +1,13 @@
 # Qwen 3.5 9B full (Mahti A100): Think mode, sufficient context
 # Two-pass: Pass 1 captures internal thinking, Pass 2 extracts logprobs
-# Submit: sbatch --export=CONFIG=experiments/configs/mahti/qwen35_think_noshuffle_sufficient.yaml,MODEL_FILE=Qwen3.5-9B-Q4_K_M.gguf scripts/mahti/slurm_single.sh
+# Submit: sbatch --time=24:00:00 --export=CONFIG=experiments/configs/mahti/qwen35_think_noshuffle_sufficient.yaml,MODEL_FILE=Qwen3.5-9B-Q4_K_M.gguf scripts/mahti/slurm_single.sh
 
 run_name: qwen35_think_noshuffle_sufficient
 model_path: auto
 model_name: qwen3.5:9b-q4_K_M
 model_family: auto
 think: true
+think_max_tokens: 8192
 prompt_mode: direct
 dataset_file: data/quality_all.jsonl
 context_condition: sufficient
