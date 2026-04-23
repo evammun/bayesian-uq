@@ -601,8 +601,20 @@ Dashboard updated: replaced escalation cost slider with selectbox using measured
 ### Think n_ctx fix
 Gemma 4 and Qwen 3.5 think configs had `n_ctx: 12288` — too tight for two-pass think (worst-case Pass 2 ~11.9K tokens). Bumped to `n_ctx: 32768` to match Qwen 3 think setup. Cancelled partial runs (~100q Gemma, ~0q Qwen 3.5), deleted results, resubmitted fresh (jobs 6384556, 6384557).
 
-### Job status at session end
-- 7 prior runs still running (Gemma 4 shuffle/para, Qwen 3.5 all 4 direct conditions)
-- 4 new CoT/Think runs (2 CoT running, 2 Think resubmitted with n_ctx fix)
-- Gemma 4 direct noshuffle: COMPLETE (4609/4609 after resume)
+### Dashboard: multi-model adaptive sampling tab
+Rewrote adaptive sampling tab to show all 3 models side by side. Dropped Composite method entirely (too many hyperparams, Product+veto was marginal). Tables: one per method (Product/Sum/MLE) with models as columns. Acc vs Compute: one chart per model stacked vertically. Joint Optimization: per-model Pareto frontiers. Removed ~370 lines, added ~255.
+
+### Think max_tokens fix (Qwen 3.5 critical, Gemma 4 precautionary)
+Qwen 3.5 think exhausts `max_tokens=4096` before closing `</think>` on **24% of questions** (model too verbose in reasoning). Pass 2 logprobs still valid but `pass1_answer` empty — loses P1/P2 disagreement signal. Gemma 4 only 1.4% empty (Qwen 3 was 0.3%).
+
+Fix: added configurable `think_max_tokens` field to `ExperimentConfig` (default 4096). Pipeline reads from config. Both think configs set to 8192. Cancelled both think jobs, deleted partial results (local + Mahti), resubmitted fresh with **24h time limits** (jobs 6385030 Gemma 4, 6385031 Qwen 3.5).
+
+Note: Qwen 3.5 think is extremely slow (~2 q/min vs Gemma 4 ~8 q/min). Full 4609 questions at 8192 tokens could take ~38-76h. 24h limit should get most of it; may need one resubmission.
+
+### Job status (April 23, ~18:00)
+**Completed:** All 7 Qwen 3 runs + Gemma 4 direct noshuffle + Qwen 3.5 direct noshuffle (just finished)
+**Running (6h limit):** Gemma 4 CoT (1650/4609), Qwen 3.5 CoT (490/4609), Qwen 3.5 direct ×3 (shuffle/para variants, ~360-400 each)
+**Running (24h limit):** Gemma 4 direct ×3 (shuffle/para variants, ~880 each)
+**Pending (24h limit):** Gemma 4 think + Qwen 3.5 think (fresh start, 8192 max_tokens)
+**Time limit concern:** Several 6h runs will need resubmission — Qwen 3.5 shuffle/para (~22h each), Qwen 3.5 CoT (~7.7h). Resume supported, no data loss.
 
