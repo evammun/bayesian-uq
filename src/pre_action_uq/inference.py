@@ -353,8 +353,11 @@ class LlamaCppClient:
                 )
 
             self._full_reset()
+            # Time the eval + logit extraction — this is the full inference cost
+            t0 = time.time()
             self.model.eval(tokens)
             logprobs = self._extract_answer_letter_logprobs()
+            elapsed = time.time() - t0
             self._query_count += 1
 
         response_text = logprobs[0]["token"] if logprobs else ""
@@ -363,6 +366,10 @@ class LlamaCppClient:
             "response_text": response_text,
             "logprobs": logprobs,
             "thinking_trace": "",
+            # Timing and token counts for per-query analysis
+            "inference_time_s": elapsed,
+            "prompt_tokens": len(tokens),
+            "output_tokens": 1,  # single answer token extracted, no generation
         }
 
     # ------------------------------------------------------------------
@@ -398,6 +405,9 @@ class LlamaCppClient:
         import re
 
         # --- Step 1: generate reasoning + answer freely ---
+        # Time the entire two-pass process as one block (both passes together)
+        t0 = time.time()
+
         chat_prompt = self._build_chat_prompt(prompt, think=think)
 
         gen = self.generate(
@@ -444,6 +454,8 @@ class LlamaCppClient:
             logprobs = self._extract_answer_letter_logprobs()
             self._query_count += 1
 
+        elapsed = time.time() - t0
+
         # --- Assemble result ---
         response_text = (
             output_prefix + "\nAnswer:" +
@@ -456,11 +468,26 @@ class LlamaCppClient:
         else:
             thinking_trace = visible_output
 
+        # Token counts: Pass 1 prompt tokens come from the chat_prompt tokenisation,
+        # Pass 2 prompt tokens come from the longer eval_prompt (which includes the
+        # generated reasoning). Sum both; output_tokens counts the raw generation
+        # length plus the single extracted answer token from Pass 2.
+        pass1_prompt_tokens = len(
+            self.model.tokenize(chat_prompt.encode(), add_bos=True)
+        )
+        pass1_output_tokens = len(
+            self.model.tokenize(raw_output.encode(), add_bos=False)
+        )
+
         return {
             "response_text": response_text,
             "logprobs": logprobs,
             "thinking_trace": thinking_trace,
             "pass1_answer": pass1_answer,
+            # Timing and token counts for per-query analysis
+            "inference_time_s": elapsed,
+            "prompt_tokens": pass1_prompt_tokens + len(tokens),  # Pass 1 + Pass 2
+            "output_tokens": pass1_output_tokens + 1,  # Pass 1 generation + Pass 2 answer token
         }
 
     def generate_cot(

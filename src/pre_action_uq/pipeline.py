@@ -426,6 +426,10 @@ def _process_single_query(
         thinking_trace=result.get("thinking_trace", ""),
         pass1_answer=pass1_answer,
         pass1_canonical_answer=pass1_canonical,
+        # Per-query timing and token counts from the inference layer
+        inference_time_s=result.get("inference_time_s"),
+        prompt_tokens=result.get("prompt_tokens"),
+        output_tokens=result.get("output_tokens"),
     )
 
 

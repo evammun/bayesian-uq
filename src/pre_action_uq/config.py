@@ -100,6 +100,11 @@ class QueryResult(BaseModel):
     pass1_answer: str = ""  # display letter (e.g. "B") or "" if not found
     pass1_canonical_answer: int = -1  # canonical index, or -1 if not found
 
+    # Per-query timing and token counts — None for results predating this field
+    inference_time_s: float | None = None
+    prompt_tokens: int | None = None
+    output_tokens: int | None = None
+
 
 class QuestionResult(BaseModel):
     """Full result for one question across all its queries.
