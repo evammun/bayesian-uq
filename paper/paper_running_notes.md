@@ -358,3 +358,120 @@ Added epistemic/aleatoric decomposition (mutual information) to replace simple a
 - [ ] Compute signals on completed results, validate discriminative power
 - [ ] Key question: does sufficient vs insufficient show different uncertainty profiles?
 - [ ] Build partial (C3) and counterfactual (C4) context conditions
+
+---
+
+## April 14-16, 2026 — Final Experiment Runs, All Paraphrase/Shuffle Jobs
+
+### Completed experiments (all 4609q)
+- **direct noshuffle paraphrase** — DONE (Mahti, Qwen paraphrase bank)
+- **direct shuffle paraphrase** — DONE
+- **cot shuffle paraphrase** — DONE
+- **think shuffle** — 4440/4609 as of Apr 16, final 169q running (job 6335112, 6h wall)
+
+### Job babysitting notes
+- Mahti gpusmall = 36h max wall; gpumedium similar. Long jobs (cot+think with shuffle) need 2-3 resume cycles.
+- 3-layer dedup + stable RNG (from Apr 2 fix) held up across all resumes — no duplicate entries in final files.
+- Direct paraphrase jobs finished in 2h resubmits comfortably (~130q remaining each).
+- Think shuffle hits wall time repeatedly — slowest mode (~80s/q with shuffle), needs multiple resubmissions.
+
+### Config details
+- All Mahti configs use `paraphrases_file: data/paraphrases_qwen.json` (free, 3A+7B format)
+- Sonnet paraphrase bank abandoned (Cat C angle shifts broken) — kept only for comparison
+- Config files live in `experiments/configs/mahti/`, one YAML per run_name
+
+### Outstanding work (post-data-collection)
+- Full AUROC table — every signal × every condition
+- Selective prediction curves (AUARC) — practical metric for routing
+- Easy vs hard subset breakdown (QuALITY provides this split)
+- N-query sensitivity (N=2,3,5,7,10 from existing 10-permutation data)
+- Think trace content analysis (hedging phrase counting)
+- Calibration reliability diagrams (ECE per condition)
+- Adaptive escalation Pareto frontier (see brainstorm §8)
+
+---
+
+## Decision Log (updated)
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-04-14 | Qwen paraphrases (3A+7B) over Sonnet (3A+3B+4C) | Free, safe, no Cat C question-altering issues. Qwen formulaic but semantically stable. |
+| 2026-04-16 | Mahti wall-time strategy: 36h for shuffle modes, 2-6h for tail resubmits | Matches gpusmall limit; avoids wasted allocation on small tails |
+| 2026-04-23 | Temperature scaling T=3.0 for Bayesian posterior | Raw per-query logprobs have ECE=0.186 — posterior concentrates in 1-2 samples without scaling. T=3.0 gives ECE=0.012. Note: mean probs (dashboard reliability diagram) are better calibrated; per-query probs (what posterior uses) are the overconfident ones. |
+| 2026-04-23 | Joint (T, τ) optimization, not calibration-only | T=3.0 is ECE-optimal but not deployment-optimal. Real objective: total_cost = avg_N + cap_rate × esc_cost. Grid search finds Pareto frontier. |
+| 2026-04-23 | Claude Code workflow: Opus for architecture, Sonnet for implementation | Sonnet as capable intern — trust but verify. Have it build tests. Opus for judgment calls, synthesis, high-blast-radius decisions. |
+
+---
+
+## April 23, 2026 — Adaptive Sampling Framework (Bayesian Posterior)
+
+### Context
+Luigi showed results from his dataset: Bayesian adaptive sampling with posterior stopping. Instead of running all N shuffle permutations, stop when posterior exceeds τ, escalate capped questions to expensive mode. We retroactively tested this on our existing 10-permutation direct shuffle data.
+
+### Method: Bayesian posterior over MCQ answers
+- Prior: uniform P(k) = 1/4 over 4 options
+- Each shuffle permutation gives a full probability vector from logprobs
+- Posterior update: P(k | samples 1..N) ∝ prior(k) × ∏ₙ pₖ⁽ⁿ⁾ (multiply likelihoods, normalise)
+- No Dirichlet needed — we have full probability vectors, just multiply and normalise in log-space
+- Stop when max posterior > τ; if N_max reached without crossing τ → "capped" → escalate
+
+### The overconfidence problem
+- Raw per-query logprobs: MSP ≈ 0.91, ECE = 0.186
+- Posterior concentrates exponentially on 4-option MCQ → MSP=0.70 crosses τ=0.95 in 2-3 consistent samples
+- Without calibration: cap_rate ≈ 0% at all τ, no escalation ever triggers, framework is useless
+- **Important distinction:** mean probs across permutations (dashboard reliability diagram) are reasonably calibrated. Per-query probs (what the posterior multiplies) are severely overconfident. Both facts are true simultaneously.
+
+### Temperature scaling
+- Calibration: new_probs = softmax(log(old_probs) / T), T > 1 deflates confidence
+- Grid search over T: optimal T=3.0 (ECE: 0.186 → 0.012, NLL also improves)
+- Dashboard default updated to T=3.0
+- At T=3.0, N_max=5, τ=0.95: avg_N=2.76, acc=76.4%, cap_rate=15.1%, acc+think=78.8%
+
+### Joint optimization insight
+- T=3.0 optimises calibration (ECE), not deployment cost
+- Real objective: total_cost = avg_N + cap_rate × escalation_cost
+- Higher T → slower convergence → higher avg_N, fewer caps → less escalation cost but more base cost
+- Lower T → faster convergence → lower avg_N, more caps (some wrong) → more escalation cost
+- Added joint (T × τ) grid search to dashboard: 9 temperatures × 6 τ values, Pareto frontier of accuracy vs total cost
+- Escalation cost configurable via slider (CoT ≈ 10× base, think ≈ 24× base)
+
+### Signal-augmented stopping (designed, not yet implemented)
+Beyond pure posterior, additional veto signals for the stopping decision:
+- **2nd Gap** < threshold → don't stop even if posterior is high (runner-up too close)
+- **Argmax flips** — if the leading answer changed during the N samples (15.1% of questions), don't stop
+- **Epistemic uncertainty** (mutual information across permutations) > threshold → keep sampling
+- **Confidence variance** across permutations > threshold → unstable, keep sampling
+- These address the posterior's blind spot: consistency ≠ correctness. Model can be consistently wrong.
+- Tier 2 (future): cross-mode disagreement, think trace hedging phrase count
+
+### Dashboard additions (Tab 7: Adaptive Sampling)
+- Two methods compared side by side: **Product** (multiply likelihoods) and **Sum** (Dirichlet pseudo-counts)
+- Product: Bayesian posterior update, max posterior as stopping criterion, requires temperature scaling (T=3.0)
+- Sum: accumulate prob vectors as pseudo-counts, Bonferroni exceedance probability as stopping criterion, no temperature needed
+- Exceedance function uses `scipy.special.betainc` — Bonferroni lower bound, conservative but fast (3 beta function calls per step vs MC sampling)
+- Side-by-side HTML tables, combined accuracy-vs-compute chart (teal=Product, rose=Sum)
+- Rich "How it works" expanders for each method explaining the math, tradeoffs, and implementation
+- **Joint Optimization section**: Product sweeps T×τ, Sum sweeps τ only, both on same Pareto frontier chart with escalation cost slider
+- Pareto tables side by side for both methods
+
+### Luigi's Bayesian library comparison (April 23)
+- Luigi uses **Dirichlet Sum** (same as our Sum) and **Dirichlet MLE** (Minka's fixed-point iteration). We have Sum + Product.
+- Luigi uses **exceedance probability** (P(leader is true mode)) not max posterior. We now also use exceedance for Sum.
+- Key insight: our Product approach is theoretically correct but breaks on overconfident logprobs (need temperature). Sum sidesteps this because evidence accumulates linearly not exponentially.
+- Luigi's MLE fits concentration from data — potentially the most principled approach. TODO: implement as third option.
+- Luigi's escalation augments α with weighted CoT vector (preserves evidence) vs our replace-answer approach. TODO: adopt.
+- Paper comparison: Product (with temp) vs Sum (no temp) vs MLE, same Pareto frontier.
+
+### Next steps (adaptive)
+- [ ] Implement signal-augmented stopping in dashboard (2nd Gap, flip detection, epistemic veto)
+- [ ] Design new adaptive pipeline with timing instrumentation for publishable results
+- [ ] Multi-model expansion — audit Qwen3-specific code (chat template, think tags), pick 2 additional models
+- [ ] Determine optimal (T, τ) for specific deployment scenarios (cheap-and-fast vs max-accuracy)
+- [ ] Implement Dirichlet MLE (Minka iteration) as third aggregation method
+- [ ] Implement Luigi-style escalation: augment α with weighted CoT vector instead of replace
+
+### Claude Code workflow note
+- **Opus** for: architecture decisions, judgment calls, synthesis, reviewing Sonnet's work, anything where getting it wrong costs time
+- **Sonnet** for: implementation, boilerplate, data exploration, running tests — treat as a capable intern nearing end of internship. Don't hand-hold, do verify. Have it write tests for its own code.
+- Pattern: Opus designs and specifies → Sonnet implements → Opus reviews → ship
+

@@ -183,28 +183,45 @@ NOT doing: production system (paper = empirical validation), training anything (
 
 ---
 
-## 8. Adaptive Escalation Experiment (future)
+## 8. Adaptive Escalation Experiment (IN PROGRESS — April 23, 2026)
 
-**Idea:** Compare flat inference (run every question at one mode) against an uncertainty-led escalation strategy that starts cheap and only spends compute when signals say the answer is weak.
+**Idea:** Compare flat inference (run every question at one mode) against Bayesian adaptive sampling that stops early when confident and escalates uncertain questions.
 
-**Setup:**
-1. Run all 4609 questions on direct mode (cheapest: ~2.5s/q). Compute MSP and 2nd Gap.
-2. Questions where signals are confident (e.g. 2nd Gap > threshold) → accept the answer.
-3. Questions where signals are weak → escalate to shuffle (10 permutations, ~25s/q). Compute epistemic.
-4. Still weak → escalate to CoT or think (~60s/q). Check cross-mode disagreement.
-5. Still weak → flag for human review.
+### 8.1 Bayesian posterior stopping (implemented, dashboard tab 7)
 
-**Comparison:**
+**Method:** Uniform prior P(k)=1/4. Each shuffle permutation gives a logprob probability vector → multiply likelihoods sequentially, normalise. Stop when max posterior > τ. No Dirichlet needed — we have full probability vectors.
+
+**The overconfidence problem (critical finding):** Raw per-query logprobs are severely overconfident (MSP≈0.91, ECE=0.186). The posterior concentrates in 1-2 samples → cap_rate≈0% at any τ → framework is useless without calibration. Note: *mean* probs across permutations (dashboard reliability diagram) are reasonably calibrated — it's the *per-query* probs (what the posterior multiplies) that are the problem.
+
+**Temperature scaling:** new_probs = softmax(log(old_probs) / T). Optimal T=3.0 for calibration (ECE: 0.186→0.012). At T=3.0, N_max=5, τ=0.95: avg_N=2.76, acc=76.4%, cap_rate=15.1%, acc+think=78.8%.
+
+**Joint (T, τ) optimization:** T=3.0 optimises calibration, not deployment cost. Real objective: total_cost = avg_N + cap_rate × esc_cost. Dashboard grid searches T=[1.0..5.0] × τ=[0.60..0.99] and plots Pareto frontier. Escalation cost is configurable (CoT≈10×, think≈24× base query).
+
+### 8.2 Signal-augmented stopping (designed, TODO: implement)
+
+Pure posterior measures consistency, not correctness. Veto signals:
+- **2nd Gap** < threshold → don't stop (runner-up too close, posterior may be wrong)
+- **Argmax flips** — leading answer changed during N samples (happens in 15.1% of Qs) → keep sampling
+- **Epistemic uncertainty** (mutual info) > threshold → keep sampling
+- **Confidence variance** > threshold → unstable
+- **Tier 2 (future):** cross-mode disagreement, think trace hedging phrase count
+
+### 8.3 Full adaptive pipeline (TODO: design + implement)
+
+The dashboard retroactively simulates adaptive stopping on existing data. For publishable results, need a real pipeline that:
+1. Actually stops early (not just simulates)
+2. Records wall-clock timing per question
+3. Implements escalation (switch to CoT/think on capped questions)
+4. Uses held-out calibration set for T and τ
+
+### 8.4 Flat baselines for comparison
+
 - **Flat direct**: all 4609 × 2.5s = ~3.2h. Accuracy ~75%.
 - **Flat CoT shuffle**: all 4609 × 60s = ~77h. Accuracy ~79%.
 - **Flat think shuffle**: all 4609 × 80s = ~100h. Accuracy ~84%.
-- **Adaptive**: most questions answered at direct speed, only hard ones escalated. Target: near-think accuracy at a fraction of compute.
-
-**Metrics:** accuracy vs total compute time. Plot Pareto frontier. The claim: adaptive escalation dominates flat strategies — you get 80%+ accuracy without paying the full CoT/think cost on every question.
+- **Adaptive target**: near-think accuracy at a fraction of compute.
 
 **Why it matters for the paper:** moves from "here are useful signals" to "here's how you'd actually deploy them." The verification layer isn't just diagnosis — it's a routing decision that saves compute. Directly addresses the commercial framing ("make your cheap local model more reliable without 10x compute").
-
-**Prerequisites:** completed experiments (have most of them), threshold calibration (need to find optimal 2nd Gap / epistemic cutoffs via held-out set or cross-validation).
 
 ---
 

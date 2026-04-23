@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from scipy.special import betainc as _betainc
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
@@ -1723,16 +1724,596 @@ def tab_signals() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab 7: Adaptive Sampling
+# ---------------------------------------------------------------------------
+
+def tab_adaptive() -> None:
+    """Bayesian adaptive sampling with posterior stopping criterion."""
+    st.header("Adaptive Sampling")
+    st.caption(
+        "Two aggregation methods compared side by side. **Product:** sequentially multiply "
+        "logprob probability vectors as Bayesian likelihoods — needs temperature scaling "
+        "because raw logprobs are overconfident (posterior concentrates exponentially). "
+        "**Sum:** accumulate probability vectors as fractional Dirichlet pseudo-counts — "
+        "converges linearly, no temperature needed. Both methods stop when a confidence "
+        "measure exceeds τ (Product: max posterior; Sum: Bonferroni exceedance probability). "
+        "Capped questions (hit N_max without crossing τ) escalate to a more expensive mode."
+    )
+
+    if df.empty:
+        st.info("No data loaded.")
+        return
+
+    # --- Discover runs ---
+    run_meta: dict[str, dict] = {}
+    for label, fp in selected_paths.items():
+        cfg = _extract_config_head(fp)
+        if cfg:
+            prefix = _extract_run_prefix(fp.stem)
+            run_meta[prefix] = {
+                "label": format_run_label(cfg),
+                "mode": _effective_mode(cfg),
+                "shuffle": cfg.get("shuffle_options", False),
+                "paraphrase": cfg.get("use_paraphrases", False),
+                "context": cfg.get("context_condition", "unknown"),
+            }
+
+    shuffle_runs = {k: v for k, v in run_meta.items() if v["shuffle"]}
+    if not shuffle_runs:
+        st.info("Need at least one shuffle run for adaptive sampling.")
+        return
+
+    # --- Selectors ---
+    sel_cols = st.columns(3)
+
+    base_opts = {v["label"]: k for k, v in shuffle_runs.items()}
+    default_base = next(
+        (k for k, v in shuffle_runs.items()
+         if v["mode"] == "direct" and not v["paraphrase"] and v["context"] == "sufficient"),
+        next(iter(shuffle_runs)),
+    )
+    base_label_list = list(base_opts.keys())
+    with sel_cols[0]:
+        chosen_base = st.selectbox(
+            "Base run (shuffle)", base_label_list,
+            index=base_label_list.index(shuffle_runs[default_base]["label"])
+            if shuffle_runs[default_base]["label"] in base_label_list else 0,
+        )
+    base_run = base_opts[chosen_base]
+
+    esc_pool = {k: v for k, v in run_meta.items() if k != base_run}
+    esc_opts = {"None": None} | {v["label"]: k for k, v in esc_pool.items()}
+    esc_list = list(esc_opts.keys())
+
+    def _esc_default(mode: str) -> int:
+        for k, v in esc_pool.items():
+            if v["mode"] == mode and not v["shuffle"] and not v["paraphrase"]:
+                try:
+                    return esc_list.index(v["label"])
+                except ValueError:
+                    pass
+        return 0
+
+    with sel_cols[1]:
+        esc1_label = st.selectbox("Escalation 1", esc_list, index=_esc_default("CoT"))
+    with sel_cols[2]:
+        esc2_label = st.selectbox("Escalation 2", esc_list, index=_esc_default("think"))
+
+    esc1_run = esc_opts[esc1_label]
+    esc2_run = esc_opts[esc2_label]
+
+    opt_cols = st.columns([1, 1, 4])
+    with opt_cols[0]:
+        n_max = st.select_slider("N_max", options=list(range(2, 11)), value=10)
+    with opt_cols[1]:
+        temperature = st.slider("Temperature (Product)", 0.5, 5.0, 3.0, 0.1,
+                                help="Calibration temperature for Product method. "
+                                     "T=3.0 optimal. Sum method doesn't use this.")
+
+    # --- Build per-question data ---
+    base_df = df[df["run_name"] == base_run]
+    if base_df.empty:
+        st.info("No data for selected base run.")
+        return
+
+    def _answer_map(rn):
+        if not rn:
+            return {}
+        s = df[df["run_name"] == rn]
+        return dict(zip(s["question_id"], s["final_answer"]))
+
+    esc1_map = _answer_map(esc1_run)
+    esc2_map = _answer_map(esc2_run)
+
+    questions = []
+    for _, row in base_df.iterrows():
+        qlog = row.get("query_log", [])
+        probs = [q["canonical_probs"] for q in qlog
+                 if q.get("canonical_probs") and len(q["canonical_probs"]) == 4]
+        if len(probs) < 2:
+            continue
+        questions.append({
+            "correct": row["correct_answer"],
+            "difficult": row.get("difficult", False),
+            "probs": probs[:n_max],
+            "esc1": esc1_map.get(row["question_id"]),
+            "esc2": esc2_map.get(row["question_id"]),
+        })
+
+    if not questions:
+        st.info("No questions with multiple permutations.")
+        return
+
+    n_q = len(questions)
+
+    # --- Baseline: mean probs across all permutations (current behavior) ---
+    baseline_correct = sum(
+        1 for q in questions
+        if int(np.argmax(np.mean(q["probs"], axis=0))) == q["correct"]
+    )
+    baseline_acc = baseline_correct / n_q
+
+    # --- Helpers ---
+    def _exceedance_bonf(alpha: np.ndarray) -> float:
+        """Bonferroni lower bound on P(leader beats all others) for Dirichlet."""
+        lead = int(np.argmax(alpha))
+        a_lead = alpha[lead]
+        loss = sum(
+            float(_betainc(a_lead, alpha[j], 0.5))
+            for j in range(len(alpha)) if j != lead
+        )
+        return max(0.0, 1.0 - loss)
+
+    def _compute_trajectory(
+        probs: list, method: str, temp: float,
+    ) -> list[tuple[float, int]]:
+        """Compute (confidence, argmax) at each permutation step."""
+        traj: list[tuple[float, int]] = []
+        if method == "product":
+            log_post = np.log(np.full(4, 0.25))
+            for n in range(len(probs)):
+                raw_lp = np.log(np.clip(probs[n], 1e-30, None))
+                if temp != 1.0:
+                    sc = raw_lp / temp
+                    sc -= sc.max()
+                    lk = np.exp(sc)
+                    lk /= lk.sum()
+                    log_post += np.log(np.clip(lk, 1e-30, None))
+                else:
+                    log_post += raw_lp
+                lp = log_post - log_post.max()
+                post = np.exp(lp)
+                post /= post.sum()
+                traj.append((float(post.max()), int(np.argmax(post))))
+        else:
+            alpha = np.ones(4)
+            for n in range(len(probs)):
+                alpha = alpha + np.array(probs[n])
+                traj.append((_exceedance_bonf(alpha), int(np.argmax(alpha))))
+        return traj
+
+    def _sweep_tau(
+        questions: list, trajs: list, tau: float, n_q: int,
+        esc1_run, esc2_run,
+    ) -> dict:
+        ns, corrects, caps = [], [], []
+        esc1_c, esc2_c = [], []
+        for i, traj in enumerate(trajs):
+            q = questions[i]
+            if tau == 0.0:
+                answer, n_stop, capped_q = traj[0][1], 1, False
+            else:
+                n_stop, capped_q = len(traj), True
+                answer = traj[-1][1]
+                for n, (conf, argmax_a) in enumerate(traj):
+                    if conf > tau:
+                        answer, n_stop, capped_q = argmax_a, n + 1, False
+                        break
+            ok = (answer == q["correct"])
+            ns.append(n_stop)
+            corrects.append(ok)
+            caps.append(capped_q)
+            esc1_c.append(
+                (q["esc1"] == q["correct"]) if (capped_q and q["esc1"] is not None) else ok
+            )
+            esc2_c.append(
+                (q["esc2"] == q["correct"]) if (capped_q and q["esc2"] is not None) else ok
+            )
+        return {
+            "avg_n": float(np.mean(ns)),
+            "acc": sum(corrects) / n_q,
+            "cap": sum(caps) / n_q,
+            "esc1": sum(esc1_c) / n_q if esc1_run else None,
+            "esc2": sum(esc2_c) / n_q if esc2_run else None,
+        }
+
+    # --- Pre-compute trajectories for BOTH methods ---
+    prod_trajs = [
+        _compute_trajectory(q["probs"], "product", temperature)
+        for q in questions
+    ]
+    sum_trajs = [
+        _compute_trajectory(q["probs"], "sum", 1.0)
+        for q in questions
+    ]
+
+    # --- Adaptive stopping: sweep τ for both methods ---
+    tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
+    prod_results, sum_results = [], []
+    for tau in tau_values:
+        rp = _sweep_tau(questions, prod_trajs, tau, n_q, esc1_run, esc2_run)
+        rp["tau"] = tau
+        prod_results.append(rp)
+        rs = _sweep_tau(questions, sum_trajs, tau, n_q, esc1_run, esc2_run)
+        rs["tau"] = tau
+        sum_results.append(rs)
+
+    # --- Render tables side by side ---
+    esc1_mode = esc_pool.get(esc1_run, {}).get("mode") if esc1_run else None
+    esc2_mode = esc_pool.get(esc2_run, {}).get("mode") if esc2_run else None
+
+    _at_css = """<style>
+    .at { border-collapse: collapse; width: 100%%; font-family: Inter, sans-serif; font-size: 13px; }
+    .at th { padding: 6px 10px; text-align: center; border-bottom: 2px solid #2A8C8F;
+        color: #2C3E50; font-weight: 600; }
+    .at td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
+    .at tr:hover { background: #F5F3F1; }
+    .at .g { background: rgba(42,140,143,0.12); }
+    .at .r { background: rgba(202,74,122,0.10); }
+    .at .ge { background: rgba(42,140,143,0.18); }
+    .at .bl td { border-top: 2px solid #ccc; font-style: italic; color: #8B95A1; }
+    </style>"""
+
+    def _build_table(results_list, label_suffix=""):
+        html = _at_css + '<table class="at"><tr>'
+        html += "<th>\u03c4</th><th>avg_N</th><th>accuracy</th><th>cap_rate</th>"
+        if esc1_mode:
+            html += f"<th>+{esc1_mode}</th>"
+        if esc2_mode:
+            html += f"<th>+{esc2_mode}</th>"
+        html += "</tr>"
+        for r in results_list:
+            html += "<tr>"
+            html += f'<td>{r["tau"]:.2f}</td><td>{r["avg_n"]:.2f}</td>'
+            html += f'<td class="g">{r["acc"]:.1%}</td>'
+            html += f'<td class="r">{r["cap"]:.1%}</td>'
+            if esc1_mode:
+                html += f'<td class="ge">{r["esc1"]:.1%}</td>' if r["esc1"] is not None else "<td>-</td>"
+            if esc2_mode:
+                html += f'<td class="ge">{r["esc2"]:.1%}</td>' if r["esc2"] is not None else "<td>-</td>"
+            html += "</tr>"
+        html += '<tr class="bl">'
+        html += f"<td>all</td><td>{n_max}</td>"
+        html += f'<td class="g">{baseline_acc:.1%}</td>'
+        html += "<td>-</td>"
+        if esc1_mode:
+            html += "<td>-</td>"
+        if esc2_mode:
+            html += "<td>-</td>"
+        html += "</tr></table>"
+        return html
+
+    tcol1, tcol2 = st.columns(2)
+    with tcol1:
+        st.markdown(f"**Product** (multiply likelihoods, T={temperature:.1f})")
+        st.markdown(_build_table(prod_results), unsafe_allow_html=True)
+        st.caption(f"Confidence = max posterior · {n_q} questions")
+    with tcol2:
+        st.markdown("**Sum** (Dirichlet pseudo-counts, no temperature)")
+        st.markdown(_build_table(sum_results), unsafe_allow_html=True)
+        st.caption(f"Confidence = exceedance prob (Bonferroni) · {n_q} questions")
+
+    # --- Method explanations ---
+    with st.expander("How it works — Product (multiply likelihoods)"):
+        st.markdown(
+            "**Model:** Each shuffle permutation gives a probability vector "
+            "[P(A), P(B), P(C), P(D)] from logprobs. Treat these as likelihood "
+            "functions and apply Bayes' rule with a uniform prior:\n\n"
+            "$$P(\\text{answer}=k \\mid \\text{samples}_{1..N}) \\propto "
+            "\\frac{1}{4} \\times \\prod_{n=1}^{N} p_k^{(n)}$$\n\n"
+            "In log-space: add log-probs, subtract max for numerical stability, "
+            "exponentiate, normalise.\n\n"
+            "**Stopping criterion:** max P(k | data) > τ — the posterior probability "
+            "of the leading answer exceeds the threshold.\n\n"
+            "**Temperature scaling:** Raw per-query logprobs are overconfident "
+            "(MSP ≈ 0.91, ECE = 0.186). The posterior concentrates in 1–2 samples, "
+            "making the framework useless. Temperature T deflates confidence: "
+            "new\\_probs = softmax(log(probs) / T). T = 3.0 is ECE-optimal "
+            "(0.186 → 0.012). Without it, cap\\_rate ≈ 0% at any τ.\n\n"
+            "**Tradeoff:** Mathematically correct Bayesian update *if* the logprobs "
+            "are well-calibrated. In practice they aren't, so we bolt on temperature "
+            "scaling — an extra hyperparameter to tune.\n\n"
+            "**Escalation:** Capped questions (hit N\\_max without crossing τ) use the "
+            "escalation mode's answer instead."
+        )
+    with st.expander("How it works — Sum (Dirichlet pseudo-counts)"):
+        st.markdown(
+            "**Model:** Instead of multiplying likelihood vectors, accumulate them "
+            "as fractional pseudo-counts in a Dirichlet distribution:\n\n"
+            "$$\\alpha_k = 1 + \\sum_{n=1}^{N} p_k^{(n)}$$\n\n"
+            "Each observation distributes one pseudo-count proportionally across "
+            "categories. The prior is uniform (α₀ = 1 per category).\n\n"
+            "**Stopping criterion:** Exceedance probability > τ — the probability "
+            "that the leading category is truly the best, computed via Bonferroni "
+            "lower bound on pairwise Beta comparisons:\n\n"
+            "$$P(\\theta_{\\text{lead}} > \\text{all others}) \\geq "
+            "1 - \\sum_{j \\neq \\text{lead}} I_{0.5}(\\alpha_{\\text{lead}}, \\alpha_j)$$\n\n"
+            "where I₀.₅ is the regularised incomplete beta function. This is a "
+            "conservative (lower) bound — the true exceedance is higher. For K=4, "
+            "the Bonferroni bound is tight when one category dominates.\n\n"
+            "**No temperature needed.** Evidence accumulates linearly (not "
+            "exponentially), so overconfident logprobs don't collapse the posterior. "
+            "Product: 0.9 × 0.9 × 0.9 = 0.73 posterior weight after 3 samples. "
+            "Sum: α\\_lead = 1 + 3×0.9 = 3.7, Σα = 7.0 — much less concentrated.\n\n"
+            "**Tradeoff:** Less statistically efficient — needs more "
+            "samples to reach the same confidence for genuinely easy questions. "
+            "But doesn't break on miscalibrated inputs.\n\n"
+            "**Escalation:** Same as Product — capped questions use the escalation "
+            "mode's answer. (Luigi's design augments α with a weighted CoT vector "
+            "instead of replacing — a future improvement.)"
+        )
+
+    # --- Combined accuracy vs compute chart ---
+    st.subheader("Accuracy vs Compute")
+
+    fig = go.Figure()
+    px = [r["avg_n"] for r in prod_results]
+    sx = [r["avg_n"] for r in sum_results]
+
+    # Product lines (teal)
+    fig.add_trace(go.Scatter(
+        x=px, y=[r["acc"] for r in prod_results],
+        mode="lines+markers", name="Product (base)",
+        line=dict(color=TEAL, width=2.5), marker=dict(size=8),
+        hovertemplate="Product τ=%{customdata:.2f}<br>avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>",
+        customdata=[r["tau"] for r in prod_results],
+    ))
+    if esc2_run and esc2_mode:
+        ys = [r["esc2"] for r in prod_results if r["esc2"] is not None]
+        fig.add_trace(go.Scatter(
+            x=px[:len(ys)], y=ys,
+            mode="lines+markers", name=f"Product +{esc2_mode}",
+            line=dict(color=TEAL, width=2, dash="dash"), marker=dict(size=6, symbol="diamond"),
+        ))
+
+    # Sum lines (rose)
+    fig.add_trace(go.Scatter(
+        x=sx, y=[r["acc"] for r in sum_results],
+        mode="lines+markers", name="Sum (base)",
+        line=dict(color=ROSE, width=2.5), marker=dict(size=8),
+        hovertemplate="Sum τ=%{customdata:.2f}<br>avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>",
+        customdata=[r["tau"] for r in sum_results],
+    ))
+    if esc2_run and esc2_mode:
+        ys = [r["esc2"] for r in sum_results if r["esc2"] is not None]
+        fig.add_trace(go.Scatter(
+            x=sx[:len(ys)], y=ys,
+            mode="lines+markers", name=f"Sum +{esc2_mode}",
+            line=dict(color=ROSE, width=2, dash="dash"), marker=dict(size=6, symbol="diamond"),
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=[n_max], y=[baseline_acc],
+        mode="markers", name=f"All-{n_max} baseline",
+        marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
+    ))
+    fig.add_hline(
+        y=baseline_acc, line_dash="dash", line_color=GRAY_LIGHT,
+        annotation_text=f"all-{n_max} baseline ({baseline_acc:.1%})",
+        annotation_position="bottom right",
+    )
+
+    fig.update_layout(**_base_layout(
+        title="Accuracy vs Average Queries — Product (teal) vs Sum (rose)",
+        xaxis_title="avg_N", yaxis_title="Accuracy",
+        height=420,
+        yaxis=dict(tickformat=".0%", gridcolor=GRID),
+        xaxis=dict(range=[0.5, n_max + 0.5], gridcolor=GRID),
+    ))
+    st.plotly_chart(_round_hover(fig), width="stretch")
+
+    # --- Joint optimization: both methods compared ---
+    st.subheader("Joint Optimization — Product vs Sum")
+    st.caption(
+        "Grid search: Product sweeps T × τ, Sum sweeps τ only (no temperature). "
+        "Both shown on the same Pareto chart for direct comparison."
+    )
+
+    esc_cost = st.slider(
+        "Escalation cost (× base query)", 5.0, 40.0, 10.0, 1.0,
+        help="How many base permutations one escalation call costs. "
+             "CoT ≈ 10×, think ≈ 24×.",
+        key="esc_cost_slider",
+    )
+
+    temps_grid = np.arange(1.0, 5.5, 0.5)
+    taus_grid = [0.60, 0.70, 0.80, 0.90, 0.95, 0.99]
+
+    def _grid_sweep(questions, method, temps, taus, n_q, esc_cost):
+        """Sweep (T, τ) for Product or just τ for Sum."""
+        grid = []
+        t_list = temps if method == "product" else [0.0]
+        for t in t_list:
+            trajs_t = [
+                _compute_trajectory(q["probs"], method, t)
+                for q in questions
+            ]
+            for tau_g in taus:
+                ns_g, corrects_g, caps_g, esc_best = [], [], [], []
+                for i, traj in enumerate(trajs_t):
+                    q = questions[i]
+                    n_stop_g, capped_g = len(traj), True
+                    answer_g = traj[-1][1]
+                    for n, (conf, argmax_a) in enumerate(traj):
+                        if conf > tau_g:
+                            answer_g, n_stop_g, capped_g = argmax_a, n + 1, False
+                            break
+                    ok = (answer_g == q["correct"])
+                    ns_g.append(n_stop_g)
+                    corrects_g.append(ok)
+                    caps_g.append(capped_g)
+                    esc_ok = ok
+                    if capped_g:
+                        if q["esc2"] is not None:
+                            esc_ok = (q["esc2"] == q["correct"])
+                        elif q["esc1"] is not None:
+                            esc_ok = (q["esc1"] == q["correct"])
+                    esc_best.append(esc_ok)
+                avg_n_g = float(np.mean(ns_g))
+                cap_rate_g = sum(caps_g) / n_q
+                grid.append({
+                    "T": float(t), "tau": tau_g,
+                    "avg_n": avg_n_g, "cap_rate": cap_rate_g,
+                    "acc": sum(corrects_g) / n_q,
+                    "acc_esc": sum(esc_best) / n_q,
+                    "total_cost": avg_n_g + cap_rate_g * esc_cost,
+                })
+        return grid
+
+    prod_grid = _grid_sweep(questions, "product", temps_grid, taus_grid, n_q, esc_cost)
+    sum_grid = _grid_sweep(questions, "sum", temps_grid, taus_grid, n_q, esc_cost)
+
+    def _pareto(grid):
+        pareto = []
+        by_cost = sorted(grid, key=lambda r: (r["total_cost"], -r["acc_esc"]))
+        best = -1.0
+        for r in by_cost:
+            if r["acc_esc"] > best:
+                best = r["acc_esc"]
+                pareto.append(r)
+        return pareto
+
+    prod_pareto = _pareto(prod_grid)
+    sum_pareto = _pareto(sum_grid)
+
+    fig2 = go.Figure()
+
+    # Product: all points (grey) + Pareto (teal stars)
+    prod_pareto_keys = {(r["T"], r["tau"]) for r in prod_pareto}
+    prod_non = [r for r in prod_grid if (r["T"], r["tau"]) not in prod_pareto_keys]
+    fig2.add_trace(go.Scatter(
+        x=[r["total_cost"] for r in prod_non],
+        y=[r["acc_esc"] for r in prod_non],
+        mode="markers",
+        marker=dict(size=6, color=GRAY_LIGHT, opacity=0.3),
+        hovertemplate=(
+            "Product T=%{customdata[0]:.1f}, τ=%{customdata[1]:.2f}<br>"
+            "cost=%{x:.1f} · acc+esc=%{y:.1%}<br>"
+            "avg_N=%{customdata[2]:.1f} · cap=%{customdata[3]:.0%}<extra></extra>"
+        ),
+        customdata=[[r["T"], r["tau"], r["avg_n"], r["cap_rate"]] for r in prod_non],
+        name="Product (all T,τ)",
+    ))
+    fig2.add_trace(go.Scatter(
+        x=[r["total_cost"] for r in prod_pareto],
+        y=[r["acc_esc"] for r in prod_pareto],
+        mode="lines+markers+text",
+        marker=dict(size=10, color=TEAL, symbol="star"),
+        line=dict(color=TEAL, width=2, dash="dot"),
+        text=[f"T={r['T']:.0f},τ={r['tau']:.2f}" for r in prod_pareto],
+        textposition="top center", textfont=dict(size=8),
+        hovertemplate=(
+            "Product T=%{customdata[0]:.1f}, τ=%{customdata[1]:.2f}<br>"
+            "cost=%{x:.1f} · acc+esc=%{y:.1%}<br>"
+            "avg_N=%{customdata[2]:.1f} · cap=%{customdata[3]:.0%}<extra></extra>"
+        ),
+        customdata=[[r["T"], r["tau"], r["avg_n"], r["cap_rate"]] for r in prod_pareto],
+        name="Product Pareto",
+    ))
+
+    # Sum: all points (light rose) + Pareto (rose stars)
+    sum_pareto_keys = {r["tau"] for r in sum_pareto}
+    sum_non = [r for r in sum_grid if r["tau"] not in sum_pareto_keys]
+    if sum_non:
+        fig2.add_trace(go.Scatter(
+            x=[r["total_cost"] for r in sum_non],
+            y=[r["acc_esc"] for r in sum_non],
+            mode="markers",
+            marker=dict(size=6, color=ROSE, opacity=0.3),
+            hovertemplate=(
+                "Sum τ=%{customdata[0]:.2f}<br>"
+                "cost=%{x:.1f} · acc+esc=%{y:.1%}<br>"
+                "avg_N=%{customdata[1]:.1f} · cap=%{customdata[2]:.0%}<extra></extra>"
+            ),
+            customdata=[[r["tau"], r["avg_n"], r["cap_rate"]] for r in sum_non],
+            name="Sum (all τ)",
+        ))
+    fig2.add_trace(go.Scatter(
+        x=[r["total_cost"] for r in sum_pareto],
+        y=[r["acc_esc"] for r in sum_pareto],
+        mode="lines+markers+text",
+        marker=dict(size=10, color=ROSE, symbol="diamond"),
+        line=dict(color=ROSE, width=2, dash="dot"),
+        text=[f"τ={r['tau']:.2f}" for r in sum_pareto],
+        textposition="bottom center", textfont=dict(size=8),
+        hovertemplate=(
+            "Sum τ=%{customdata[0]:.2f}<br>"
+            "cost=%{x:.1f} · acc+esc=%{y:.1%}<br>"
+            "avg_N=%{customdata[1]:.1f} · cap=%{customdata[2]:.0%}<extra></extra>"
+        ),
+        customdata=[[r["tau"], r["avg_n"], r["cap_rate"]] for r in sum_pareto],
+        name="Sum Pareto",
+    ))
+
+    fig2.add_trace(go.Scatter(
+        x=[float(n_max)], y=[baseline_acc],
+        mode="markers", name=f"All-{n_max} baseline",
+        marker=dict(size=12, color=GOLD, symbol="diamond"),
+    ))
+
+    fig2.update_layout(**_base_layout(
+        title="Product vs Sum: Accuracy vs Total Cost",
+        xaxis_title="Total cost per question (base-query units)",
+        yaxis_title="Accuracy (with best escalation)",
+        height=480,
+        yaxis=dict(tickformat=".1%", gridcolor=GRID),
+        xaxis=dict(gridcolor=GRID),
+    ))
+    st.plotly_chart(_round_hover(fig2), width="stretch")
+
+    # Pareto tables side by side
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        st.markdown("**Product Pareto (T × τ):**")
+        p_html = '<table class="at"><tr>'
+        p_html += '<th>T</th><th>τ</th><th>avg_N</th><th>cap</th>'
+        p_html += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
+        for r in prod_pareto:
+            p_html += f'<tr><td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
+            p_html += f'<td>{r["avg_n"]:.2f}</td>'
+            p_html += f'<td class="r">{r["cap_rate"]:.1%}</td>'
+            p_html += f'<td class="g">{r["acc"]:.1%}</td>'
+            p_html += f'<td class="ge">{r["acc_esc"]:.1%}</td>'
+            p_html += f'<td>{r["total_cost"]:.1f}</td></tr>'
+        p_html += '</table>'
+        st.markdown(p_html, unsafe_allow_html=True)
+    with pcol2:
+        st.markdown("**Sum Pareto (τ only):**")
+        s_html = '<table class="at"><tr>'
+        s_html += '<th>τ</th><th>avg_N</th><th>cap</th>'
+        s_html += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
+        for r in sum_pareto:
+            s_html += f'<tr><td>{r["tau"]:.2f}</td>'
+            s_html += f'<td>{r["avg_n"]:.2f}</td>'
+            s_html += f'<td class="r">{r["cap_rate"]:.1%}</td>'
+            s_html += f'<td class="g">{r["acc"]:.1%}</td>'
+            s_html += f'<td class="ge">{r["acc_esc"]:.1%}</td>'
+            s_html += f'<td>{r["total_cost"]:.1f}</td></tr>'
+        s_html += '</table>'
+        st.markdown(s_html, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 st.title("Pre-Action Uncertainty Quantification")
 st.caption("QuALITY dataset | Context sufficiency experiments")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Progress", "Uncertainty Distributions",
     "Condition Comparison", "Effect Analysis", "Question Explorer",
-    "Signal Battery",
+    "Signal Battery", "Adaptive Sampling",
 ])
 
 with tab1:
@@ -1747,3 +2328,5 @@ with tab5:
     tab_explorer()
 with tab6:
     tab_signals()
+with tab7:
+    tab_adaptive()
