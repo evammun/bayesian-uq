@@ -707,11 +707,14 @@ def run_experiment(
         model_path = str(found)
 
     print(f"Loading model: {Path(model_path).name[:50]}...")
+    # Pass model_family from config so the correct chat template is used.
+    # "auto" (the default) detects family from the GGUF filename.
     client = LlamaCppClient(
         model_path=model_path,
         n_ctx=config.n_ctx,
         seed=config.seed,
         verbose=False,
+        model_family=config.model_family,
     )
     print(f"  Model loaded in {client.load_time:.1f}s")
 

@@ -40,13 +40,40 @@ import llama_cpp
 # Answer letters for MCQA extraction (matches v2 convention)
 ANSWER_LETTERS = ["A", "B", "C", "D"]
 
-# Qwen3 chat template tokens
+# ChatML tokens — used by Qwen3 and Qwen3.5; kept for backward compat
 _IM_START = "<|im_start|>"
 _IM_END = "<|im_end|>"
 
 # Token IDs for answer letters — populated on first model load.
 # Maps letter -> list of token IDs (bare "A" and space-prefixed " A").
 _ANSWER_TOKEN_IDS: dict[str, list[int]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Model family detection
+# ---------------------------------------------------------------------------
+
+def _detect_model_family(model_path: str) -> str:
+    """Detect model family from the GGUF filename.
+
+    Used when model_family="auto" is passed to LlamaCppClient.
+    Falls back to "qwen3" if no pattern matches (safe default — existing
+    behaviour is preserved).
+
+    Args:
+        model_path: Path to the GGUF file (only the filename is inspected).
+
+    Returns:
+        One of: "qwen3", "qwen3.5", "gemma4".
+    """
+    name = Path(model_path).stem.lower()
+    if "qwen3.5" in name or "qwen-3.5" in name:
+        return "qwen3.5"
+    if "qwen3" in name or "qwen-3" in name or "qwen" in name:
+        return "qwen3"
+    if "gemma-4" in name or "gemma4" in name or "gemma" in name:
+        return "gemma4"
+    return "qwen3"  # safe fallback — preserves existing behaviour
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +101,7 @@ class LlamaCppClient:
         n_batch: int | None = None,
         seed: int = 42,
         verbose: bool = False,
+        model_family: str = "auto",
     ):
         """Load a GGUF model for inference.
 
@@ -87,10 +115,20 @@ class LlamaCppClient:
                 triggered batch-size errors during testing.
             seed: Random seed for reproducibility.
             verbose: Print llama.cpp loading diagnostics.
+            model_family: One of "auto", "qwen3", "qwen3.5", "gemma4".
+                "auto" (default) detects family from the GGUF filename.
         """
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
+
+        # Resolve model family — "auto" inspects the GGUF filename
+        self._model_family = (
+            _detect_model_family(str(self.model_path))
+            if model_family == "auto"
+            else model_family
+        )
+        print(f"  [inference] model_family={self._model_family!r}")
 
         if n_batch is None:
             n_batch = n_ctx
@@ -124,12 +162,13 @@ class LlamaCppClient:
 
         for letter in ANSWER_LETTERS:
             ids = []
-            # Bare letter: "A"
-            bare = self.model.tokenize(letter.encode(), add_bos=False)
+            # Bare letter: "A" — special=True ensures Gemma special tokens
+            # are recognised; harmless for Qwen models
+            bare = self.model.tokenize(letter.encode(), add_bos=False, special=True)
             if len(bare) == 1:
                 ids.append(bare[0])
             # Space-prefixed: " A"
-            spaced = self.model.tokenize(f" {letter}".encode(), add_bos=False)
+            spaced = self.model.tokenize(f" {letter}".encode(), add_bos=False, special=True)
             if len(spaced) == 1:
                 ids.append(spaced[0])
             _ANSWER_TOKEN_IDS[letter] = ids
@@ -344,7 +383,10 @@ class LlamaCppClient:
         chat_prompt = self._build_chat_prompt(user_message, think=think) + assistant_prefill
 
         with self._lock:
-            tokens = self.model.tokenize(chat_prompt.encode(), add_bos=True)
+            # special=True ensures Gemma special tokens (<start_of_turn> etc.)
+            # are tokenized as single special-token IDs, not split into subwords.
+            # Harmless for Qwen models.
+            tokens = self.model.tokenize(chat_prompt.encode(), add_bos=True, special=True)
 
             if len(tokens) > self._n_ctx:
                 raise ValueError(
@@ -442,7 +484,8 @@ class LlamaCppClient:
         eval_prompt = chat_prompt + output_prefix + "\n\nAnswer:"
 
         with self._lock:
-            tokens = self.model.tokenize(eval_prompt.encode(), add_bos=True)
+            # special=True — same reason as in generate_with_logprobs
+            tokens = self.model.tokenize(eval_prompt.encode(), add_bos=True, special=True)
 
             if len(tokens) > self._n_ctx:
                 raise ValueError(
@@ -473,10 +516,10 @@ class LlamaCppClient:
         # generated reasoning). Sum both; output_tokens counts the raw generation
         # length plus the single extracted answer token from Pass 2.
         pass1_prompt_tokens = len(
-            self.model.tokenize(chat_prompt.encode(), add_bos=True)
+            self.model.tokenize(chat_prompt.encode(), add_bos=True, special=True)
         )
         pass1_output_tokens = len(
-            self.model.tokenize(raw_output.encode(), add_bos=False)
+            self.model.tokenize(raw_output.encode(), add_bos=False, special=True)
         )
 
         return {
@@ -522,24 +565,83 @@ class LlamaCppClient:
         think: bool = True,
         system_message: str = "You are a helpful assistant.",
     ) -> str:
-        """Construct a Qwen3-format chat prompt.
+        """Construct a chat prompt appropriate for the loaded model family.
+
+        Dispatches to the correct template based on self._model_family.
+        Qwen3 behaviour is UNCHANGED from the original implementation —
+        all other families are additive.
 
         Args:
             user_message: User's message content.
-            think: Prepend /think (True) or /no_think (False).
-            system_message: System prompt text.
+            think: Whether the model should reason before answering.
+            system_message: Fallback system prompt text (used for qwen3).
 
         Returns:
-            Formatted prompt with Qwen3 <|im_start|>/<|im_end|> tokens.
+            Formatted prompt string ready for tokenization.
         """
-        think_tag = "/think" if think else "/no_think"
-        return (
-            f"{_IM_START}system\n"
-            f"{think_tag}\n{system_message}{_IM_END}\n"
-            f"{_IM_START}user\n"
-            f"{user_message}{_IM_END}\n"
-            f"{_IM_START}assistant\n"
-        )
+        if self._model_family == "qwen3":
+            # ChatML format with /no_think or /think control token in system turn.
+            # This is the original Qwen3 behaviour — DO NOT change.
+            think_tag = "/think" if think else "/no_think"
+            return (
+                f"{_IM_START}system\n"
+                f"{think_tag}\n{system_message}{_IM_END}\n"
+                f"{_IM_START}user\n"
+                f"{user_message}{_IM_END}\n"
+                f"{_IM_START}assistant\n"
+            )
+
+        elif self._model_family == "qwen3.5":
+            # Qwen3.5 uses the same ChatML format but does NOT support /no_think
+            # as a control token — include a plain-text instruction instead.
+            # When think=True, omit the "do not think" instruction so the model
+            # reasons naturally.
+            if think:
+                # Thinking is on by default in Qwen3.5 — no special instruction needed
+                sys_turn = f"{_IM_START}system\n{system_message}{_IM_END}\n"
+            else:
+                no_think_msg = (
+                    f"{system_message} "
+                    "Do not use any thinking or reasoning blocks. Answer directly."
+                )
+                sys_turn = f"{_IM_START}system\n{no_think_msg}{_IM_END}\n"
+
+            return (
+                sys_turn
+                + f"{_IM_START}user\n"
+                + f"{user_message}{_IM_END}\n"
+                + f"{_IM_START}assistant\n"
+            )
+
+        elif self._model_family == "gemma4":
+            # Gemma 4 uses <start_of_turn>/<end_of_turn> tokens.
+            # When think=True, prepend a system turn instructing step-by-step reasoning.
+            # When think=False, no system turn needed.
+            if think:
+                return (
+                    "<start_of_turn>system\n"
+                    "Think step by step before answering.<end_of_turn>\n"
+                    "<start_of_turn>user\n"
+                    f"{user_message}<end_of_turn>\n"
+                    "<start_of_turn>model\n"
+                )
+            else:
+                return (
+                    "<start_of_turn>user\n"
+                    f"{user_message}<end_of_turn>\n"
+                    "<start_of_turn>model\n"
+                )
+
+        else:
+            # Unknown family — fall back to qwen3 to preserve existing behaviour
+            think_tag = "/think" if think else "/no_think"
+            return (
+                f"{_IM_START}system\n"
+                f"{think_tag}\n{system_message}{_IM_END}\n"
+                f"{_IM_START}user\n"
+                f"{user_message}{_IM_END}\n"
+                f"{_IM_START}assistant\n"
+            )
 
     # ------------------------------------------------------------------
     # Properties
@@ -561,28 +663,48 @@ class LlamaCppClient:
 # ---------------------------------------------------------------------------
 
 def _split_think_response(text: str) -> tuple[str, str]:
-    """Separate Qwen3 <think>...</think> from visible output.
+    """Separate model reasoning from visible output.
+
+    Handles two think-tag formats:
+      - Gemma4:  <|think|>...</|think|>
+      - Qwen3:   <think>...</think>
+
+    Gemma4 tags are checked first; if neither is present the full text
+    is returned as the visible response (thinking_trace = "").
 
     Returns:
-        (visible_response, thinking_trace).  If no think tags are found
-        the full text is returned as the visible response.
+        (visible_response, thinking_trace).
     """
-    tag_open = "<think>"
-    tag_close = "</think>"
+    # --- Gemma4 style: <|think|>...</|think|> ---
+    gemma_open = "<|think|>"
+    gemma_close = "<|/think|>"
+    if gemma_open in text:
+        start = text.index(gemma_open) + len(gemma_open)
+        if gemma_close in text:
+            end = text.index(gemma_close)
+            thinking = text[start:end].strip()
+            visible = text[end + len(gemma_close):].strip()
+        else:
+            thinking = text[start:].strip()
+            visible = ""
+        return visible, thinking
 
-    if tag_open not in text:
-        return text, ""
+    # --- Qwen3 style: <think>...</think> ---
+    qwen_open = "<think>"
+    qwen_close = "</think>"
+    if qwen_open in text:
+        start = text.index(qwen_open) + len(qwen_open)
+        if qwen_close in text:
+            end = text.index(qwen_close)
+            thinking = text[start:end].strip()
+            visible = text[end + len(qwen_close):].strip()
+        else:
+            thinking = text[start:].strip()
+            visible = ""
+        return visible, thinking
 
-    start = text.index(tag_open) + len(tag_open)
-    if tag_close in text:
-        end = text.index(tag_close)
-        thinking = text[start:end].strip()
-        visible = text[end + len(tag_close):].strip()
-    else:
-        thinking = text[start:].strip()
-        visible = ""
-
-    return visible, thinking
+    # No think tags found — full text is the visible response
+    return text, ""
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +824,10 @@ def _find_last_answer_token(
 _DEFAULT_GGUF = "qwen3-8b-q4_k_m.gguf"
 
 
-def find_model_path(model_name: str = "qwen3:8b-q4_K_M") -> Path | None:
+def find_model_path(
+    model_name: str = "qwen3:8b-q4_K_M",
+    gguf_filename: str | None = None,
+) -> Path | None:
     """Find a GGUF model file on disk.
 
     Search order:
@@ -715,13 +840,19 @@ def find_model_path(model_name: str = "qwen3:8b-q4_K_M") -> Path | None:
          on the Windows laptop)
 
     Args:
-        model_name: Ignored for now (single-model project). Kept for
-            config compatibility so callers don't need to change.
+        model_name: Kept for config compatibility (logged but not used for search).
+        gguf_filename: Specific GGUF filename to search for. If None, falls
+            back to _DEFAULT_GGUF ("qwen3-8b-q4_k_m.gguf"). Supply this
+            when searching for a non-default model (e.g. a Gemma or Qwen3.5
+            GGUF placed in the standard locations).
 
     Returns:
         Path to the GGUF file, or None if not found anywhere.
     """
     import os
+
+    # Resolve the target filename — caller wins; otherwise use project default
+    target_gguf = gguf_filename if gguf_filename is not None else _DEFAULT_GGUF
 
     # --- 1. Explicit env var ---
     env_path = os.environ.get("UQ_MODEL_PATH")
@@ -732,7 +863,7 @@ def find_model_path(model_name: str = "qwen3:8b-q4_K_M") -> Path | None:
         print(f"  [WARN] UQ_MODEL_PATH={env_path} but file does not exist")
 
     # --- 2. vast.ai convention ---
-    vastai = Path("/workspace/models") / _DEFAULT_GGUF
+    vastai = Path("/workspace/models") / target_gguf
     if vastai.is_file():
         return vastai
 
@@ -740,12 +871,12 @@ def find_model_path(model_name: str = "qwen3:8b-q4_K_M") -> Path | None:
     # Walk up from this file to find the project root (contains pyproject.toml)
     project_root = _find_project_root()
     if project_root:
-        local = project_root / "models" / _DEFAULT_GGUF
+        local = project_root / "models" / target_gguf
         if local.is_file():
             return local
 
     # --- 4. ~/models/ ---
-    home_models = Path.home() / "models" / _DEFAULT_GGUF
+    home_models = Path.home() / "models" / target_gguf
     if home_models.is_file():
         return home_models
 

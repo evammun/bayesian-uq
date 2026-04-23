@@ -40,6 +40,7 @@ class ExperimentConfig(BaseModel):
     run_name: str
     model_path: str = "auto"  # path to GGUF file, or "auto" to search standard locations
     model_name: str = "qwen3:8b-q4_K_M"  # model identifier (for logging/reference)
+    model_family: str = "auto"  # "auto", "qwen3", "qwen3.5", "gemma4"
     think: bool = False
     prompt_mode: Literal["direct", "cot"] = "direct"
     dataset_file: str = "data/quality_all.jsonl"

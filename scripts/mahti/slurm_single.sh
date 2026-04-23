@@ -51,8 +51,10 @@ echo "============================================"
 echo ""
 
 # --- Copy model to fast local NVMe ---
-MODEL_SRC=/scratch/project_2018384/models/qwen3-8b-q4_k_m.gguf
-MODEL_DST=$LOCAL_SCRATCH/qwen3-8b-q4_k_m.gguf
+# MODEL_FILE can be overridden via sbatch --export to use a different GGUF
+MODEL_FILE=${MODEL_FILE:-qwen3-8b-q4_k_m.gguf}
+MODEL_SRC=/scratch/project_2018384/models/$MODEL_FILE
+MODEL_DST=$LOCAL_SCRATCH/$MODEL_FILE
 
 echo "Copying model to LOCAL_SCRATCH..."
 cp "$MODEL_SRC" "$MODEL_DST"
@@ -70,7 +72,8 @@ EXISTING=$(ls -S "$RESULT_DIR"/${RUN_NAME}_*.json 2>/dev/null | head -1)
 
 if [ -n "$EXISTING" ]; then
     N=$(grep -c '"question_id"' "$EXISTING" 2>/dev/null || echo 0)
-    TOTAL=4609
+    MAX_Q=$(grep '^max_questions:' "$CONFIG" | awk '{print $2}' | tr -d '\r')
+    TOTAL=${MAX_Q:-4609}
     if [ "$N" -ge "$TOTAL" ]; then
         echo "Already complete: $EXISTING ($N questions). Nothing to do."
         exit 0
