@@ -549,6 +549,14 @@ Reviewed Luigi's full `bayesian.py` (1321 lines) and exceedance approximation do
 | 2026-04-23 | Keep pipeline as-is for multi-model, retroactive adaptive | Always better to have more data. Adaptive stopping computed retroactively from full permutation data. |
 | 2026-04-23 | Per-query timing instrumentation | Need cost baselines for each query to compare adaptive approaches. inference_time_s + token counts. |
 | 2026-04-23 | llama-cpp-python 0.3.36 (JamePeng fork) on Mahti | PyPI 0.3.20 too old for Qwen 3.5 and Gemma 4 architectures. JamePeng fork built from source with CUDA. |
-| 2026-04-23 | Qwen 3.5 deferred — llama.cpp recurrent memory bug | GGML_ASSERT in llama-memory-recurrent.cpp. Hybrid attention not supported. Will revisit when upstream fixes land. |
+| 2026-04-23 | Qwen 3.5 fixed — `llama_memory_clear` workaround | `llama_memory_seq_rm` crashes on recurrent cells. `llama_memory_clear` (full wipe) works without latency penalty. 20/20 test, 90% accuracy. |
 | 2026-04-23 | Gemma 4 E4B validated as second model | 72% accuracy, valid logprobs, fast inference (0.96s/q). Very overconfident — good calibration contrast with Qwen 3. |
+
+### Qwen 3.5 fix and launch (same session, later)
+- **Root cause:** `llama_memory_seq_rm` iterates recurrent cells and asserts `cell.has_seq_id(seq_id)`, which fails for Qwen 3.5's hybrid DeltaNet architecture.
+- **Fix 1 (failed):** Skip `llama_memory_seq_rm`, just reset `n_tokens = 0`. No crash, but 19/20 queries failed — stale recurrent state leaked between questions.
+- **Fix 2 (success):** Use `llama_memory_clear(mem, True)` instead — wipes all memory (KV + recurrent) without per-cell seq_id checks. Model-family-gated: only Qwen 3.5 uses this path; other models keep `llama_memory_seq_rm`.
+- **Validation:** 20/20 questions processed, 90% accuracy, valid logprobs. No latency impact.
+- **Full runs launched on Mahti:** Same 4 conditions as Gemma 4 (direct × {noshuffle, shuffle, noshuffle+para, shuffle+para}). Jobs 6384215-6384218. Pending behind Gemma 4 runs.
+- **Gemma 4 progress at time of launch:** noshuffle at 2539/4609 (~55%), shuffle/para runs at ~224/4609 (~5%)
 

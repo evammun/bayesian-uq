@@ -180,30 +180,28 @@ class LlamaCppClient:
     def _full_reset(self) -> None:
         """Clear the KV cache and reset token counter.
 
-        Llama.reset() only sets n_tokens=0 without clearing the KV
-        cache, which causes decode failures on subsequent eval() calls.
-
-        The API for clearing the cache has changed across llama-cpp-python
-        versions, so we try multiple approaches:
-          - 0.3.12+: llama_memory_seq_rm (via llama_get_memory)
-          - older: memory_clear on the context object
-          - fallback: kv_cache_clear on the context
+        Hybrid/recurrent models (Qwen 3.5) crash on llama_memory_seq_rm
+        due to a llama.cpp bug in recurrent cell handling. For those
+        models we use llama_memory_clear (full wipe) instead.
         """
         ctx = self.model._ctx
 
-        # Try the modern API first (0.3.12+)
-        try:
-            mem = llama_cpp.llama_get_memory(ctx.ctx)
-            llama_cpp.llama_memory_seq_rm(mem, -1, -1, -1)
-        except (AttributeError, Exception):
-            # Try older API
+        if self._model_family == "qwen3.5":
             try:
-                ctx.memory_clear(True)
-            except AttributeError:
+                llama_cpp.llama_memory_clear(llama_cpp.llama_get_memory(ctx.ctx), True)
+            except (AttributeError, Exception):
+                try:
+                    ctx.memory_clear(True)
+                except AttributeError:
+                    self.model.reset()
+        else:
+            try:
+                mem = llama_cpp.llama_get_memory(ctx.ctx)
+                llama_cpp.llama_memory_seq_rm(mem, -1, -1, -1)
+            except (AttributeError, Exception):
                 try:
                     ctx.kv_cache_clear()
                 except AttributeError:
-                    # Last resort — Llama.reset() at least zeros n_tokens
                     self.model.reset()
 
         self.model.n_tokens = 0
