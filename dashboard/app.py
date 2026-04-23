@@ -250,10 +250,11 @@ def _short_model_name(cfg: dict) -> str:
 
 
 def format_run_label(cfg: dict) -> str:
-    """Human-readable run label."""
+    """Human-readable run label.  Only call out positives (shuffle, paraphrase)."""
     parts = [_short_model_name(cfg)]
     parts.append(_effective_mode(cfg))
-    parts.append("shuffle" if cfg.get("shuffle_options", True) else "noshuffle")
+    if cfg.get("shuffle_options", False):
+        parts.append("shuffle")
     if cfg.get("use_paraphrases", False):
         parts.append("paraphrase")
     return " · ".join(parts)
@@ -622,36 +623,104 @@ def tab_distributions() -> None:
                   if _extract_run_prefix(p.stem) == run_name), ""), None))
         return format_run_label(cfg) if cfg else run_name.replace("quality_", "")
 
-    # --- Per-run MSP distributions (2 per row) ---
+    def _run_sort_key(run_name):
+        """Sort runs into visual groups: mode, then shuffle/para variant, then model."""
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        if cfg:
+            mode = _effective_mode(cfg)
+            shuffle = cfg.get("shuffle_options", False)
+            para = cfg.get("use_paraphrases", False)
+            model = _short_model_name(cfg)
+        else:
+            mode, shuffle, para, model = "direct", False, False, ""
+        mode_order = {"direct": 0, "CoT": 1, "think": 2}
+        variant_order = (0 if not shuffle and not para else
+                         1 if shuffle and not para else
+                         2 if not shuffle and para else 3)
+        return (mode_order.get(mode, 9), variant_order, model)
+
+    def _run_group_label(run_name):
+        """Group header like 'Direct' or 'Direct · shuffle'."""
+        cfg = _extract_config_head(selected_paths.get(
+            next((l for l, p in selected_paths.items()
+                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        if cfg:
+            mode = _effective_mode(cfg)
+            shuffle = cfg.get("shuffle_options", False)
+            para = cfg.get("use_paraphrases", False)
+        else:
+            mode, shuffle, para = "direct", False, False
+        parts = [mode.capitalize() if mode != "CoT" else "CoT"]
+        if shuffle:
+            parts.append("shuffle")
+        if para:
+            parts.append("paraphrase")
+        return " · ".join(parts)
+
+    # --- Per-run MSP distributions (2 per row, grouped by mode) ---
     st.subheader("MSP by Run (Correct vs Incorrect)")
     st.caption("Teal = correct, Gold = incorrect")
-    run_names = sorted(active["run_name"].unique())
-    for i in range(0, len(run_names), 2):
-        cols = st.columns(2)
-        for j, col in enumerate(cols):
-            idx = i + j
-            if idx >= len(run_names):
-                break
-            sub = active[active["run_name"] == run_names[idx]]
-            with col:
-                st.plotly_chart(_round_hover(_msp_hist(sub, _run_label(run_names[idx]))),
-                                width="stretch")
+    run_names = sorted(active["run_name"].unique(), key=_run_sort_key)
+    prev_group = None
+    group_buffer: list[str] = []
+    def _flush_buffer(buf):
+        for i in range(0, len(buf), 2):
+            cols = st.columns(2)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx >= len(buf):
+                    break
+                sub = active[active["run_name"] == buf[idx]]
+                with col:
+                    st.plotly_chart(_round_hover(_msp_hist(sub, _run_label(buf[idx]))),
+                                    width="stretch")
+
+    for rn in run_names:
+        grp = _run_group_label(rn)
+        if grp != prev_group:
+            if group_buffer:
+                _flush_buffer(group_buffer)
+                group_buffer = []
+            st.markdown(f"---")
+            st.markdown(f"**{grp}**")
+            prev_group = grp
+        group_buffer.append(rn)
+    if group_buffer:
+        _flush_buffer(group_buffer)
 
     # --- Agreement (only for multi-query runs, 2 per row) ---
     multi = active[(active["num_queries"] > 1) & active["agreement"].notna()]
     if not multi.empty:
         st.subheader("Agreement by Run (Correct vs Incorrect)")
-        multi_runs = sorted(multi["run_name"].unique())
-        for i in range(0, len(multi_runs), 2):
-            cols = st.columns(2)
-            for j, col in enumerate(cols):
-                idx = i + j
-                if idx >= len(multi_runs):
-                    break
-                sub = multi[multi["run_name"] == multi_runs[idx]]
-                with col:
-                    st.plotly_chart(_round_hover(_agree_hist(sub, _run_label(multi_runs[idx]))),
-                                    width="stretch")
+        multi_runs = sorted(multi["run_name"].unique(), key=_run_sort_key)
+        prev_group = None
+        group_buffer = []
+        def _flush_agree_buffer(buf):
+            for i in range(0, len(buf), 2):
+                cols = st.columns(2)
+                for j, col in enumerate(cols):
+                    idx = i + j
+                    if idx >= len(buf):
+                        break
+                    sub = multi[multi["run_name"] == buf[idx]]
+                    with col:
+                        st.plotly_chart(_round_hover(_agree_hist(sub, _run_label(buf[idx]))),
+                                        width="stretch")
+
+        for rn in multi_runs:
+            grp = _run_group_label(rn)
+            if grp != prev_group:
+                if group_buffer:
+                    _flush_agree_buffer(group_buffer)
+                    group_buffer = []
+                st.markdown(f"---")
+                st.markdown(f"**{grp}**")
+                prev_group = grp
+            group_buffer.append(rn)
+        if group_buffer:
+            _flush_agree_buffer(group_buffer)
 
     # --- Fragile confidence: MSP by agreement bin ---
     st.subheader("Fragile Confidence: MSP by Agreement Level")
@@ -770,37 +839,9 @@ def tab_comparison() -> None:
         factor_hdrs = [factor_labels.get(c, c) for c in factor_cols]
         n_factors = len(factor_hdrs)
 
-        # Collect numeric accuracy values for heatmap scaling
-        acc_vals = []
-        for row in pivot_data:
-            for key in ("Accuracy", "Acc Easy", "Acc Hard"):
-                v = row.get(key, "-")
-                if v != "-":
-                    try:
-                        acc_vals.append(float(v.replace("%", "")) / 100)
-                    except ValueError:
-                        pass
-        acc_min = min(acc_vals) if acc_vals else 0.5
-        acc_max = max(acc_vals) if acc_vals else 1.0
-        acc_range = max(acc_max - acc_min, 0.01)
-
-        def _acc_bg(val_str: str) -> str:
-            if val_str == "-":
-                return ""
-            try:
-                v = float(val_str.replace("%", "")) / 100
-                t = (v - acc_min) / acc_range
-                t = max(0.0, min(1.0, t))
-                r = int(220 - t * 178)
-                g = int(100 + t * 40)
-                b = int(100 - t * 57)
-                alpha = 0.18 + t * 0.17
-                return f' style="background:rgba({r},{g},{b},{alpha:.2f})"'
-            except ValueError:
-                return ""
-
-        # Best values per column for bold highlighting
-        best = {}
+        # Per-column landmarks: best, p75, p50, p25, worst
+        # Only these 5 cells get highlighted; everything else stays plain
+        landmarks: dict[str, dict[str, str]] = {}  # col -> {val_str: style}
         for key in ("Accuracy", "Acc Easy", "Acc Hard"):
             vals = []
             for row in pivot_data:
@@ -810,8 +851,66 @@ def tab_comparison() -> None:
                         vals.append(float(v.replace("%", "")))
                     except ValueError:
                         pass
-            if vals:
-                best[key] = f"{max(vals):.0f}%"
+            if len(vals) < 3:
+                continue
+            sv = sorted(vals)
+            marks = {
+                sv[-1]: "rgba(42,140,143,0.25)",     # best — strong teal
+                sv[(3*len(sv))//4]: "rgba(42,140,143,0.12)",  # p75 — light teal
+                sv[len(sv)//2]: "rgba(160,160,160,0.10)",     # p50 — neutral
+                sv[len(sv)//4]: "rgba(200,120,80,0.12)",      # p25 — light warm
+                sv[0]: "rgba(200,80,60,0.22)",       # worst — strong warm
+            }
+            landmarks[key] = {f"{v:.0f}%": bg for v, bg in marks.items()}
+
+        def _acc_highlight(val_str: str, col: str) -> str:
+            bg = landmarks.get(col, {}).get(val_str)
+            return f' style="background:{bg}"' if bg else ""
+
+        # Per-column confidence highlights: best 5 calibrated (teal) + worst 5 overconfident (warm)
+        # Key: (conf_col, row_index) -> style string
+        conf_styles: dict[tuple[str, int], str] = {}
+        for conf_key, acc_key in [("Confidence", "Accuracy"), ("Conf Easy", "Acc Easy"), ("Conf Hard", "Acc Hard")]:
+            gaps = []  # (row_idx, gap)
+            for ri, row in enumerate(pivot_data):
+                a, c = row.get(acc_key, "-"), row.get(conf_key, "-")
+                if a == "-" or c == "-":
+                    continue
+                try:
+                    gaps.append((ri, float(c) - float(a.replace("%", "")) / 100))
+                except ValueError:
+                    pass
+            if len(gaps) < 3:
+                continue
+            by_gap = sorted(gaps, key=lambda x: abs(x[1]))
+            n_pick = min(5, len(gaps))
+            # Best calibrated: smallest |gap|
+            best_cal = by_gap[:n_pick]
+            gap_best_max = max(abs(g) for _, g in best_cal) if best_cal else 0.01
+            for rank, (ri, gap) in enumerate(best_cal):
+                t = 1.0 - rank / max(n_pick, 1)
+                alpha = 0.08 + t * 0.14
+                conf_styles[(conf_key, ri)] = f'background:rgba(42,140,143,{alpha:.2f})'
+            # Worst overconfident: largest gap (most positive)
+            by_overconf = sorted(gaps, key=lambda x: x[1], reverse=True)
+            worst_oc = by_overconf[:n_pick]
+            gap_worst_max = worst_oc[0][1] if worst_oc else 0.2
+            gap_worst_min = worst_oc[-1][1] if worst_oc else 0.1
+            oc_range = max(gap_worst_max - gap_worst_min, 0.01)
+            for ri, gap in worst_oc:
+                if (conf_key, ri) in conf_styles:
+                    continue  # already marked as well-calibrated
+                t = (gap - gap_worst_min) / oc_range
+                t = max(0.0, min(1.0, t))
+                r = int(200 + t * 40)
+                g = int(120 - t * 80)
+                b = int(80 - t * 50)
+                alpha = 0.10 + t * 0.22
+                conf_styles[(conf_key, ri)] = f'background:rgba({r},{g},{b},{alpha:.2f})'
+
+        def _conf_highlight(conf_key: str, row_idx: int) -> str:
+            s = conf_styles.get((conf_key, row_idx))
+            return f' style="{s}"' if s else ""
 
         html = """<style>
         .cond-table { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 13px; }
@@ -837,8 +936,8 @@ def tab_comparison() -> None:
             html += "<th>Acc</th><th>Conf</th>"
         html += "</tr>"
 
-        # Data rows with model-colored left border and heatmap accuracy cells
-        for row in pivot_data:
+        # Data rows with model-colored left border and landmark highlights
+        for ri, row in enumerate(pivot_data):
             model_val = row.get("Model", "")
             border_color = MODEL_COLORS.get(model_val, "#E5E0DB")
             html += f'<tr style="border-left:4px solid {border_color}">'
@@ -846,13 +945,10 @@ def tab_comparison() -> None:
                 html += f'<td class="factor">{row.get(h, "")}</td>'
             for acc_key, conf_key in [("Accuracy", "Confidence"), ("Acc Easy", "Conf Easy"), ("Acc Hard", "Conf Hard")]:
                 acc_v = row[acc_key]
-                bold = " font-weight:600;" if acc_v == best.get(acc_key) else ""
-                bg = _acc_bg(acc_v)
-                if bold and bg:
-                    bg = bg.replace('"', f'{bold}"')
-                elif bold:
-                    bg = f' style="{bold}"'
-                html += f'<td{bg}>{acc_v}</td><td>{row[conf_key]}</td>'
+                conf_v = row[conf_key]
+                acc_bg = _acc_highlight(acc_v, acc_key)
+                conf_bg = _conf_highlight(conf_key, ri)
+                html += f'<td{acc_bg}>{acc_v}</td><td{conf_bg}>{conf_v}</td>'
             html += f'<td>{row["N"]}</td>'
             html += "</tr>"
 
@@ -1699,7 +1795,7 @@ def tab_signals() -> None:
         _html_table(cross_rows)
         st.markdown("When modes **agree**, accuracy is high. When they **disagree**, accuracy drops — the disagreement itself is a strong uncertainty signal.")
     else:
-        st.info("Need at least 2 modes (direct, CoT, think) with noshuffle runs to compare.")
+        st.info("Need at least 2 modes (direct, CoT, think) with base runs (no shuffle/paraphrase) to compare.")
 
     # --- Position loyalty (shuffle runs only) ---
     st.subheader("Position Loyalty")
