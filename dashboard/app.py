@@ -449,10 +449,20 @@ def build_analysis_cache() -> dict:
 
     signals = load_signals()
 
+    adaptive_data = None
+    _adaptive_path = DASHBOARD_DIR / "adaptive_cache.pkl"
+    if _adaptive_path.exists():
+        try:
+            with open(_adaptive_path, "rb") as _af:
+                adaptive_data = _pickle.load(_af)
+        except Exception:
+            pass
+
     cache = {
         "df": full_df,
         "run_meta": run_meta,
         "signals_df": signals,
+        "adaptive": adaptive_data,
         "built_at": datetime.now().isoformat(),
     }
 
@@ -2109,6 +2119,10 @@ def tab_adaptive() -> None:
         cache = _load_adaptive_cache(_mtime)
         if cache and cache.get("n_max") != n_max:
             cache = None
+    if cache is None and analysis_cache is not None and analysis_cache.get("adaptive"):
+        cache = analysis_cache["adaptive"]
+        if cache and cache.get("n_max") != n_max:
+            cache = None
 
     if cache is not None:
         model_data = cache["model_data"]
@@ -2120,6 +2134,10 @@ def tab_adaptive() -> None:
         st.caption(f"Using precomputed cache ({_age_str}). "
                    f"Run `python dashboard/precompute_adaptive.py` to refresh.")
     else:
+        if not HAS_LOCAL_FILES:
+            st.info("Adaptive sampling data not available in the analysis cache. "
+                    "Rebuild the cache locally with the adaptive cache present.")
+            return
         cal_grids_cached = {}
 
         # --- Discover runs ---
@@ -2578,11 +2596,11 @@ def tab_adaptive() -> None:
         "logprob vectors. This is the honest baseline — no knobs turned."
     )
 
-    # --- Cross-method highlighting (compare 5 methods per model at each τ) ---
+    # --- Cross-method highlighting: only tag best & worst across 5 methods ---
     def _make_cross_method_highlight(model_data_src, model_names_src, methods_src,
                                      tau_vals, keys_good, keys_bad):
-        """For each (model, tau, metric): find range across 5 methods, highlight best."""
-        ranges = {}
+        """For each (model, tau, metric): highlight only the best and worst method."""
+        best_worst = {}
         for mn in model_names_src:
             for ti, tau in enumerate(tau_vals):
                 if tau == 0.0:
@@ -2597,24 +2615,26 @@ def tab_adaptive() -> None:
                                 vals.append(v)
                     if len(vals) >= 2:
                         lo, hi = min(vals), max(vals)
-                        if hi - lo >= 0.001:
-                            ranges[(mn, ti, k)] = (lo, hi)
+                        if hi - lo >= 0.005:
+                            best_worst[(mn, ti, k)] = (lo, hi)
         bad_set = set(keys_bad)
 
         def _hl(mn, ti, metric, value, skip=False):
             if skip or value is None:
                 return ""
             key = (mn, ti, metric)
-            if key not in ranges:
+            if key not in best_worst:
                 return ""
-            lo, hi = ranges[key]
-            t = (value - lo) / (hi - lo)
-            if t < 0.25:
-                return ""
-            opacity = 0.06 + 0.18 * min(1.0, (t - 0.25) / 0.75)
+            lo, hi = best_worst[key]
+            is_best = abs(value - hi) < 1e-6
+            is_worst = abs(value - lo) < 1e-6
             if metric in bad_set:
-                return f' style="background:rgba(202,74,122,{opacity:.2f})"'
-            return f' style="background:rgba(42,140,143,{opacity:.2f})"'
+                is_best, is_worst = is_worst, is_best
+            if is_best:
+                return ' style="background:rgba(42,140,143,0.18)"'
+            if is_worst:
+                return ' style="background:rgba(202,74,122,0.14)"'
+            return ""
         return _hl
 
     _cs = _make_cross_method_highlight(
