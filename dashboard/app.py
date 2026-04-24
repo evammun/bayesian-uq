@@ -3185,31 +3185,70 @@ def tab_adaptive() -> None:
             ))
             st.plotly_chart(_round_hover(fig2), width="stretch")
 
-        # --- Pareto tables ---
-        def _pareto_table(pareto_list):
-            h = _at_css + '<table class="at"><tr>'
-            h += '<th>T</th><th>\u03c4</th><th>N</th><th>cap</th>'
-            h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
-            for r in pareto_list:
-                h += f'<tr><td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
-                h += f'<td>{r["avg_n"]:.2f}</td>'
-                h += f'<td>{r["cap_rate"]:.1%}</td>'
-                h += f'<td>{r["acc"]:.1%}</td>'
-                h += f'<td>{r["acc_esc"]:.1%}</td>'
-                h += f'<td>{r["total_cost"]:.1f}</td></tr>'
-            h += '</table>'
-            return h
+        # --- Pareto tables: one section per model, 5 methods side by side ---
+        st.markdown("**Pareto Frontier Tables (by model)**")
 
-        for method_label, mkey in METHODS:
-            st.markdown(f"**{method_label} \u2014 Pareto Frontiers**")
-            cols = st.columns(len(model_names))
-            for ci, mn in enumerate(model_names):
-                with cols[ci]:
-                    st.markdown(f"*{mn}*")
-                    st.markdown(
-                        _pareto_table(cal_pareto[(mkey, mn)]),
-                        unsafe_allow_html=True,
+        _pareto_css = """<style>
+        .pt { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 11px; }
+        .pt th { padding: 3px 5px; text-align: center; font-weight: 600; font-size: 11px; }
+        .pt td { padding: 3px 5px; text-align: center; border-bottom: 1px solid #E5E0DB; font-size: 11px; }
+        .pt tr:hover { background: #F5F3F1; }
+        .pt .best-row td { font-weight: 700; }
+        .pt .mhdr { border-bottom: 2px solid; font-size: 12px; letter-spacing: 0.02em; }
+        .pt .winner { font-size: 10px; padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
+        </style>"""
+
+        for mn in model_names:
+            st.markdown(f"##### {mn}")
+
+            peak_by_method = {}
+            efficiency_by_method = {}
+            for _, mkey in METHODS:
+                pts = cal_pareto.get((mkey, mn), [])
+                if pts:
+                    best_pt = max(pts, key=lambda r: r["acc_esc"])
+                    peak_by_method[mkey] = best_pt["acc_esc"]
+                    efficiency_by_method[mkey] = max(
+                        r["acc_esc"] / max(r["total_cost"], 0.1) for r in pts
                     )
+
+            best_peak_method = max(peak_by_method, key=peak_by_method.get) if peak_by_method else None
+            best_eff_method = max(efficiency_by_method, key=efficiency_by_method.get) if efficiency_by_method else None
+
+            cols = st.columns(len(METHODS))
+            for ci, (method_label, mkey) in enumerate(METHODS):
+                with cols[ci]:
+                    mcolor = MCOLORS[mkey]
+                    badges = ""
+                    if mkey == best_peak_method:
+                        badges += f'<span class="winner" style="background:{mcolor};color:white">peak</span>'
+                    if mkey == best_eff_method and mkey != best_peak_method:
+                        badges += f'<span class="winner" style="background:{mcolor};color:white">eff</span>'
+
+                    pts = cal_pareto.get((mkey, mn), [])
+                    best_acc = max((r["acc_esc"] for r in pts), default=-1)
+
+                    h = _pareto_css + f'<table class="pt">'
+                    h += f'<tr><th colspan="6" class="mhdr" style="border-color:{mcolor};color:{mcolor}">'
+                    h += f'{method_label}{badges}</th></tr>'
+                    h += '<tr><th>T</th><th>\u03c4</th><th>N\u0304</th><th>cap</th>'
+                    h += '<th>+esc</th><th>cost</th></tr>'
+                    for r in pts:
+                        is_best = abs(r["acc_esc"] - best_acc) < 1e-6
+                        cls = ' class="best-row"' if is_best else ""
+                        acc_bg = ""
+                        if is_best and mkey == best_peak_method:
+                            acc_bg = f' style="background:rgba(42,140,143,0.18)"'
+                        h += f'<tr{cls}>'
+                        h += f'<td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
+                        h += f'<td>{r["avg_n"]:.1f}</td>'
+                        h += f'<td>{r["cap_rate"]:.0%}</td>'
+                        h += f'<td{acc_bg}>{r["acc_esc"]:.1%}</td>'
+                        h += f'<td>{r["total_cost"]:.1f}</td></tr>'
+                    if not pts:
+                        h += '<tr><td colspan="6">-</td></tr>'
+                    h += '</table>'
+                    st.markdown(h, unsafe_allow_html=True)
     else:
         st.info("No temperature calibration data. "
                 "Run `python dashboard/precompute_adaptive.py` or click "
