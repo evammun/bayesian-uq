@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import pickle
 import re
@@ -29,6 +30,28 @@ from scipy.stats import chi2 as _chi2, gamma as _gamma, norm as _norm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_ROOT / "results"
 CACHE_PATH = Path(__file__).resolve().parent / "adaptive_cache.pkl"
+LOG_PATH = Path(__file__).resolve().parent / "precompute_adaptive.log"
+
+# File + console logging so we can tail the log while the script runs
+_fh = logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8")
+_fh.setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[_fh, logging.StreamHandler()],
+)
+log = logging.getLogger(__name__)
+
+
+class _FlushHandler(logging.Handler):
+    """Flushes all handlers after every log record so tail -f works."""
+    def emit(self, record):
+        for h in logging.root.handlers:
+            h.flush()
+
+
+logging.root.addHandler(_FlushHandler())
 
 # ---------------------------------------------------------------------------
 # Data loading (duplicated from app.py to keep script standalone)
@@ -674,10 +697,10 @@ def run_precompute(n_max: int = 10) -> dict:
     t0 = time.time()
 
     # --- Load data ---
-    print("Loading result files...")
+    log.info("Loading result files...")
     result_files = get_result_files()
     if not result_files:
-        print("No result files found.")
+        log.info("No result files found.")
         return {}
 
     all_data: dict[str, dict] = {}
@@ -686,24 +709,24 @@ def run_precompute(n_max: int = 10) -> dict:
         if data:
             prefix = _extract_run_prefix(fp.stem)
             all_data[prefix] = data
-    print(f"  Loaded {len(all_data)} runs.")
+    log.info(f"  Loaded {len(all_data)} runs.")
 
     rows = results_to_df(all_data)
-    print(f"  {len(rows)} question rows.")
+    log.info(f"  {len(rows)} question rows.")
 
     model_data = build_questions_data(rows, n_max)
     if not model_data:
-        print("No models with shuffle direct runs found.")
+        log.info("No models with shuffle direct runs found.")
         return {}
 
     model_names = list(model_data.keys())
-    print(f"  Models: {', '.join(model_names)}")
+    log.info(f"  Models: {', '.join(model_names)}")
 
     # --- Raw trajectories (T=1) ---
-    print("\nComputing raw trajectories (T=1)...")
+    log.info("\nComputing raw trajectories (T=1)...")
     for mn, mdata in model_data.items():
         qs = mdata["questions"]
-        print(f"  {mn}: {len(qs)} questions...")
+        log.info(f"  {mn}: {len(qs)} questions...")
         mdata["prod_trajs"] = [
             _compute_trajectory(q["probs"], "product", 1.0) for q in qs
         ]
@@ -720,7 +743,7 @@ def run_precompute(n_max: int = 10) -> dict:
 
     # --- Raw tau sweep ---
     tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
-    print("\nSweeping raw tau values...")
+    log.info("\nSweeping raw tau values...")
     for mn, mdata in model_data.items():
         qs, n_q_m = mdata["questions"], mdata["n_q"]
         er1, er2 = mdata["esc1_run"], mdata["esc2_run"]
@@ -735,7 +758,7 @@ def run_precompute(n_max: int = 10) -> dict:
     # --- Temperature grid sweep (all methods) ---
     temps_grid = np.arange(1.0, 5.5, 0.5)
     taus_grid = [0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99]
-    print("\nTemperature grid sweep (this is the slow part)...")
+    log.info("\nTemperature grid sweep (this is the slow part)...")
     cal_grids: dict[tuple[str, str], list] = {}
     total_sweeps = len(METHODS) * len(model_data)
     done = 0
@@ -743,16 +766,18 @@ def run_precompute(n_max: int = 10) -> dict:
         qs, n_q_m = mdata["questions"], mdata["n_q"]
         for method_label, mkey in METHODS:
             done += 1
-            print(f"  [{done}/{total_sweeps}] {mn} × {method_label}...")
+            t_sweep = time.time()
+            log.info(f"  [{done}/{total_sweeps}] {mn} × {method_label} ({n_q_m} qs × {len(temps_grid)} temps × {len(taus_grid)} taus)...")
             method = MKEY_TO_METHOD[mkey]
             cal_grids[(mkey, mn)] = _grid_sweep_all(
                 qs, method, temps_grid, taus_grid, n_q_m,
                 mdata["esc1_run"], mdata["esc2_run"],
             )
+            log.info(f"    done in {time.time() - t_sweep:.1f}s")
 
     # --- Compute calibrated tau sweeps at optimal T ---
     tau_values_cal = [0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99]
-    print("\nComputing calibrated tau sweeps at optimal T...")
+    log.info("\nComputing calibrated tau sweeps at optimal T...")
     cal_opt: dict = {}
     cal_model_data: dict = {}
 
@@ -765,7 +790,7 @@ def run_precompute(n_max: int = 10) -> dict:
     # Dashboard will derive Pareto + optimal T on the fly from the cached grid (cheap).
 
     elapsed = time.time() - t0
-    print(f"\nDone in {elapsed:.1f}s.")
+    log.info(f"\nDone in {elapsed:.1f}s.")
 
     # --- Build cache ---
     # Strip trajectories from model_data to save space (they're large).
@@ -807,14 +832,14 @@ def main():
 
     cache = run_precompute(n_max=args.n_max)
     if not cache:
-        print("Nothing to cache.")
+        log.info("Nothing to cache.")
         return
 
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CACHE_PATH, "wb") as f:
         pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
     size_mb = CACHE_PATH.stat().st_size / (1024 * 1024)
-    print(f"Cache saved to {CACHE_PATH} ({size_mb:.1f} MB)")
+    log.info(f"Cache saved to {CACHE_PATH} ({size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":

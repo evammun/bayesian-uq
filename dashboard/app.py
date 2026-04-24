@@ -435,7 +435,7 @@ if auto_refresh:
 
 # Recalculate adaptive sampling cache
 st.sidebar.divider()
-st.sidebar.caption("Adaptive cache: ~10 min to recompute")
+st.sidebar.caption("Adaptive cache: ~36 min to recompute")
 if st.sidebar.button("Recalculate Adaptive Cache", key="recalc_adaptive"):
     import subprocess, sys
     _script = Path(__file__).resolve().parent / "precompute_adaptive.py"
