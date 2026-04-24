@@ -45,9 +45,6 @@ DEEP_BLUE = "#4B7C92"
 SLATE = "#5B5E8D"
 ROSE = "#CA4A7A"
 GOLD = "#D4A017"
-INDIGO = "#6366F1"
-EMERALD = "#50C878"
-PURPLE = "#7B68AE"
 PURPLE = "#6C4F7F"
 MAGENTA = "#9B4F8F"
 SOFT_TEAL = "#65B2B5"
@@ -1978,7 +1975,7 @@ def tab_adaptive() -> None:
     METHODS = [("Product", "prod"), ("Sum", "sum"), ("Dirichlet MLE", "mle"),
                ("MoM", "mom"), ("MoM + Bayes", "mom_bayes")]
     MCOLORS = {"prod": TEAL, "sum": ROSE, "mle": GOLD,
-               "mom": INDIGO, "mom_bayes": EMERALD}
+               "mom": SLATE, "mom_bayes": PURPLE}
     MKEY_TO_METHOD = {"prod": "product", "sum": "sum", "mle": "mle",
                       "mom": "mom", "mom_bayes": "mom_bayes"}
     tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
@@ -1987,16 +1984,22 @@ def tab_adaptive() -> None:
     # --- Selectors ---
     n_max = st.select_slider("N_max", options=list(range(2, 11)), value=10)
 
-    # --- Try to load precomputed cache ---
+    # --- Try to load precomputed cache (cached to avoid re-reading 7MB on every refresh) ---
     _cache_path = Path(__file__).resolve().parent / "adaptive_cache.pkl"
-    cache = None
-    if _cache_path.exists():
+
+    @st.cache_data(ttl=300)
+    def _load_adaptive_cache(_mtime: float) -> dict | None:
         try:
             with open(_cache_path, "rb") as _f:
-                cache = _pickle.load(_f)
-            if cache.get("n_max") != n_max:
-                cache = None
+                return _pickle.load(_f)
         except Exception:
+            return None
+
+    cache = None
+    if _cache_path.exists():
+        _mtime = _cache_path.stat().st_mtime
+        cache = _load_adaptive_cache(_mtime)
+        if cache and cache.get("n_max") != n_max:
             cache = None
 
     if cache is not None:
@@ -2724,14 +2727,17 @@ def tab_adaptive() -> None:
 
     for mn in model_names:
         mdata = model_data[mn]
-        fig = go.Figure()
+        col_base, col_esc = st.columns(2)
+
+        fig_base = go.Figure()
+        fig_esc = go.Figure()
         for method_label, mkey in METHODS:
             color = MCOLORS[mkey]
             results = mdata[f"{mkey}_results"]
             xs = [r["avg_n"] for r in results]
-            fig.add_trace(go.Scatter(
+            fig_base.add_trace(go.Scatter(
                 x=xs, y=[r["acc"] for r in results],
-                mode="lines+markers", name=f"{method_label} (base)",
+                mode="lines+markers", name=method_label,
                 line=dict(color=color, width=2.5), marker=dict(size=8),
                 hovertemplate=(
                     f"{method_label} \u03c4=%{{customdata:.2f}}<br>"
@@ -2742,31 +2748,48 @@ def tab_adaptive() -> None:
             if mdata["has_esc2"]:
                 ys = [r["esc2"] for r in results if r["esc2"] is not None]
                 if ys:
-                    fig.add_trace(go.Scatter(
+                    fig_esc.add_trace(go.Scatter(
                         x=xs[:len(ys)], y=ys,
                         mode="lines+markers", name=f"{method_label} +think",
-                        line=dict(color=color, width=2, dash="dash"),
-                        marker=dict(size=6, symbol="diamond"),
+                        line=dict(color=color, width=2.5),
+                        marker=dict(size=8, symbol="diamond"),
+                        hovertemplate=(
+                            f"{method_label} +think \u03c4=%{{customdata:.2f}}<br>"
+                            "avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>"
+                        ),
+                        customdata=[r["tau"] for r in results[:len(ys)]],
                     ))
         baseline = mdata["baseline_acc"]
-        fig.add_trace(go.Scatter(
+        _bl_kwargs = dict(
             x=[n_max], y=[baseline],
             mode="markers", name=f"All-{n_max} baseline",
             marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
-        ))
-        fig.add_hline(
+            showlegend=True,
+        )
+        _hl_kwargs = dict(
             y=baseline, line_dash="dash", line_color=GRAY_LIGHT,
             annotation_text=f"all-{n_max} baseline ({baseline:.1%})",
             annotation_position="bottom right",
         )
-        fig.update_layout(**_base_layout(
-            title=f"{mn} — Accuracy vs Compute",
-            xaxis_title="avg_N", yaxis_title="Accuracy",
-            height=350,
+        _layout_kwargs = dict(
+            xaxis_title="avg_N", yaxis_title="Accuracy", height=350,
             yaxis=dict(tickformat=".0%", gridcolor=GRID),
             xaxis=dict(range=[0.5, n_max + 0.5], gridcolor=GRID),
-        ))
-        st.plotly_chart(_round_hover(fig), width="stretch")
+        )
+        fig_base.add_trace(go.Scatter(**_bl_kwargs))
+        fig_base.add_hline(**_hl_kwargs)
+        fig_base.update_layout(**_base_layout(
+            title=f"{mn} — Base Accuracy", **_layout_kwargs))
+
+        fig_esc.add_trace(go.Scatter(**_bl_kwargs))
+        fig_esc.add_hline(**_hl_kwargs)
+        fig_esc.update_layout(**_base_layout(
+            title=f"{mn} — +Think Escalation", **_layout_kwargs))
+
+        with col_base:
+            st.plotly_chart(_round_hover(fig_base), use_container_width=True)
+        with col_esc:
+            st.plotly_chart(_round_hover(fig_esc), use_container_width=True)
 
     # ===================================================================
     # SECTION 2: TEMPERATURE CALIBRATION
@@ -2906,13 +2929,16 @@ def tab_adaptive() -> None:
         st.markdown("**Accuracy vs Compute (at optimal T)**")
         for mn in model_names:
             cmd = cal_model_data[mn]
-            fig = go.Figure()
+            col_base_c, col_esc_c = st.columns(2)
+
+            fig_base_c = go.Figure()
+            fig_esc_c = go.Figure()
             for method_label, mkey in METHODS:
                 color = MCOLORS[mkey]
                 results = cmd[f"{mkey}_results"]
                 opt_T = cal_opt.get((mkey, mn), {}).get("T", 1.0)
                 xs = [r["avg_n"] for r in results]
-                fig.add_trace(go.Scatter(
+                fig_base_c.add_trace(go.Scatter(
                     x=xs, y=[r["acc"] for r in results],
                     mode="lines+markers",
                     name=f"{method_label} T={opt_T:.1f}",
@@ -2927,32 +2953,49 @@ def tab_adaptive() -> None:
                 if cmd["has_esc2"]:
                     ys = [r["esc2"] for r in results if r["esc2"] is not None]
                     if ys:
-                        fig.add_trace(go.Scatter(
+                        fig_esc_c.add_trace(go.Scatter(
                             x=xs[:len(ys)], y=ys,
                             mode="lines+markers",
-                            name=f"{method_label} +think",
-                            line=dict(color=color, width=2, dash="dash"),
-                            marker=dict(size=6, symbol="diamond"),
+                            name=f"{method_label} +think T={opt_T:.1f}",
+                            line=dict(color=color, width=2.5),
+                            marker=dict(size=8, symbol="diamond"),
+                            hovertemplate=(
+                                f"{method_label} +think T={opt_T:.1f} "
+                                "\u03c4=%{customdata:.2f}<br>"
+                                "avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>"
+                            ),
+                            customdata=[r["tau"] for r in results[:len(ys)]],
                         ))
             baseline = cmd["baseline_acc"]
-            fig.add_trace(go.Scatter(
+            _bl_c = dict(
                 x=[n_max], y=[baseline],
                 mode="markers", name=f"All-{n_max} baseline",
                 marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
-            ))
-            fig.add_hline(
+            )
+            _hl_c = dict(
                 y=baseline, line_dash="dash", line_color=GRAY_LIGHT,
                 annotation_text=f"all-{n_max} baseline ({baseline:.1%})",
                 annotation_position="bottom right",
             )
-            fig.update_layout(**_base_layout(
-                title=f"{mn} \u2014 Accuracy vs Compute (calibrated)",
-                xaxis_title="avg_N", yaxis_title="Accuracy",
-                height=350,
+            _lay_c = dict(
+                xaxis_title="avg_N", yaxis_title="Accuracy", height=350,
                 yaxis=dict(tickformat=".0%", gridcolor=GRID),
                 xaxis=dict(range=[0.5, n_max + 0.5], gridcolor=GRID),
-            ))
-            st.plotly_chart(_round_hover(fig), width="stretch")
+            )
+            fig_base_c.add_trace(go.Scatter(**_bl_c))
+            fig_base_c.add_hline(**_hl_c)
+            fig_base_c.update_layout(**_base_layout(
+                title=f"{mn} \u2014 Base (calibrated)", **_lay_c))
+
+            fig_esc_c.add_trace(go.Scatter(**_bl_c))
+            fig_esc_c.add_hline(**_hl_c)
+            fig_esc_c.update_layout(**_base_layout(
+                title=f"{mn} \u2014 +Think (calibrated)", **_lay_c))
+
+            with col_base_c:
+                st.plotly_chart(_round_hover(fig_base_c), use_container_width=True)
+            with col_esc_c:
+                st.plotly_chart(_round_hover(fig_esc_c), use_container_width=True)
 
         # --- Pareto frontier charts (all methods sweep T) ---
         st.markdown("**Pareto Frontiers (all methods sweep T \u00d7 \u03c4)**")
@@ -3050,6 +3093,15 @@ def tab_adaptive() -> None:
     st.subheader("Export Results")
     import json as _json
 
+    def _make_serializable(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return float(obj) if hasattr(obj, '__float__') else str(obj)
+
     export_data: dict = {"n_max": n_max, "models": {}}
     for mn in model_names:
         mdata = model_data[mn]
@@ -3064,11 +3116,21 @@ def tab_adaptive() -> None:
             m_export["calibrated"] = {}
             for _, mkey in METHODS:
                 opt = cal_opt.get((mkey, mn), {})
+                pareto_clean = []
+                for r in cal_pareto.get((mkey, mn), []):
+                    pareto_clean.append({
+                        "T": r.get("T"), "tau": r.get("tau"),
+                        "avg_n": r.get("avg_n"), "cap_rate": r.get("cap_rate"),
+                        "acc": r.get("acc"), "acc_esc": r.get("acc_esc"),
+                        "total_cost": r.get("total_cost"),
+                    })
                 m_export["calibrated"][mkey] = {
                     "opt_T": opt.get("T"),
                     "opt_tau": opt.get("tau"),
                     "acc_esc": opt.get("acc_esc"),
-                    "pareto": cal_pareto.get((mkey, mn), []),
+                    "avg_n": opt.get("avg_n"),
+                    "cap_rate": opt.get("cap_rate"),
+                    "pareto": pareto_clean,
                 }
                 if mn in cal_model_data:
                     m_export["calibrated"][mkey]["tau_sweep"] = (
@@ -3076,7 +3138,7 @@ def tab_adaptive() -> None:
                     )
         export_data["models"][mn] = m_export
 
-    export_json = _json.dumps(export_data, indent=2, default=float)
+    export_json = _json.dumps(export_data, indent=2, default=_make_serializable)
     export_path = Path(
         r"C:\Users\evama\Dropbox\Family Room\Projects\bayesian-uq"
         r"\paper\results\adaptive_sampling_export.json"

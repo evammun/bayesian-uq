@@ -1,0 +1,292 @@
+EXTRACTED PAPER CONTENT
+=======================
+Source: https://openreview.net/pdf?id=JfiwaTxhI8
+Downloaded: 2026-04-24
+Published as: Conference paper at ICLR 2026
+
+================================================================================
+1. TITLE AND AUTHORS
+================================================================================
+
+Title: Epistemic Uncertainty Quantification To Improve Decisions From Black-Box Models
+
+Authors:
+- Sebastien Melo (1)
+- Gael Varoquaux (1,2)
+- Marine le Morvan (1)
+
+Affiliations:
+1 - Soda team, Inria Saclay, Palaiseau, France
+2 - :probabl., Paris, France
+
+Contact: {sebastien.melo,gael.varoquaux,marine.le-morvan}@inria.fr
+Code: https://github.com/soda-inria/epistemic-uq-decision
+
+================================================================================
+2. ABSTRACT
+================================================================================
+
+Distinguishing epistemic uncertainty (model ignorance) from aleatoric uncertainty
+(task randomness) is critical for reliable AI systems, yet standard confidence
+evaluation metrics capture different and incomplete aspects of uncertainty. While
+AUC and accuracy measure predictive signal, proper scoring rules assess overall
+uncertainty, and calibration metrics isolate part of the epistemic uncertainty but
+ignore within-bin heterogeneity of errors, known as grouping loss. We bridge
+this evaluation gap by introducing asymptotically consistent and sample-efficient
+estimators of the grouping loss and excess decision risk, providing a fine-grained
+assessment of epistemic uncertainty that complements existing calibration metrics.
+Applied to LLM question-answering with inherent aleatoric noise, our estimators
+reveal substantial grouping loss which decreases with model scale and instruction
+tuning. Their local nature enables automatic identification of subgroups with
+systematic over- or under-confidence, supporting interpretable confidence audits.
+Finally, we leverage these estimates to design LLM cascades that defer high excess
+decision risk predictions to stronger models, achieving higher accuracy at lower
+cost than competing approaches.
+
+================================================================================
+3. METHODOLOGY SUMMARY
+================================================================================
+
+CORE PROBLEM:
+Standard calibration metrics (like ECE) only capture part of epistemic uncertainty.
+A model can be well-calibrated on average but systematically overconfident on some
+subgroups and underconfident on others -- the two effects cancel out. The authors
+call this hidden heterogeneity "grouping loss" (GL).
+
+PROPER SCORING RULE DECOMPOSITION (Theorem 1):
+Expected Loss = Calibration Loss (CL) + Grouping Loss (GL) + Aleatoric Loss
+Where Epistemic Loss = CL + GL.
+Key insight: calibration alone is an incomplete picture of epistemic error.
+
+GROUPING LOSS DEFINITION:
+GL = E[(f*(X) - c o f(X))^2] = E_p[V[f*(X) | f(X) = p]]
+This measures the variance of true probabilities within a level set of the model f.
+A model that assigns the same confidence to inputs with different true probabilities
+has high grouping loss.
+
+THEIR ESTIMATORS:
+
+(a) Grouping Loss Estimator (GL_lb):
+- Uses partition-based estimation instead of traditional binning
+- Builds an "honest regression tree" (Wager & Athey, 2017) on the residuals
+  R = Y - c o f(X), where c is the calibration function (Platt scaling)
+- The tree partitions the input space to minimize intra-leaf variance of residuals
+- Debiased estimator: GL_lb = sum_j p_hat_j * (r_hat_j^2 - v_hat_j / n_j)
+- Asymptotically consistent: converges to true GL as sample size increases
+- More sample-efficient than prior binning-based methods (Perez-Lebel et al., 2023)
+
+(b) Pointwise Excess Decision Risk Estimator (R_hat):
+- Estimates per-sample epistemic decision risk
+- R_f(x) = Lambda_Delta * |f*(X) - t*| when model and oracle disagree, else 0
+- Uses the same partition-based residual estimate to approximate f*(X)
+- Key property: POINTWISE -- gives a risk score for each individual input
+- This is what enables the LLM cascade application
+
+PARTITION CONSTRUCTION:
+- Honest regression trees: split data into fitting set (40%) and evaluation set (50%)
+  plus calibration set (10%)
+- Tree structure learned on fitting set, leaf estimates computed on evaluation set
+- This prevents overfitting and provides unbiased leaf estimates
+- Unlimited depth, minimum 15 samples per leaf
+- For LLMs: partition built on query features or embeddings
+
+CALIBRATION:
+- Platt scaling used for calibration throughout
+- Calibration is applied first, then residuals are analyzed for grouping loss
+
+EXPERIMENTAL SETUP:
+
+(a) Semi-synthetic validation (Section 4.1):
+- Weather dataset from TabReD (16M+ samples)
+- Gradient Boosted tree for confidence scores
+- Validates that GL_lb converges to true GL
+
+(b) LLM Grouping Loss Audit (Section 4.2):
+- Folktexts benchmark (Cruz et al., 2024): tabular data converted to natural
+  language questions with binary-choice answers
+- 5 ACS datasets: ACSIncome, ACSEmployment, ACSMobility, ACSTravelTime,
+  ACSPublicCoverage
+- Tasks have inherent aleatoric uncertainty (outcome can't be determined from input)
+- 27 open-source LLMs, 1B to 70B parameters
+- Confidence scores from next-token logprobs: P(yes) / (P(yes) + P(no))
+- Zero-shot evaluation
+
+(c) LLM Cascades (Section 4.3):
+- Cascade pool: Llama 3 instruction-tuned family (1B, 3B, 8B, 70B), Phi4 (14B),
+  Gemma 2 (27B), Mixtral 8x7B
+- 120 different cascade pool configurations across 5 datasets
+- Compared against: predictive router (Hu et al., 2024), calibration-only cascade,
+  and biggest-model baseline
+
+================================================================================
+4. KEY FINDINGS / RESULTS
+================================================================================
+
+GROUPING LOSS IN LLMS:
+- LLMs exhibit substantial grouping loss (GL), meaning their confidence scores
+  hide significant within-bin heterogeneity
+- GL decreases with model size (clear size effect across 1B to 70B)
+- Instruction-tuned models have lower (or equal) GL compared to base models
+- Instruction tuning polarizes answer distributions and induces overconfidence
+  (confirming Cruz et al., 2024) but reduces subgroup-specific biases
+- Even after calibration, systematic biases remain for demographic subgroups
+  (e.g., experienced graduate women's income underestimated)
+
+ESTIMATOR QUALITY:
+- Their GL_lb estimator converges to true GL from below (lower bound)
+- More sample-efficient than Perez-Lebel et al. (2023) binning-based method
+- Binning-free approach captures more heterogeneity in confidence scores
+
+LLM CASCADES:
+- Their epistemic risk cascade outperforms the largest model in the pool at a
+  fraction of its cost: on average +6% accuracy gain at 46% of cost
+- Accounting for full epistemic risk (CL + GL) vs. calibration-only (CL) yields
+  up to 15% accuracy improvement on high-GL datasets like ACSEmployment
+- Outperforms predictive router baseline (Hu et al., 2024) in 60% of cases,
+  achieving strict Pareto optimality (higher accuracy at lower cost)
+- Robust to training set size: with 6,000+ samples, performance is consistent;
+  even with 2,000 samples, +12% accuracy on high-GL datasets
+- At high willingness-to-pay: +4% accuracy over Llama 70B at ~30% of its cost
+
+SUBGROUP IDENTIFICATION:
+- The tree-based partition automatically identifies over/under-confident subgroups
+- Example: Llama 3.3 70B Instruct on ACSIncome:
+  * Group 37 (young graduate women, age <= 24): underconfident
+  * Group 62 (experienced graduate women, professional degree, age >= 37): overconfident
+- These local biases are invisible to global calibration metrics
+
+================================================================================
+5. RELEVANCE TO OUR WORK (Bayesian UQ Project)
+================================================================================
+
+--- UNCERTAINTY QUANTIFICATION ---
+
+HIGH RELEVANCE. This paper directly addresses the gap between calibration and full
+epistemic uncertainty. Their key concept:
+
+"A classifier may be well-calibrated overall yet overconfident on some subgroups
+and underconfident on others, with the two effects canceling out."
+
+This maps directly to our finding about "fragile confidence" -- high single-prompt
+confidence + low cross-permutation consistency. Their grouping loss is essentially
+measuring the same phenomenon we detect through permutation disagreement: the model
+assigns similar confidence to inputs where it should be more or less certain.
+
+Their decomposition: Epistemic Loss = Calibration Loss + Grouping Loss
+Our finding: Per-query MSP ~0.91, ECE = 0.186, but mean across permutations is
+well-calibrated. The per-query overconfidence we observe IS grouping loss in their
+framework -- the model assigns high confidence to inputs that actually have different
+true probabilities.
+
+--- LOGPROB ANALYSIS ---
+
+MODERATE RELEVANCE. They extract confidence scores from next-token logprobs:
+P(yes) / (P(yes) + P(no)) for binary-choice questions. This is analogous to our
+approach of extracting [P(A), P(B), P(C), P(D)] from first-token logprobs.
+
+Key difference: they use binary outcomes (yes/no), we use 4-way MCQ. They don't
+do multiple queries per input -- they get one confidence score per question.
+
+They observe the same overconfidence phenomenon we do: instruction-tuned models
+produce overconfident logprobs. Their solution is Platt scaling (post-hoc
+recalibration); our solution is temperature scaling T=3.0 on the likelihood
+aggregation.
+
+--- ANSWER SHUFFLING / PERMUTATION ---
+
+NOT ADDRESSED. This paper does NOT use answer shuffling, permutation testing,
+or multiple queries per input. They query each LLM once per question and analyze
+the resulting confidence score. Their approach to measuring epistemic uncertainty
+is entirely different from ours:
+- OURS: Present the same question N times with shuffled answers, observe variance
+  in logprob vectors across permutations as a signal of epistemic uncertainty
+- THEIRS: Use a single confidence score per question, then use a learned partition
+  (honest tree) on input features to detect where confidence is miscalibrated
+
+This is a fundamentally different paradigm. We create artificial perturbations to
+probe uncertainty; they analyze the geometry of the confidence-vs-outcome space.
+
+--- BAYESIAN AGGREGATION ---
+
+NOT ADDRESSED. They do not aggregate multiple probability vectors. No Bayesian
+posterior, no product-of-experts, no Dirichlet aggregation. Their framework is
+frequentist: partition-based estimation with honest regression trees.
+
+--- ADAPTIVE STOPPING ---
+
+NOT DIRECTLY ADDRESSED, but their cascade framework is conceptually parallel.
+Their cascade: "query cheap model first, defer to expensive model if epistemic
+risk is high." This is analogous to our adaptive stopping: "query with few
+permutations first, do more if posterior is uncertain, escalate to think mode
+if still uncertain."
+
+Key parallel:
+- OURS: tau threshold on posterior confidence -> stop early or escalate
+- THEIRS: tau threshold on epistemic risk estimate -> keep cheap model or defer
+  to expensive model
+
+Their cascade achieves: cheaper compute by routing easy questions to small models
+Our adaptive stopping achieves: cheaper compute by stopping early on easy questions
+
+Both are fundamentally about "spend compute where uncertainty is high."
+
+--- CALIBRATION ---
+
+HIGH RELEVANCE. Their entire framework is built on the insight that calibration
+is necessary but insufficient. Specific connections:
+
+1. They use Platt scaling for calibration. We use temperature scaling (T=3.0).
+   Both are post-hoc recalibration methods addressing overconfident logprobs.
+
+2. Their grouping loss measures "hidden miscalibration within calibration bins."
+   Our permutation-based variance measures something similar: even after
+   temperature scaling makes the aggregate well-calibrated, individual queries
+   show high variance, indicating the model's confidence is fragile.
+
+3. Their finding that "instruction-tuning polarizes answer distributions" maps
+   to our finding about CoT/think mode collapsing logprobs (scaffolding absorption).
+
+4. ECE limitations: They explicitly argue ECE misses grouping loss. We found
+   ECE = 0.186 per-query but good calibration after aggregation. Both papers
+   show ECE alone is misleading.
+
+--- DECISION DEFERRAL / ROUTING ---
+
+HIGH RELEVANCE. Their LLM cascade is directly comparable to our routing framework:
+- They route between different-sized models (1B -> 3B -> 8B -> 70B)
+- We route between different inference modes (direct -> CoT -> think)
+- Both use uncertainty estimates to decide when to "spend more compute"
+- Their metric: pointwise excess decision risk estimate
+- Our metric: posterior confidence after N permutations
+
+Their cascade result (+6% accuracy at 46% cost) is a useful comparison point for
+our adaptive stopping results (avg_N=2.76 of 10, accuracy maintained, 15% escalated).
+
+================================================================================
+6. ADDITIONAL NOTES
+================================================================================
+
+VENUE: ICLR 2026 (top venue, published paper, not preprint)
+
+RELATED WORK THEY CITE THAT MAY BE USEFUL TO US:
+- Cruz et al. (2024): "Evaluating language models as risk scores" -- NeurIPS 2024,
+  uses Folktexts benchmark, found base LLMs underconfident, instruct overconfident
+- Bickford Smith et al. (2025): "Rethinking aleatoric and epistemic uncertainty"
+  -- ICML, criticizes common epistemic UQ definitions
+- Shorinwa et al. (2025): Survey on UQ for LLMs
+- Xia et al. (2025): Survey on UQ estimation methods for LLMs
+- Vashurin et al. (2025): Benchmarking UQ methods with lm-polygraph
+- Chen et al. (2024): "Reconfidencing LLM Uncertainty from the Grouping Loss
+  Perspective" -- EMNLP 2024 (same group, precursor paper)
+- Detommaso et al. (2024): "Multicalibration for confidence scoring in LLMs" -- ICML
+
+LIMITATIONS (implicit):
+- Binary classification only (yes/no) -- doesn't extend to multi-class in this paper
+- Requires labeled data to build the partition (needs ground truth outcomes)
+- Partition quality depends on having good input features
+- The honest tree approach needs a held-out fitting set (uses 40% of data for tree
+  structure), which may be data-hungry for small datasets
+- Evaluated only on tabular-to-text tasks (Folktexts) -- no reading comprehension,
+  no complex reasoning tasks
+
+GITHUB: https://github.com/soda-inria/epistemic-uq-decision
