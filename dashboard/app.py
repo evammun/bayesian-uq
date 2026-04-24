@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -431,6 +432,25 @@ if not result_files:
 auto_refresh = st.sidebar.toggle("Auto-refresh (2 min)", value=False)
 if auto_refresh:
     st_autorefresh(interval=120_000, key="auto_refresh_counter")
+
+# Recalculate adaptive sampling cache
+st.sidebar.divider()
+st.sidebar.caption("Adaptive cache: ~10 min to recompute")
+if st.sidebar.button("Recalculate Adaptive Cache", key="recalc_adaptive"):
+    import subprocess, sys
+    _script = Path(__file__).resolve().parent / "precompute_adaptive.py"
+    _python = Path(sys.executable)
+    with st.sidebar.status("Recomputing adaptive sampling...", expanded=True):
+        _proc = subprocess.run(
+            [str(_python), str(_script)],
+            capture_output=True, text=True, timeout=1200,
+        )
+        if _proc.returncode == 0:
+            st.sidebar.success("Cache updated! Refresh the page to use new results.")
+        else:
+            st.sidebar.error(f"Precompute failed:\n{_proc.stderr[-500:]}")
+        if _proc.stdout:
+            st.sidebar.text(_proc.stdout[-1000:])
 
 # Build run labels
 run_labels: dict[str, Path] = {}
@@ -1941,545 +1961,557 @@ def tab_signals() -> None:
 
 def tab_adaptive() -> None:
     """Bayesian adaptive sampling with posterior stopping criterion."""
+    import pickle as _pickle
+
     st.header("Adaptive Sampling")
     st.caption(
         "Five posterior aggregation methods compared side by side. "
-        "**Product:** multiply logprob likelihoods with temperature scaling (T). "
-        "**Sum:** Dirichlet pseudo-counts (no temperature). "
-        "**MLE:** fit Dirichlet α via Minka 2000. "
-        "**MoM:** one-line variance-ratio estimate of concentration α₀. "
-        "**MoM+Bayes:** MoM with Gamma prior on α₀, marginalized exceedance. "
-        "All methods stop when confidence > τ. Capped questions escalate to CoT/think."
+        "Raw results (T=1) on top, temperature-calibrated results below. "
+        "All methods stop when confidence > \u03c4. Capped questions escalate to CoT/think."
     )
 
     if df.empty:
         st.info("No data loaded.")
         return
 
-    # --- Discover runs ---
-    run_meta: dict[str, dict] = {}
-    for label, fp in selected_paths.items():
-        cfg = _extract_config_head(fp)
-        if cfg:
-            prefix = _extract_run_prefix(fp.stem)
-            run_meta[prefix] = {
-                "label": format_run_label(cfg),
-                "model": _short_model_name(cfg),
-                "mode": _effective_mode(cfg),
-                "shuffle": cfg.get("shuffle_options", False),
-                "paraphrase": cfg.get("use_paraphrases", False),
-                "context": cfg.get("context_condition", "unknown"),
-            }
-
-    # --- Auto-discover per-model configs ---
-    models_found: dict[str, dict] = {}  # model -> {base, esc1, esc2}
-    for model_name in sorted({v["model"] for v in run_meta.values()}):
-        model_runs = {k: v for k, v in run_meta.items() if v["model"] == model_name}
-        base = next(
-            (k for k, v in model_runs.items()
-             if v["mode"] == "direct" and v["shuffle"] and not v["paraphrase"]),
-            None,
-        )
-        if not base:
-            continue
-        esc1 = next(
-            (k for k, v in model_runs.items()
-             if v["mode"] == "CoT" and not v["shuffle"] and not v["paraphrase"]),
-            None,
-        )
-        esc2 = next(
-            (k for k, v in model_runs.items()
-             if v["mode"] == "think" and not v["shuffle"] and not v["paraphrase"]),
-            None,
-        )
-        models_found[model_name] = {"base": base, "esc1": esc1, "esc2": esc2}
-
-    if not models_found:
-        st.info("Need at least one model with a shuffle direct run for adaptive sampling.")
-        return
-
-    # --- Selectors (just parameters, no run pickers) ---
-    opt_cols = st.columns([1, 1, 3])
-    with opt_cols[0]:
-        n_max = st.select_slider("N_max", options=list(range(2, 11)), value=10)
-    with opt_cols[1]:
-        temperature = st.slider("Temperature (Product)", 0.5, 5.0, 3.0, 0.1,
-                                help="Calibration temperature for Product. "
-                                     "T=3.0 optimal. Sum/MLE don't use this.")
-
-    # --- Build per-model question data ---
-    def _answer_map(rn):
-        if not rn:
-            return {}
-        s = df[df["run_name"] == rn]
-        return dict(zip(s["question_id"], s["final_answer"]))
-
-    def _probs_map(rn):
-        if not rn:
-            return {}
-        s = df[df["run_name"] == rn]
-        out = {}
-        for _, row in s.iterrows():
-            ql = row.get("query_log", [])
-            for q in ql:
-                cp = q.get("canonical_probs", [])
-                if len(cp) == 4:
-                    out[row["question_id"]] = cp
-                    break
-        return out
-
-    model_data: dict[str, dict] = {}
-    for model_name, cfg in models_found.items():
-        base_df = df[df["run_name"] == cfg["base"]]
-        if base_df.empty:
-            continue
-        esc1_map = _answer_map(cfg["esc1"])
-        esc2_map = _answer_map(cfg["esc2"])
-        esc1_probs = _probs_map(cfg["esc1"])
-        esc2_probs = _probs_map(cfg["esc2"])
-        questions = []
-        for _, row in base_df.iterrows():
-            qlog = row.get("query_log", [])
-            probs = [q["canonical_probs"] for q in qlog
-                     if q.get("canonical_probs") and len(q["canonical_probs"]) == 4]
-            if len(probs) < 2:
-                continue
-            qid = row["question_id"]
-            questions.append({
-                "correct": row["correct_answer"],
-                "difficult": row.get("difficult", False),
-                "probs": probs[:n_max],
-                "esc1": esc1_map.get(qid),
-                "esc2": esc2_map.get(qid),
-                "esc1_probs": esc1_probs.get(qid),
-                "esc2_probs": esc2_probs.get(qid),
-            })
-        if not questions:
-            continue
-        n_q = len(questions)
-        baseline_correct = sum(
-            1 for q in questions
-            if int(np.argmax(np.mean(q["probs"], axis=0))) == q["correct"]
-        )
-        model_data[model_name] = {
-            "questions": questions, "n_q": n_q,
-            "baseline_acc": baseline_correct / n_q,
-            "has_esc1": cfg["esc1"] is not None,
-            "has_esc2": cfg["esc2"] is not None,
-            "esc1_run": cfg["esc1"], "esc2_run": cfg["esc2"],
-        }
-
-    if not model_data:
-        st.info("No models with enough data for adaptive sampling.")
-        return
-
-    # --- Helpers ---
-    def _trigamma(x):
-        """Fast trigamma ψ₁(x) via recurrence + asymptotic series (Abramowitz & Stegun 6.4.12)."""
-        x = np.asarray(x, dtype=np.float64)
-        result = np.zeros_like(x)
-        for _ in range(7):
-            small = x < 7.0
-            result += np.where(small, 1.0 / (x * x), 0.0)
-            x = np.where(small, x + 1.0, x)
-        ix = 1.0 / x
-        ix2 = ix * ix
-        result += ix + ix2 * (0.5 + ix * (1.0 / 6.0 + ix2 * (-1.0 / 30.0 + ix2 * (1.0 / 42.0))))
-        return result
-
-    def _inverse_digamma(y, max_iter=8):
-        """Vectorized inverse digamma via Newton's method (Minka 2003 init)."""
-        psi_1 = float(_digamma(1.0))
-        denom = y - psi_1
-        denom = np.where(np.abs(denom) < 1e-15, 1e-15, denom)
-        x = np.where(y >= -2.22, np.exp(y) + 0.5, -1.0 / denom)
-        x = np.maximum(x, 1e-8)
-        for _ in range(max_iter):
-            dx = (_digamma(x) - y) / _trigamma(x)
-            x = np.maximum(x - dx, 1e-8)
-        return x
-
-    def _exceedance_copula(alpha):
-        """Damped Gaussian-copula exceedance P(leader beats all others).
-
-        Luigi's method: exact pairwise Beta marginals + first-order Gaussian
-        copula correction with K-dependent damping.  RMSE ~0.005 for K=4
-        vs ~0.04 for Bonferroni.  Accepts (K,) or (M, K).
-        """
-        alpha = np.asarray(alpha, dtype=np.float64)
-        alpha = np.maximum(alpha, 1e-12)
-        squeeze = alpha.ndim == 1
-        if squeeze:
-            alpha = alpha[np.newaxis, :]
-        K = alpha.shape[-1]
-        M = alpha.shape[0]
-
-        if K < 3:
-            a = alpha.max(axis=-1)
-            b = alpha.min(axis=-1)
-            out = 1.0 - _betainc(a, b, 0.5)
-            return float(out[0]) if squeeze else out
-
-        leader_idx = np.argmax(alpha, axis=-1)
-        row_idx = np.arange(M)
-        alpha_lead = alpha[row_idx, leader_idx]
-
-        col_idx = np.arange(K)
-        comp_mask = col_idx[None, :] != leader_idx[:, None]
-        alpha_comp = alpha[comp_mask].reshape(M, K - 1)
-
-        p_j = np.clip(
-            1.0 - _betainc(alpha_lead[:, None], alpha_comp, 0.5),
-            1e-15, 1.0 - 1e-15,
-        )
-        a_j = _norm.ppf(p_j)
-        phi_j = _norm.pdf(a_j)
-
-        S = alpha.sum(axis=-1)[:, None]
-        al = alpha_lead[:, None]
-        denom = np.maximum(S * S * (S + 1.0), 1e-300)
-        var_j = (al * (S - al) + alpha_comp * (S - alpha_comp) + 2.0 * al * alpha_comp) / denom
-        var_j = np.maximum(var_j, 1e-300)
-
-        aj_i, ak_i = alpha_comp[:, :, None], alpha_comp[:, None, :]
-        S3 = S[:, :, None]
-        al3 = al[:, :, None]
-        denom3 = np.maximum(S3 * S3 * (S3 + 1.0), 1e-300)
-        cov_jk = (al3 * (S3 + aj_i + ak_i - al3) - aj_i * ak_i) / denom3
-        rho_jk = cov_jk / np.sqrt(var_j[:, :, None] * var_j[:, None, :])
-
-        log_p = np.log(p_j)
-        log_prod_all = log_p.sum(axis=-1)
-        prod_all = np.exp(log_prod_all)
-
-        log_rem = log_prod_all[:, None, None] - log_p[:, :, None] - log_p[:, None, :]
-        term = rho_jk * (phi_j[:, :, None] * phi_j[:, None, :]) * np.exp(log_rem)
-
-        triu = np.triu(np.ones((K - 1, K - 1), dtype=bool), k=1)
-        correction = term[:, triu].sum(axis=-1)
-
-        damping = 0.637 + 0.206 * math.exp(-0.587 * (K - 3))
-        P = np.clip(prod_all + damping * correction, 0.0, 1.0)
-        return float(P[0]) if squeeze else P
-
-    def _mom_estimate_alpha(mu, var_sum, mu_var_sum, N, K=4):
-        """Estimate Dirichlet α via Method of Moments (variance ratio).
-
-        Pooled R̂ = Σₖ s²ₖ / Σₖ μ̂ₖ(1-μ̂ₖ).  For Dirichlet(α₀·μ),
-        E[R̂] = 1/(α₀+1), so α̂₀ = (1-R̂)/R̂.
-        Returns α = α̂₀ · μ̂, clamped to [1, 200].
-        """
-        if mu_var_sum < 1e-15:
-            return mu * 10.0
-        R = var_sum / mu_var_sum
-        R = np.clip(R, 1e-6, 1.0 - 1e-6)
-        alpha0 = (1.0 - R) / R
-        alpha0 = np.clip(alpha0, 1.0, 200.0)
-        alpha = alpha0 * mu
-        return np.maximum(alpha, 1e-8)
-
-    _BAYES_GRID = np.logspace(np.log10(0.5), np.log10(300), 80)
-
-    def _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K=4):
-        """Marginalize exceedance over Gamma posterior on α₀.
-
-        Likelihood: pooled R̂·K(N-1)/R_true ~ χ²(K(N-1)).
-        Prior: Gamma(shape=2, rate=0.2)  →  mean=10, mode=5.
-        """
-        from scipy.stats import chi2 as _chi2, gamma as _gamma
-        df = K * (N - 1)
-        if mu_var_sum < 1e-15:
-            return _exceedance_copula(mu * 10.0)
-
-        R_hat = var_sum / mu_var_sum
-        grid = _BAYES_GRID
-        R_true = 1.0 / (grid + 1.0)
-        ratio = R_hat / np.maximum(R_true, 1e-15) * df
-        log_lik = _chi2.logpdf(ratio, df) + np.log(df) - np.log(np.maximum(R_true, 1e-15))
-        log_prior = _gamma.logpdf(grid, a=2.0, scale=5.0)
-        log_post = log_lik + log_prior
-        log_post -= log_post.max()
-        post = np.exp(log_post)
-        post /= post.sum()
-
-        alpha_grid = grid[:, None] * mu[None, :]
-        alpha_grid = np.maximum(alpha_grid, 1e-8)
-        exc_grid = _exceedance_copula(alpha_grid)
-
-        return float(np.dot(post, exc_grid))
-
-    def _fit_dirichlet_mle(log_p_sum, N, prior_strength=1.0, max_iter=50, tol=1e-4):
-        """Fit Dirichlet α via MLE (Minka 2000) with uniform pseudo-observation."""
-        K = len(log_p_sum)
-        if prior_strength > 0:
-            pseudo_log = np.full(K, np.log(1.0 / K))
-            suff_stats = (log_p_sum + prior_strength * pseudo_log) / (N + prior_strength)
-        else:
-            suff_stats = log_p_sum / N
-        psi_K = math.log(K) - 0.5 / K
-        alpha = np.maximum(_inverse_digamma(suff_stats + psi_K), 0.1)
-        for _ in range(max_iter):
-            a_new = _inverse_digamma(float(_digamma(np.sum(alpha))) + suff_stats)
-            a_new = np.maximum(a_new, 1e-8)
-            if np.max(np.abs(a_new - alpha)) < tol:
-                return a_new
-            alpha = a_new
-        return alpha
-
-    def _batch_mle_trajectories(questions, prior_strength=1.0):
-        """Batch-compute MLE trajectories with regularisation and copula exceedance."""
-        n_q = len(questions)
-        n_max_q = len(questions[0]["probs"])
-        K = 4
-        eps_smooth = 1e-3
-        pseudo_log = np.log(1.0 / K)
-
-        first_argmax = np.zeros(n_q, dtype=int)
-        batch_suff, batch_qi = [], []
-
-        for qi in range(n_q):
-            plist = questions[qi]["probs"]
-            log_p_sum = np.zeros(K)
-            for n in range(n_max_q):
-                p = np.asarray(plist[n], dtype=float)
-                p_smooth = eps_smooth / K + (1.0 - eps_smooth) * p
-                log_p_sum += np.log(p_smooth)
-                if n == 0:
-                    first_argmax[qi] = int(np.argmax(p))
-                else:
-                    N = n + 1
-                    suff = (log_p_sum + prior_strength * pseudo_log) / (N + prior_strength)
-                    batch_suff.append(suff)
-                    batch_qi.append(qi)
-
-        if not batch_suff:
-            return [[(0.0, 0)] * n_max_q for _ in range(n_q)]
-
-        B = np.array(batch_suff)
-        psi_K = math.log(K) - 0.5 / K
-        alpha = np.maximum(_inverse_digamma(B + psi_K), 0.1)
-        for _ in range(30):
-            asum = alpha.sum(axis=1, keepdims=True)
-            a_new = _inverse_digamma(_digamma(asum) + B)
-            a_new = np.maximum(a_new, 1e-8)
-            if np.max(np.abs(a_new - alpha)) < 1e-4:
-                alpha = a_new
-                break
-            alpha = a_new
-
-        exc = _exceedance_copula(alpha)
-        leads = np.argmax(alpha, axis=1)
-
-        trajs = [[(0.0, int(first_argmax[qi]))] for qi in range(n_q)]
-        for idx, qi in enumerate(batch_qi):
-            trajs[qi].append((float(exc[idx]), int(leads[idx])))
-        return trajs
-
-    def _compute_trajectory(
-        probs: list, method: str, temp: float,
-    ) -> list[tuple[float, int]]:
-        """Compute (confidence, argmax) at each permutation step.
-
-        Methods:
-          product    — Bayesian posterior, confidence = max P(k|data)
-          sum        — Dirichlet pseudo-counts, confidence = copula exceedance
-          mle        — Dirichlet MLE fit, confidence = copula exceedance
-          mom        — Method of Moments α₀ estimate, confidence = copula exceedance
-          mom_bayes  — MoM + Gamma prior on α₀, marginalized exceedance
-        """
-        traj: list[tuple[float, int]] = []
-
-        if method == "product":
-            log_post = np.log(np.full(4, 0.25))
-
-            for n in range(len(probs)):
-                p = np.array(probs[n])
-                raw_lp = np.log(np.clip(p, 1e-30, None))
-                if temp != 1.0:
-                    sc = raw_lp / temp
-                    sc -= sc.max()
-                    lk = np.exp(sc)
-                    lk /= lk.sum()
-                    log_post += np.log(np.clip(lk, 1e-30, None))
-                else:
-                    log_post += raw_lp
-                lp = log_post - log_post.max()
-                post = np.exp(lp)
-                post /= post.sum()
-
-                traj.append((float(post.max()), int(np.argmax(post))))
-
-        elif method == "mle":
-            K = 4
-            eps_smooth = 1e-3
-            log_p_sum = np.zeros(K)
-            for n in range(len(probs)):
-                p = np.array(probs[n], dtype=float)
-                p_smooth = eps_smooth / K + (1.0 - eps_smooth) * p
-                log_p_sum += np.log(p_smooth)
-                N = n + 1
-                if N < 2:
-                    traj.append((0.0, int(np.argmax(p))))
-                    continue
-                alpha = _fit_dirichlet_mle(log_p_sum, N)
-                traj.append((_exceedance_copula(alpha), int(np.argmax(alpha))))
-
-        elif method in ("mom", "mom_bayes"):
-            K = 4
-            p_sum = np.zeros(K)
-            p_sq_sum = np.zeros(K)
-            for n in range(len(probs)):
-                p = np.array(probs[n], dtype=float)
-                p_sum += p
-                p_sq_sum += p * p
-                N = n + 1
-                if N < 2:
-                    traj.append((0.0, int(np.argmax(p))))
-                    continue
-                mu = p_sum / N
-                var = (p_sq_sum / N - mu * mu) * N / (N - 1)
-                var = np.maximum(var, 0.0)
-                var_sum = var.sum()
-                mu_var_sum = (mu * (1.0 - mu)).sum()
-                if method == "mom":
-                    alpha = _mom_estimate_alpha(mu, var_sum, mu_var_sum, N, K)
-                    traj.append((_exceedance_copula(alpha), int(np.argmax(mu))))
-                else:
-                    exc = _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K)
-                    traj.append((exc, int(np.argmax(mu))))
-
-        else:  # sum
-            alpha = np.ones(4)
-            for n in range(len(probs)):
-                alpha = alpha + np.array(probs[n])
-                traj.append((_exceedance_copula(alpha), int(np.argmax(alpha))))
-
-        return traj
-
-    def _augmented_answer(q, alpha_base, esc_key):
-        """Augment Sum alpha with escalation probs, return argmax."""
-        ep = q.get(f"{esc_key}_probs")
-        if ep is not None:
-            return int(np.argmax(alpha_base + np.array(ep)))
-        return q.get(esc_key)
-
-    def _sweep_tau(
-        questions: list, trajs: list, tau: float, n_q: int,
-        esc1_run, esc2_run,
-    ) -> dict:
-        ns, corrects, caps = [], [], []
-        esc1_c, esc2_c = [], []
-        for i, traj in enumerate(trajs):
-            q = questions[i]
-            if tau == 0.0:
-                answer, n_stop, capped_q = traj[0][1], 1, False
-            else:
-                n_stop, capped_q = len(traj), True
-                answer = traj[-1][1]
-                for n, (conf, argmax_a) in enumerate(traj):
-                    if conf > tau:
-                        answer, n_stop, capped_q = argmax_a, n + 1, False
-                        break
-            ok = (answer == q["correct"])
-            ns.append(n_stop)
-            corrects.append(ok)
-            caps.append(capped_q)
-            if capped_q:
-                alpha_base = np.ones(4)
-                for p in q["probs"]:
-                    alpha_base += np.array(p)
-                a1 = _augmented_answer(q, alpha_base, "esc1")
-                a2 = _augmented_answer(q, alpha_base, "esc2")
-                esc1_c.append((a1 == q["correct"]) if a1 is not None else ok)
-                esc2_c.append((a2 == q["correct"]) if a2 is not None else ok)
-            else:
-                esc1_c.append(ok)
-                esc2_c.append(ok)
-        return {
-            "avg_n": float(np.mean(ns)),
-            "acc": sum(corrects) / n_q,
-            "cap": sum(caps) / n_q,
-            "esc1": sum(esc1_c) / n_q if esc1_run else None,
-            "esc2": sum(esc2_c) / n_q if esc2_run else None,
-        }
-
-    # --- Compute trajectories per model (Product, Sum, MLE, MoM, MoM+Bayes) ---
-    for mn, mdata in model_data.items():
-        qs = mdata["questions"]
-        mdata["prod_trajs"] = [
-            _compute_trajectory(q["probs"], "product", temperature) for q in qs
-        ]
-        mdata["sum_trajs"] = [
-            _compute_trajectory(q["probs"], "sum", 1.0) for q in qs
-        ]
-        mdata["mle_trajs"] = _batch_mle_trajectories(qs)
-        mdata["mom_trajs"] = [
-            _compute_trajectory(q["probs"], "mom", 1.0) for q in qs
-        ]
-        mdata["mom_bayes_trajs"] = [
-            _compute_trajectory(q["probs"], "mom_bayes", 1.0) for q in qs
-        ]
-
-    # --- Adaptive stopping: sweep τ per model ---
-    tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
+    # --- Constants ---
     METHODS = [("Product", "prod"), ("Sum", "sum"), ("Dirichlet MLE", "mle"),
                ("MoM", "mom"), ("MoM + Bayes", "mom_bayes")]
     MCOLORS = {"prod": TEAL, "sum": ROSE, "mle": GOLD,
                "mom": INDIGO, "mom_bayes": EMERALD}
+    MKEY_TO_METHOD = {"prod": "product", "sum": "sum", "mle": "mle",
+                      "mom": "mom", "mom_bayes": "mom_bayes"}
+    tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
+    tau_values_cal = [0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99]
 
-    for mn, mdata in model_data.items():
-        qs, n_q_m = mdata["questions"], mdata["n_q"]
-        er1, er2 = mdata["esc1_run"], mdata["esc2_run"]
-        for _, mkey in METHODS:
-            results = []
-            for tau in tau_values:
-                r = _sweep_tau(qs, mdata[f"{mkey}_trajs"], tau, n_q_m, er1, er2)
-                r["tau"] = tau
-                results.append(r)
-            mdata[f"{mkey}_results"] = results
+    # --- Selectors ---
+    n_max = st.select_slider("N_max", options=list(range(2, 11)), value=10)
 
-    model_names = list(model_data.keys())
+    # --- Try to load precomputed cache ---
+    _cache_path = Path(__file__).resolve().parent / "adaptive_cache.pkl"
+    cache = None
+    if _cache_path.exists():
+        try:
+            with open(_cache_path, "rb") as _f:
+                cache = _pickle.load(_f)
+            if cache.get("n_max") != n_max:
+                cache = None
+        except Exception:
+            cache = None
 
-    # --- Cross-model/method highlighting ---
-    all_result_lists = []
-    for mn in model_names:
-        for _, mkey in METHODS:
-            all_result_lists.append(model_data[mn][f"{mkey}_results"])
+    if cache is not None:
+        model_data = cache["model_data"]
+        model_names = cache["model_names"]
+        cal_grids_cached = cache.get("cal_grids", {})
+        import datetime as _dt
+        _age = time.time() - cache.get("computed_at", 0)
+        _age_str = f"{_age / 60:.0f} min ago" if _age < 3600 else f"{_age / 3600:.1f} h ago"
+        st.caption(f"Using precomputed cache ({_age_str}). "
+                   f"Run `python dashboard/precompute_adaptive.py` to refresh.")
+    else:
+        cal_grids_cached = {}
 
-    def _make_highlight(result_lists, keys_good, keys_bad, skip_tau_zero=True):
-        all_keys = keys_good + keys_bad
-        all_v = {k: [] for k in all_keys}
-        for rl in result_lists:
-            for r in rl:
-                if skip_tau_zero and r.get("tau", -1) == 0.0:
-                    continue
-                for k in all_keys:
-                    v = r.get(k)
-                    if v is not None:
-                        all_v[k].append(v)
-        ranges = {}
-        for k, vals in all_v.items():
-            if len(vals) < 3:
+        # --- Discover runs ---
+        run_meta: dict[str, dict] = {}
+        for label, fp in selected_paths.items():
+            cfg = _extract_config_head(fp)
+            if cfg:
+                prefix = _extract_run_prefix(fp.stem)
+                run_meta[prefix] = {
+                    "label": format_run_label(cfg),
+                    "model": _short_model_name(cfg),
+                    "mode": _effective_mode(cfg),
+                    "shuffle": cfg.get("shuffle_options", False),
+                    "paraphrase": cfg.get("use_paraphrases", False),
+                    "context": cfg.get("context_condition", "unknown"),
+                }
+
+        # --- Auto-discover per-model configs ---
+        models_found: dict[str, dict] = {}
+        for model_name in sorted({v["model"] for v in run_meta.values()}):
+            model_runs = {k: v for k, v in run_meta.items() if v["model"] == model_name}
+            base = next(
+                (k for k, v in model_runs.items()
+                 if v["mode"] == "direct" and v["shuffle"] and not v["paraphrase"]),
+                None,
+            )
+            if not base:
                 continue
-            lo, hi = min(vals), max(vals)
-            if hi - lo >= 0.01:
-                ranges[k] = (lo, hi)
+            esc1 = next(
+                (k for k, v in model_runs.items()
+                 if v["mode"] == "CoT" and not v["shuffle"] and not v["paraphrase"]),
+                None,
+            )
+            esc2 = next(
+                (k for k, v in model_runs.items()
+                 if v["mode"] == "think" and not v["shuffle"] and not v["paraphrase"]),
+                None,
+            )
+            models_found[model_name] = {"base": base, "esc1": esc1, "esc2": esc2}
+
+        if not models_found:
+            st.info("Need at least one model with a shuffle direct run for adaptive sampling.")
+            return
+
+        # --- Build per-model question data ---
+        def _answer_map(rn):
+            if not rn:
+                return {}
+            s = df[df["run_name"] == rn]
+            return dict(zip(s["question_id"], s["final_answer"]))
+
+        def _probs_map(rn):
+            if not rn:
+                return {}
+            s = df[df["run_name"] == rn]
+            out = {}
+            for _, row in s.iterrows():
+                ql = row.get("query_log", [])
+                for q in ql:
+                    cp = q.get("canonical_probs", [])
+                    if len(cp) == 4:
+                        out[row["question_id"]] = cp
+                        break
+            return out
+
+        model_data: dict[str, dict] = {}
+        for model_name, cfg in models_found.items():
+            base_df = df[df["run_name"] == cfg["base"]]
+            if base_df.empty:
+                continue
+            esc1_map = _answer_map(cfg["esc1"])
+            esc2_map = _answer_map(cfg["esc2"])
+            esc1_probs = _probs_map(cfg["esc1"])
+            esc2_probs = _probs_map(cfg["esc2"])
+            questions = []
+            for _, row in base_df.iterrows():
+                qlog = row.get("query_log", [])
+                probs = [q["canonical_probs"] for q in qlog
+                         if q.get("canonical_probs") and len(q["canonical_probs"]) == 4]
+                if len(probs) < 2:
+                    continue
+                qid = row["question_id"]
+                questions.append({
+                    "correct": row["correct_answer"],
+                    "difficult": row.get("difficult", False),
+                    "probs": probs[:n_max],
+                    "esc1": esc1_map.get(qid),
+                    "esc2": esc2_map.get(qid),
+                    "esc1_probs": esc1_probs.get(qid),
+                    "esc2_probs": esc2_probs.get(qid),
+                })
+            if not questions:
+                continue
+            n_q = len(questions)
+            baseline_correct = sum(
+                1 for q in questions
+                if int(np.argmax(np.mean(q["probs"], axis=0))) == q["correct"]
+            )
+            model_data[model_name] = {
+                "questions": questions, "n_q": n_q,
+                "baseline_acc": baseline_correct / n_q,
+                "has_esc1": cfg["esc1"] is not None,
+                "has_esc2": cfg["esc2"] is not None,
+                "esc1_run": cfg["esc1"], "esc2_run": cfg["esc2"],
+            }
+
+        if not model_data:
+            st.info("No models with enough data for adaptive sampling.")
+            return
+
+        # --- Helpers (only needed for live computation) ---
+        def _trigamma(x):
+            x = np.asarray(x, dtype=np.float64)
+            result = np.zeros_like(x)
+            for _ in range(7):
+                small = x < 7.0
+                result += np.where(small, 1.0 / (x * x), 0.0)
+                x = np.where(small, x + 1.0, x)
+            ix = 1.0 / x
+            ix2 = ix * ix
+            result += ix + ix2 * (0.5 + ix * (1.0 / 6.0 + ix2 * (-1.0 / 30.0 + ix2 * (1.0 / 42.0))))
+            return result
+
+        def _inverse_digamma(y, max_iter=8):
+            psi_1 = float(_digamma(1.0))
+            denom = y - psi_1
+            denom = np.where(np.abs(denom) < 1e-15, 1e-15, denom)
+            x = np.where(y >= -2.22, np.exp(y) + 0.5, -1.0 / denom)
+            x = np.maximum(x, 1e-8)
+            for _ in range(max_iter):
+                dx = (_digamma(x) - y) / _trigamma(x)
+                x = np.maximum(x - dx, 1e-8)
+            return x
+
+        def _exceedance_copula(alpha):
+            alpha = np.asarray(alpha, dtype=np.float64)
+            alpha = np.maximum(alpha, 1e-12)
+            squeeze = alpha.ndim == 1
+            if squeeze:
+                alpha = alpha[np.newaxis, :]
+            K = alpha.shape[-1]
+            M = alpha.shape[0]
+
+            if K < 3:
+                a = alpha.max(axis=-1)
+                b = alpha.min(axis=-1)
+                out = 1.0 - _betainc(a, b, 0.5)
+                return float(out[0]) if squeeze else out
+
+            leader_idx = np.argmax(alpha, axis=-1)
+            row_idx = np.arange(M)
+            alpha_lead = alpha[row_idx, leader_idx]
+
+            col_idx = np.arange(K)
+            comp_mask = col_idx[None, :] != leader_idx[:, None]
+            alpha_comp = alpha[comp_mask].reshape(M, K - 1)
+
+            p_j = np.clip(
+                1.0 - _betainc(alpha_lead[:, None], alpha_comp, 0.5),
+                1e-15, 1.0 - 1e-15,
+            )
+            a_j = _norm.ppf(p_j)
+            phi_j = _norm.pdf(a_j)
+
+            S = alpha.sum(axis=-1)[:, None]
+            al = alpha_lead[:, None]
+            denom = np.maximum(S * S * (S + 1.0), 1e-300)
+            var_j = (al * (S - al) + alpha_comp * (S - alpha_comp) + 2.0 * al * alpha_comp) / denom
+            var_j = np.maximum(var_j, 1e-300)
+
+            aj_i, ak_i = alpha_comp[:, :, None], alpha_comp[:, None, :]
+            S3 = S[:, :, None]
+            al3 = al[:, :, None]
+            denom3 = np.maximum(S3 * S3 * (S3 + 1.0), 1e-300)
+            cov_jk = (al3 * (S3 + aj_i + ak_i - al3) - aj_i * ak_i) / denom3
+            rho_jk = cov_jk / np.sqrt(var_j[:, :, None] * var_j[:, None, :])
+
+            log_p = np.log(p_j)
+            log_prod_all = log_p.sum(axis=-1)
+            prod_all = np.exp(log_prod_all)
+
+            log_rem = log_prod_all[:, None, None] - log_p[:, :, None] - log_p[:, None, :]
+            term = rho_jk * (phi_j[:, :, None] * phi_j[:, None, :]) * np.exp(log_rem)
+
+            triu = np.triu(np.ones((K - 1, K - 1), dtype=bool), k=1)
+            correction = term[:, triu].sum(axis=-1)
+
+            damping = 0.637 + 0.206 * math.exp(-0.587 * (K - 3))
+            P = np.clip(prod_all + damping * correction, 0.0, 1.0)
+            return float(P[0]) if squeeze else P
+
+        def _mom_estimate_alpha(mu, var_sum, mu_var_sum, N, K=4):
+            if mu_var_sum < 1e-15:
+                return mu * 10.0
+            R = var_sum / mu_var_sum
+            R = np.clip(R, 1e-6, 1.0 - 1e-6)
+            alpha0 = (1.0 - R) / R
+            alpha0 = np.clip(alpha0, 1.0, 200.0)
+            alpha = alpha0 * mu
+            return np.maximum(alpha, 1e-8)
+
+        _BAYES_GRID = np.logspace(np.log10(0.5), np.log10(300), 80)
+
+        def _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K=4):
+            from scipy.stats import chi2 as _chi2, gamma as _gamma
+            df_val = K * (N - 1)
+            if mu_var_sum < 1e-15:
+                return _exceedance_copula(mu * 10.0)
+
+            R_hat = var_sum / mu_var_sum
+            grid = _BAYES_GRID
+            R_true = 1.0 / (grid + 1.0)
+            ratio = R_hat / np.maximum(R_true, 1e-15) * df_val
+            log_lik = _chi2.logpdf(ratio, df_val) + np.log(df_val) - np.log(np.maximum(R_true, 1e-15))
+            log_prior = _gamma.logpdf(grid, a=2.0, scale=5.0)
+            log_post = log_lik + log_prior
+            log_post -= log_post.max()
+            post = np.exp(log_post)
+            post /= post.sum()
+
+            alpha_grid = grid[:, None] * mu[None, :]
+            alpha_grid = np.maximum(alpha_grid, 1e-8)
+            exc_grid = _exceedance_copula(alpha_grid)
+
+            return float(np.dot(post, exc_grid))
+
+        def _temp_scale(p, temp):
+            lp = np.log(np.clip(p, 1e-30, None)) / temp
+            lp -= lp.max()
+            out = np.exp(lp)
+            return out / out.sum()
+
+        def _fit_dirichlet_mle(log_p_sum, N, prior_strength=1.0, max_iter=50, tol=1e-4):
+            K = len(log_p_sum)
+            if prior_strength > 0:
+                pseudo_log = np.full(K, np.log(1.0 / K))
+                suff_stats = (log_p_sum + prior_strength * pseudo_log) / (N + prior_strength)
+            else:
+                suff_stats = log_p_sum / N
+            psi_K = math.log(K) - 0.5 / K
+            alpha = np.maximum(_inverse_digamma(suff_stats + psi_K), 0.1)
+            for _ in range(max_iter):
+                a_new = _inverse_digamma(float(_digamma(np.sum(alpha))) + suff_stats)
+                a_new = np.maximum(a_new, 1e-8)
+                if np.max(np.abs(a_new - alpha)) < tol:
+                    return a_new
+                alpha = a_new
+            return alpha
+
+        def _batch_mle_trajectories(questions, prior_strength=1.0, temp=1.0):
+            n_q = len(questions)
+            n_max_q = len(questions[0]["probs"])
+            K = 4
+            eps_smooth = 1e-3
+            pseudo_log = np.log(1.0 / K)
+
+            first_argmax = np.zeros(n_q, dtype=int)
+            batch_suff, batch_qi = [], []
+
+            for qi in range(n_q):
+                plist = questions[qi]["probs"]
+                log_p_sum = np.zeros(K)
+                for n in range(n_max_q):
+                    p = np.asarray(plist[n], dtype=float)
+                    if temp > 1.0:
+                        p = _temp_scale(p, temp)
+                    p_smooth = eps_smooth / K + (1.0 - eps_smooth) * p
+                    log_p_sum += np.log(p_smooth)
+                    if n == 0:
+                        first_argmax[qi] = int(np.argmax(p))
+                    else:
+                        N = n + 1
+                        suff = (log_p_sum + prior_strength * pseudo_log) / (N + prior_strength)
+                        batch_suff.append(suff)
+                        batch_qi.append(qi)
+
+            if not batch_suff:
+                return [[(0.0, 0)] * n_max_q for _ in range(n_q)]
+
+            B = np.array(batch_suff)
+            psi_K = math.log(K) - 0.5 / K
+            alpha = np.maximum(_inverse_digamma(B + psi_K), 0.1)
+            for _ in range(30):
+                asum = alpha.sum(axis=1, keepdims=True)
+                a_new = _inverse_digamma(_digamma(asum) + B)
+                a_new = np.maximum(a_new, 1e-8)
+                if np.max(np.abs(a_new - alpha)) < 1e-4:
+                    alpha = a_new
+                    break
+                alpha = a_new
+
+            exc = _exceedance_copula(alpha)
+            leads = np.argmax(alpha, axis=1)
+
+            trajs = [[(0.0, int(first_argmax[qi]))] for qi in range(n_q)]
+            for idx, qi in enumerate(batch_qi):
+                trajs[qi].append((float(exc[idx]), int(leads[idx])))
+            return trajs
+
+        def _compute_trajectory(probs, method, temp):
+            traj = []
+
+            if method == "product":
+                log_post = np.log(np.full(4, 0.25))
+                for n in range(len(probs)):
+                    p = np.array(probs[n])
+                    raw_lp = np.log(np.clip(p, 1e-30, None))
+                    if temp != 1.0:
+                        sc = raw_lp / temp
+                        sc -= sc.max()
+                        lk = np.exp(sc)
+                        lk /= lk.sum()
+                        log_post += np.log(np.clip(lk, 1e-30, None))
+                    else:
+                        log_post += raw_lp
+                    lp = log_post - log_post.max()
+                    post = np.exp(lp)
+                    post /= post.sum()
+                    traj.append((float(post.max()), int(np.argmax(post))))
+
+            elif method == "mle":
+                K = 4
+                eps_smooth = 1e-3
+                log_p_sum = np.zeros(K)
+                for n in range(len(probs)):
+                    p = np.array(probs[n], dtype=float)
+                    if temp > 1.0:
+                        p = _temp_scale(p, temp)
+                    p_smooth = eps_smooth / K + (1.0 - eps_smooth) * p
+                    log_p_sum += np.log(p_smooth)
+                    N = n + 1
+                    if N < 2:
+                        traj.append((0.0, int(np.argmax(p))))
+                        continue
+                    alpha = _fit_dirichlet_mle(log_p_sum, N)
+                    traj.append((_exceedance_copula(alpha), int(np.argmax(alpha))))
+
+            elif method in ("mom", "mom_bayes"):
+                K = 4
+                p_sum = np.zeros(K)
+                p_sq_sum = np.zeros(K)
+                for n in range(len(probs)):
+                    p = np.array(probs[n], dtype=float)
+                    if temp > 1.0:
+                        p = _temp_scale(p, temp)
+                    p_sum += p
+                    p_sq_sum += p * p
+                    N = n + 1
+                    if N < 2:
+                        traj.append((0.0, int(np.argmax(p))))
+                        continue
+                    mu = p_sum / N
+                    var = (p_sq_sum / N - mu * mu) * N / (N - 1)
+                    var = np.maximum(var, 0.0)
+                    var_sum = var.sum()
+                    mu_var_sum = (mu * (1.0 - mu)).sum()
+                    if method == "mom":
+                        alpha = _mom_estimate_alpha(mu, var_sum, mu_var_sum, N, K)
+                        traj.append((_exceedance_copula(alpha), int(np.argmax(mu))))
+                    else:
+                        exc = _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K)
+                        traj.append((exc, int(np.argmax(mu))))
+
+            else:  # sum
+                alpha = np.ones(4)
+                for n in range(len(probs)):
+                    p = np.array(probs[n])
+                    if temp > 1.0:
+                        p = _temp_scale(p, temp)
+                    alpha = alpha + p
+                    traj.append((_exceedance_copula(alpha), int(np.argmax(alpha))))
+
+            return traj
+
+        def _augmented_answer(q, alpha_base, esc_key):
+            ep = q.get(f"{esc_key}_probs")
+            if ep is not None:
+                return int(np.argmax(alpha_base + np.array(ep)))
+            return q.get(esc_key)
+
+        def _sweep_tau(questions, trajs, tau, n_q, esc1_run, esc2_run):
+            ns, corrects, caps = [], [], []
+            esc1_c, esc2_c = [], []
+            for i, traj in enumerate(trajs):
+                q = questions[i]
+                if tau == 0.0:
+                    answer, n_stop, capped_q = traj[0][1], 1, False
+                else:
+                    n_stop, capped_q = len(traj), True
+                    answer = traj[-1][1]
+                    for n, (conf, argmax_a) in enumerate(traj):
+                        if conf > tau:
+                            answer, n_stop, capped_q = argmax_a, n + 1, False
+                            break
+                ok = (answer == q["correct"])
+                ns.append(n_stop)
+                corrects.append(ok)
+                caps.append(capped_q)
+                if capped_q:
+                    alpha_base = np.ones(4)
+                    for p in q["probs"]:
+                        alpha_base += np.array(p)
+                    a1 = _augmented_answer(q, alpha_base, "esc1")
+                    a2 = _augmented_answer(q, alpha_base, "esc2")
+                    esc1_c.append((a1 == q["correct"]) if a1 is not None else ok)
+                    esc2_c.append((a2 == q["correct"]) if a2 is not None else ok)
+                else:
+                    esc1_c.append(ok)
+                    esc2_c.append(ok)
+            return {
+                "avg_n": float(np.mean(ns)),
+                "acc": sum(corrects) / n_q,
+                "cap": sum(caps) / n_q,
+                "esc1": sum(esc1_c) / n_q if esc1_run else None,
+                "esc2": sum(esc2_c) / n_q if esc2_run else None,
+            }
+
+        st.info("No precomputed cache found. Computing live (this may take ~10 min)... "
+                "Run `python dashboard/precompute_adaptive.py` to create a cache.")
+
+        # --- Compute raw trajectories (T=1, no calibration) ---
+        for mn, mdata in model_data.items():
+            qs = mdata["questions"]
+            mdata["prod_trajs"] = [
+                _compute_trajectory(q["probs"], "product", 1.0) for q in qs
+            ]
+            mdata["sum_trajs"] = [
+                _compute_trajectory(q["probs"], "sum", 1.0) for q in qs
+            ]
+            mdata["mle_trajs"] = _batch_mle_trajectories(qs, temp=1.0)
+            mdata["mom_trajs"] = [
+                _compute_trajectory(q["probs"], "mom", 1.0) for q in qs
+            ]
+            mdata["mom_bayes_trajs"] = [
+                _compute_trajectory(q["probs"], "mom_bayes", 1.0) for q in qs
+            ]
+
+        # --- Raw tau sweep ---
+        for mn, mdata in model_data.items():
+            qs, n_q_m = mdata["questions"], mdata["n_q"]
+            er1, er2 = mdata["esc1_run"], mdata["esc2_run"]
+            for _, mkey in METHODS:
+                results = []
+                for tau in tau_values:
+                    r = _sweep_tau(qs, mdata[f"{mkey}_trajs"], tau, n_q_m, er1, er2)
+                    r["tau"] = tau
+                    results.append(r)
+                mdata[f"{mkey}_results"] = results
+
+        model_names = list(model_data.keys())
+
+    # ===================================================================
+    # SECTION 1: RAW RESULTS (T = 1)
+    # ===================================================================
+    st.subheader("Raw Results (T = 1)")
+    st.caption(
+        "No temperature calibration. All methods operate on the model's raw "
+        "logprob vectors. This is the honest baseline — no knobs turned."
+    )
+
+    # --- Cross-method highlighting (compare 5 methods per model at each τ) ---
+    def _make_cross_method_highlight(model_data_src, model_names_src, methods_src,
+                                     tau_vals, keys_good, keys_bad):
+        """For each (model, tau, metric): find range across 5 methods, highlight best."""
+        ranges = {}
+        for mn in model_names_src:
+            for ti, tau in enumerate(tau_vals):
+                if tau == 0.0:
+                    continue
+                for k in keys_good + keys_bad:
+                    vals = []
+                    for _, mkey in methods_src:
+                        res = model_data_src[mn].get(f"{mkey}_results", [])
+                        if ti < len(res):
+                            v = res[ti].get(k)
+                            if v is not None:
+                                vals.append(v)
+                    if len(vals) >= 2:
+                        lo, hi = min(vals), max(vals)
+                        if hi - lo >= 0.001:
+                            ranges[(mn, ti, k)] = (lo, hi)
         bad_set = set(keys_bad)
 
-        def _hl(metric, value, skip=False):
-            if skip or value is None or metric not in ranges:
+        def _hl(mn, ti, metric, value, skip=False):
+            if skip or value is None:
                 return ""
-            lo, hi = ranges[metric]
+            key = (mn, ti, metric)
+            if key not in ranges:
+                return ""
+            lo, hi = ranges[key]
             t = (value - lo) / (hi - lo)
-            if t < 0.35:
+            if t < 0.25:
                 return ""
-            opacity = 0.06 + 0.16 * min(1.0, (t - 0.35) / 0.65)
+            opacity = 0.06 + 0.18 * min(1.0, (t - 0.25) / 0.75)
             if metric in bad_set:
                 return f' style="background:rgba(202,74,122,{opacity:.2f})"'
             return f' style="background:rgba(42,140,143,{opacity:.2f})"'
         return _hl
 
-    _cs = _make_highlight(all_result_lists, ["acc", "esc1", "esc2"], ["cap"])
+    _cs = _make_cross_method_highlight(
+        model_data, model_names, METHODS, tau_values,
+        ["acc", "esc1", "esc2"], ["cap"],
+    )
 
     _at_css = """<style>
     .at { border-collapse: collapse; width: 100%%; font-family: Inter, sans-serif; font-size: 13px; }
@@ -2488,62 +2520,74 @@ def tab_adaptive() -> None:
     .at td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #E5E0DB; }
     .at tr:hover { background: #F5F3F1; }
     .at .bl td { border-top: 2px solid #ccc; font-style: italic; color: #8B95A1; }
+    .at .mb { border-left: 3px solid #2A8C8F; }
     </style>"""
 
-    # --- τ-sweep tables: one per method, models side by side ---
-    for method_label, mkey in METHODS:
-        desc = {"prod": f"multiply likelihoods, T={temperature:.1f}",
-                "sum": "Dirichlet pseudo-counts",
-                "mle": "fit α via Minka MLE",
-                "mom": "variance-ratio α₀ estimate",
-                "mom_bayes": "Bayesian wrapper on MoM"}[mkey]
-        st.markdown(f"**{method_label}** ({desc})")
-        html = _at_css + '<table class="at"><tr><th rowspan="2">\u03c4</th>'
-        for mn in model_names:
-            ncols = 3
-            if model_data[mn]["has_esc1"]:
-                ncols += 1
-            if model_data[mn]["has_esc2"]:
-                ncols += 1
-            html += f'<th colspan="{ncols}">{mn}</th>'
-        html += "</tr><tr>"
-        for mn in model_names:
-            html += "<th>N</th><th>acc</th><th>cap</th>"
-            if model_data[mn]["has_esc1"]:
-                html += "<th>+CoT</th>"
-            if model_data[mn]["has_esc2"]:
-                html += "<th>+think</th>"
-        html += "</tr>"
-        for ti, tau in enumerate(tau_values):
-            is_zero = (tau == 0.0)
-            html += f"<tr><td>{tau:.2f}</td>"
-            for mn in model_names:
-                r = model_data[mn][f"{mkey}_results"][ti]
-                html += f'<td>{r["avg_n"]:.2f}</td>'
-                html += f'<td{_cs("acc", r["acc"], is_zero)}>{r["acc"]:.1%}</td>'
-                html += f'<td{_cs("cap", r["cap"], is_zero)}>{r["cap"]:.1%}</td>'
-                if model_data[mn]["has_esc1"]:
-                    v = r["esc1"]
-                    if v is not None:
-                        html += f'<td{_cs("esc1", v, is_zero)}>{v:.1%}</td>'
-                    else:
-                        html += "<td>-</td>"
-                if model_data[mn]["has_esc2"]:
-                    v = r["esc2"]
-                    if v is not None:
-                        html += f'<td{_cs("esc2", v, is_zero)}>{v:.1%}</td>'
-                    else:
-                        html += "<td>-</td>"
+    # --- Reusable table renderer (used by both raw and calibrated sections) ---
+    def _render_tau_tables(data_src, names_src, methods_src, tau_vals,
+                           hl_fn, css, n_max_val, desc_override=None,
+                           show_temp=False):
+        """Render τ-sweep tables: one per method, models side by side."""
+        for method_label, mkey in methods_src:
+            if desc_override and mkey in desc_override:
+                desc = desc_override[mkey]
+            else:
+                desc = {"prod": "multiply likelihoods, raw",
+                        "sum": "Dirichlet pseudo-counts",
+                        "mle": "fit α via Minka MLE",
+                        "mom": "variance-ratio α₀ estimate",
+                        "mom_bayes": "Bayesian wrapper on MoM"}[mkey]
+            st.markdown(f"**{method_label}** ({desc})")
+            html = css + '<table class="at"><tr><th rowspan="2" class="mb">\u03c4</th>'
+            for mn in names_src:
+                ncols = 3
+                if data_src[mn]["has_esc1"]:
+                    ncols += 1
+                if data_src[mn]["has_esc2"]:
+                    ncols += 1
+                html += f'<th class="mb" colspan="{ncols}">{mn}</th>'
+            html += "</tr><tr>"
+            for mi, mn in enumerate(names_src):
+                first = ' class="mb"' if True else ''
+                html += f"<th{first}>N</th><th>acc</th><th>cap</th>"
+                if data_src[mn]["has_esc1"]:
+                    html += "<th>+CoT</th>"
+                if data_src[mn]["has_esc2"]:
+                    html += "<th>+think</th>"
             html += "</tr>"
-        html += '<tr class="bl"><td>all</td>'
-        for mn in model_names:
-            html += f'<td>{n_max}</td><td>{model_data[mn]["baseline_acc"]:.1%}</td><td>-</td>'
-            if model_data[mn]["has_esc1"]:
-                html += "<td>-</td>"
-            if model_data[mn]["has_esc2"]:
-                html += "<td>-</td>"
-        html += "</tr></table>"
-        st.markdown(html, unsafe_allow_html=True)
+            for ti, tau in enumerate(tau_vals):
+                is_zero = (tau == 0.0)
+                html += f'<tr><td class="mb">{tau:.2f}</td>'
+                for mn in names_src:
+                    r = data_src[mn][f"{mkey}_results"][ti]
+                    html += f'<td class="mb">{r["avg_n"]:.2f}</td>'
+                    html += f'<td{hl_fn(mn, ti, "acc", r["acc"], is_zero)}>{r["acc"]:.1%}</td>'
+                    html += f'<td{hl_fn(mn, ti, "cap", r["cap"], is_zero)}>{r["cap"]:.1%}</td>'
+                    if data_src[mn]["has_esc1"]:
+                        v = r["esc1"]
+                        if v is not None:
+                            html += f'<td{hl_fn(mn, ti, "esc1", v, is_zero)}>{v:.1%}</td>'
+                        else:
+                            html += "<td>-</td>"
+                    if data_src[mn]["has_esc2"]:
+                        v = r["esc2"]
+                        if v is not None:
+                            html += f'<td{hl_fn(mn, ti, "esc2", v, is_zero)}>{v:.1%}</td>'
+                        else:
+                            html += "<td>-</td>"
+                html += "</tr>"
+            html += '<tr class="bl"><td class="mb">all</td>'
+            for mn in names_src:
+                html += f'<td class="mb">{n_max_val}</td><td>{data_src[mn]["baseline_acc"]:.1%}</td><td>-</td>'
+                if data_src[mn]["has_esc1"]:
+                    html += "<td>-</td>"
+                if data_src[mn]["has_esc2"]:
+                    html += "<td>-</td>"
+            html += "</tr></table>"
+            st.markdown(html, unsafe_allow_html=True)
+
+    _render_tau_tables(model_data, model_names, METHODS, tau_values,
+                       _cs, _at_css, n_max)
 
     # --- Method explanations ---
     with st.expander("How it works — Product (multiply likelihoods)"):
@@ -2558,13 +2602,14 @@ def tab_adaptive() -> None:
             "**Stopping criterion:** max P(k | data) > τ — the posterior probability "
             "of the leading answer exceeds the threshold.\n\n"
             "**Temperature scaling:** Raw per-query logprobs are overconfident "
-            "(MSP ≈ 0.91, ECE = 0.186). The posterior concentrates in 1–2 samples, "
+            "(MSP \u2248 0.91, ECE = 0.186). The posterior concentrates in 1\u20132 samples, "
             "making the framework useless. Temperature T deflates confidence: "
             "new\\_probs = softmax(log(probs) / T). T = 3.0 is ECE-optimal "
-            "(0.186 → 0.012). Without it, cap\\_rate ≈ 0% at any τ.\n\n"
+            "(0.186 \u2192 0.012). The raw section above shows T=1 (no calibration); "
+            "the calibrated section below finds optimal T per method.\n\n"
             "**Tradeoff:** Mathematically correct Bayesian update *if* the logprobs "
-            "are well-calibrated. In practice they aren't, so we bolt on temperature "
-            "scaling — an extra hyperparameter to tune.\n\n"
+            "are well-calibrated. In practice they aren't, so temperature helps \u2014 "
+            "but it's an extra hyperparameter to tune.\n\n"
             "**Escalation:** Capped questions don't replace the answer — they "
             "**augment** the Sum-style Dirichlet (α = 1 + Σ pₖ) with the "
             "escalation mode's probability vector: α\\_aug = α + p\\_esc. "
@@ -2723,14 +2768,19 @@ def tab_adaptive() -> None:
         ))
         st.plotly_chart(_round_hover(fig), width="stretch")
 
-    # --- Joint Optimization ---
-    st.subheader("Joint Optimization — All Methods")
+    # ===================================================================
+    # SECTION 2: TEMPERATURE CALIBRATION
+    # ===================================================================
+    st.divider()
+    st.subheader("Temperature-Calibrated Results")
     st.caption(
-        "Product sweeps T × τ. Sum, MLE, MoM & MoM+Bayes sweep τ only. "
-        "Pareto frontiers per model."
+        "Sweep temperature T for **all** methods — not just Product. "
+        "Optimal T maximizes acc+escalation on each method's Pareto frontier. "
+        "Hypothesis: MoM/Bayes needs less T than Product because concentration "
+        "estimation already accounts for overconfidence."
     )
 
-    ESC_COSTS = {"CoT (2.4×)": 2.4, "Think (7.1×)": 7.1}
+    ESC_COSTS = {"CoT (2.4\u00d7)": 2.4, "Think (7.1\u00d7)": 7.1}
     esc_mode = st.selectbox(
         "Escalation mode",
         list(ESC_COSTS.keys()),
@@ -2740,213 +2790,298 @@ def tab_adaptive() -> None:
     )
     esc_cost = ESC_COSTS[esc_mode]
 
-    temps_grid = np.arange(1.0, 5.5, 0.5)
-    taus_grid = [0.60, 0.70, 0.80, 0.90, 0.95, 0.99]
-
-    def _grid_sweep(questions, method, temps, taus, n_q, esc_cost,
-                    pre_trajs=None):
-        grid = []
-        t_list = temps if method == "product" else [0.0]
-        for t in t_list:
-            if pre_trajs is not None:
-                trajs_t = pre_trajs
-            else:
-                trajs_t = [
-                    _compute_trajectory(q["probs"], method, t)
-                    for q in questions
-                ]
-            for tau_g in taus:
-                ns_g, corrects_g, caps_g, esc_best = [], [], [], []
-                for i, traj in enumerate(trajs_t):
-                    q = questions[i]
-                    n_stop_g, capped_g = len(traj), True
-                    answer_g = traj[-1][1]
-                    for n, (conf, argmax_a) in enumerate(traj):
-                        if conf > tau_g:
-                            answer_g, n_stop_g, capped_g = argmax_a, n + 1, False
-                            break
-                    ok = (answer_g == q["correct"])
-                    ns_g.append(n_stop_g)
-                    corrects_g.append(ok)
-                    caps_g.append(capped_g)
-                    esc_ok = ok
-                    if capped_g:
-                        alpha_base = np.ones(4)
-                        for p in q["probs"]:
-                            alpha_base += np.array(p)
-                        a2 = _augmented_answer(q, alpha_base, "esc2")
-                        a1 = _augmented_answer(q, alpha_base, "esc1")
-                        if a2 is not None:
-                            esc_ok = (a2 == q["correct"])
-                        elif a1 is not None:
-                            esc_ok = (a1 == q["correct"])
-                    esc_best.append(esc_ok)
-                avg_n_g = float(np.mean(ns_g))
-                cap_rate_g = sum(caps_g) / n_q
-                grid.append({
-                    "T": float(t), "tau": tau_g,
-                    "avg_n": avg_n_g, "cap_rate": cap_rate_g,
-                    "acc": sum(corrects_g) / n_q,
-                    "acc_esc": sum(esc_best) / n_q,
-                    "total_cost": avg_n_g + cap_rate_g * esc_cost,
-                })
-        return grid
-
-    def _pareto(grid):
+    def _pareto_from_grid(grid, esc_cost_val):
+        """Pareto frontier, computing total_cost on the fly."""
+        enriched = [
+            {**r, "total_cost": r["avg_n"] + r["cap_rate"] * esc_cost_val}
+            for r in grid
+        ]
         pareto = []
-        by_cost = sorted(grid, key=lambda r: (r["total_cost"], -r["acc_esc"]))
+        by_cost = sorted(enriched, key=lambda r: (r["total_cost"], -r["acc_esc"]))
         best = -1.0
         for r in by_cost:
             if r["acc_esc"] > best:
                 best = r["acc_esc"]
                 pareto.append(r)
-        return pareto
+        return pareto, enriched
 
-    for mn, mdata in model_data.items():
-        qs, n_q_m = mdata["questions"], mdata["n_q"]
-        mdata["prod_grid"] = _grid_sweep(qs, "product", temps_grid, taus_grid, n_q_m, esc_cost)
-        mdata["sum_grid"] = _grid_sweep(qs, "sum", temps_grid, taus_grid, n_q_m, esc_cost)
-        mdata["mle_grid"] = _grid_sweep(qs, "mle", temps_grid, taus_grid, n_q_m, esc_cost,
-                                         pre_trajs=mdata["mle_trajs"])
-        mdata["mom_grid"] = _grid_sweep(qs, "mom", temps_grid, taus_grid, n_q_m, esc_cost,
-                                         pre_trajs=mdata["mom_trajs"])
-        mdata["mom_bayes_grid"] = _grid_sweep(qs, "mom_bayes", temps_grid, taus_grid, n_q_m, esc_cost,
-                                               pre_trajs=mdata["mom_bayes_trajs"])
+    cal_opt: dict = {}
+    cal_pareto: dict = {}
+    cal_model_data: dict = {}
+
+    # Use cached grid sweeps (from precompute script or session state)
+    _have_cal_grids = bool(cal_grids_cached)
+    if not _have_cal_grids:
+        _cal_cache_key = (
+            tuple(sorted((mn, model_data[mn]["n_q"]) for mn in model_names)),
+            n_max,
+        )
+        if (st.session_state.get("cal_cache_key") == _cal_cache_key
+                and "cal_grids" in st.session_state):
+            cal_grids_cached = st.session_state.cal_grids
+            _have_cal_grids = True
+
+    if _have_cal_grids:
+        cal_grids = cal_grids_cached
+        for (mkey, mn), grid in cal_grids.items():
+            pareto, enriched = _pareto_from_grid(grid, esc_cost)
+            cal_pareto[(mkey, mn)] = pareto
+            cal_grids[(mkey, mn)] = enriched
+            if pareto:
+                cal_opt[(mkey, mn)] = max(pareto, key=lambda r: r["acc_esc"])
+
+        # --- Optimal T table ---
+        st.markdown("**Optimal Temperature per Method \u00d7 Model**")
+        html = _at_css + '<table class="at"><tr><th class="mb">Method</th>'
+        for mn in model_names:
+            html += f'<th class="mb" colspan="4">{mn}</th>'
+        html += '</tr><tr><th class="mb"></th>'
+        for mn in model_names:
+            html += '<th class="mb">T*</th><th>\u03c4*</th><th>acc_esc</th><th>avg_N</th>'
+        html += '</tr>'
+        for method_label, mkey in METHODS:
+            html += f'<tr><td class="mb"><b>{method_label}</b></td>'
+            for mn in model_names:
+                b = cal_opt.get((mkey, mn))
+                if b:
+                    html += (f'<td class="mb"><b>{b["T"]:.1f}</b></td>'
+                             f'<td>{b["tau"]:.2f}</td>'
+                             f'<td>{b["acc_esc"]:.1%}</td>'
+                             f'<td>{b["avg_n"]:.1f}</td>')
+                else:
+                    html += '<td class="mb" colspan="4">-</td>'
+            html += '</tr>'
+        html += '</table>'
+        st.markdown(html, unsafe_allow_html=True)
+
+        # --- Extract calibrated τ-sweep from grid at optimal T ---
+        for mn in model_names:
+            mdata = model_data[mn]
+            cal_md = {
+                "questions": mdata["questions"], "n_q": mdata["n_q"],
+                "baseline_acc": mdata["baseline_acc"],
+                "has_esc1": mdata["has_esc1"], "has_esc2": mdata["has_esc2"],
+                "esc1_run": mdata["esc1_run"], "esc2_run": mdata["esc2_run"],
+            }
+            for _, mkey in METHODS:
+                opt_T = cal_opt.get((mkey, mn), {}).get("T", 1.0)
+                grid = cal_grids_cached.get((mkey, mn), [])
+                results = []
+                for tau in tau_values_cal:
+                    match = next(
+                        (r for r in grid
+                         if abs(r["T"] - opt_T) < 0.01 and abs(r["tau"] - tau) < 0.001),
+                        None,
+                    )
+                    if match:
+                        results.append({
+                            "tau": tau, "avg_n": match["avg_n"],
+                            "acc": match["acc"], "cap": match["cap_rate"],
+                            "esc1": match.get("esc1"),
+                            "esc2": match.get("esc2"),
+                        })
+                    else:
+                        results.append({
+                            "tau": tau, "avg_n": 0, "acc": 0, "cap": 0,
+                            "esc1": None, "esc2": None,
+                        })
+                cal_md[f"{mkey}_results"] = results
+            cal_model_data[mn] = cal_md
+
+        # --- Calibrated \u03c4-sweep tables ---
+        cal_hl = _make_cross_method_highlight(
+            cal_model_data, model_names, METHODS, tau_values_cal,
+            ["acc", "esc1", "esc2"], ["cap"],
+        )
+        cal_descs = {}
         for _, mkey in METHODS:
-            mdata[f"{mkey}_pareto"] = _pareto(mdata[f"{mkey}_grid"])
+            ts = [f"{cal_opt.get((mkey, mn), {}).get('T', 1.0):.1f}"
+                  for mn in model_names]
+            cal_descs[mkey] = f"T* = {', '.join(ts)}"
 
-    def _add_method_traces(fig, grid, pareto, color, name, has_temp):
-        p_keys = {(r["T"], r["tau"]) for r in pareto}
-        non_p = [r for r in grid if (r["T"], r["tau"]) not in p_keys]
-        t_fmt = f"{name} T=%{{customdata[0]:.1f}}, " if has_temp else f"{name} "
-        if non_p:
+        _render_tau_tables(cal_model_data, model_names, METHODS, tau_values_cal,
+                           cal_hl, _at_css, n_max, desc_override=cal_descs)
+
+        # --- Calibrated Accuracy vs Compute ---
+        st.markdown("**Accuracy vs Compute (at optimal T)**")
+        for mn in model_names:
+            cmd = cal_model_data[mn]
+            fig = go.Figure()
+            for method_label, mkey in METHODS:
+                color = MCOLORS[mkey]
+                results = cmd[f"{mkey}_results"]
+                opt_T = cal_opt.get((mkey, mn), {}).get("T", 1.0)
+                xs = [r["avg_n"] for r in results]
+                fig.add_trace(go.Scatter(
+                    x=xs, y=[r["acc"] for r in results],
+                    mode="lines+markers",
+                    name=f"{method_label} T={opt_T:.1f}",
+                    line=dict(color=color, width=2.5), marker=dict(size=8),
+                    hovertemplate=(
+                        f"{method_label} T={opt_T:.1f} "
+                        "\u03c4=%{customdata:.2f}<br>"
+                        "avg_N=%{x:.2f}<br>acc=%{y:.1%}<extra></extra>"
+                    ),
+                    customdata=[r["tau"] for r in results],
+                ))
+                if cmd["has_esc2"]:
+                    ys = [r["esc2"] for r in results if r["esc2"] is not None]
+                    if ys:
+                        fig.add_trace(go.Scatter(
+                            x=xs[:len(ys)], y=ys,
+                            mode="lines+markers",
+                            name=f"{method_label} +think",
+                            line=dict(color=color, width=2, dash="dash"),
+                            marker=dict(size=6, symbol="diamond"),
+                        ))
+            baseline = cmd["baseline_acc"]
             fig.add_trace(go.Scatter(
-                x=[r["total_cost"] for r in non_p],
-                y=[r["acc_esc"] for r in non_p],
-                mode="markers",
-                marker=dict(size=4, color=color, opacity=0.10),
+                x=[n_max], y=[baseline],
+                mode="markers", name=f"All-{n_max} baseline",
+                marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
+            ))
+            fig.add_hline(
+                y=baseline, line_dash="dash", line_color=GRAY_LIGHT,
+                annotation_text=f"all-{n_max} baseline ({baseline:.1%})",
+                annotation_position="bottom right",
+            )
+            fig.update_layout(**_base_layout(
+                title=f"{mn} \u2014 Accuracy vs Compute (calibrated)",
+                xaxis_title="avg_N", yaxis_title="Accuracy",
+                height=350,
+                yaxis=dict(tickformat=".0%", gridcolor=GRID),
+                xaxis=dict(range=[0.5, n_max + 0.5], gridcolor=GRID),
+            ))
+            st.plotly_chart(_round_hover(fig), width="stretch")
+
+        # --- Pareto frontier charts (all methods sweep T) ---
+        st.markdown("**Pareto Frontiers (all methods sweep T \u00d7 \u03c4)**")
+
+        def _add_method_traces(fig, grid, pareto, color, name):
+            p_keys = {(r["T"], r["tau"]) for r in pareto}
+            non_p = [r for r in grid if (r["T"], r["tau"]) not in p_keys]
+            t_fmt = f"{name} T=%{{customdata[0]:.1f}}, "
+            if non_p:
+                fig.add_trace(go.Scatter(
+                    x=[r["total_cost"] for r in non_p],
+                    y=[r["acc_esc"] for r in non_p],
+                    mode="markers",
+                    marker=dict(size=4, color=color, opacity=0.10),
+                    hovertemplate=(
+                        t_fmt + "\u03c4=%{customdata[1]:.2f}<br>"
+                        "cost=%{x:.1f} \u00b7 acc+esc=%{y:.1%}<br>"
+                        "avg_N=%{customdata[2]:.1f} \u00b7 cap=%{customdata[3]:.0%}"
+                        "<extra></extra>"
+                    ),
+                    customdata=[[r["T"], r["tau"], r["avg_n"], r["cap_rate"]]
+                                for r in non_p],
+                    name=f"{name} (all)", showlegend=False,
+                ))
+            fig.add_trace(go.Scatter(
+                x=[r["total_cost"] for r in pareto],
+                y=[r["acc_esc"] for r in pareto],
+                mode="lines+markers",
+                marker=dict(size=8, color=color, symbol="star"),
+                line=dict(color=color, width=2.5),
                 hovertemplate=(
                     t_fmt + "\u03c4=%{customdata[1]:.2f}<br>"
                     "cost=%{x:.1f} \u00b7 acc+esc=%{y:.1%}<br>"
                     "avg_N=%{customdata[2]:.1f} \u00b7 cap=%{customdata[3]:.0%}"
                     "<extra></extra>"
                 ),
-                customdata=[[r["T"], r["tau"], r["avg_n"], r["cap_rate"]] for r in non_p],
-                name=f"{name} (all)", showlegend=False,
+                customdata=[[r["T"], r["tau"], r["avg_n"], r["cap_rate"]]
+                            for r in pareto],
+                name=f"{name} Pareto",
             ))
-        fig.add_trace(go.Scatter(
-            x=[r["total_cost"] for r in pareto],
-            y=[r["acc_esc"] for r in pareto],
-            mode="lines+markers",
-            marker=dict(size=8, color=color, symbol="star"),
-            line=dict(color=color, width=2.5),
-            hovertemplate=(
-                t_fmt + "\u03c4=%{customdata[1]:.2f}<br>"
-                "cost=%{x:.1f} \u00b7 acc+esc=%{y:.1%}<br>"
-                "avg_N=%{customdata[2]:.1f} \u00b7 cap=%{customdata[3]:.0%}"
-                "<extra></extra>"
-            ),
-            customdata=[[r["T"], r["tau"], r["avg_n"], r["cap_rate"]] for r in pareto],
-            name=f"{name} Pareto",
-        ))
 
-    for mn in model_names:
-        mdata = model_data[mn]
-        fig2 = go.Figure()
+        for mn in model_names:
+            fig2 = go.Figure()
+            for method_label, mkey in METHODS:
+                grid = cal_grids[(mkey, mn)]
+                pareto = cal_pareto[(mkey, mn)]
+                _add_method_traces(fig2, grid, pareto, MCOLORS[mkey], method_label)
+            baseline = model_data[mn]["baseline_acc"]
+            fig2.add_trace(go.Scatter(
+                x=[float(n_max)], y=[baseline],
+                mode="markers", name=f"All-{n_max} baseline",
+                marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
+            ))
+            fig2.update_layout(**_base_layout(
+                title=f"{mn} \u2014 Accuracy vs Total Cost (all methods sweep T)",
+                xaxis_title="Total cost per question (base-query units)",
+                yaxis_title="Accuracy (with best escalation)",
+                height=400,
+                yaxis=dict(tickformat=".1%", gridcolor=GRID),
+                xaxis=dict(gridcolor=GRID),
+            ))
+            st.plotly_chart(_round_hover(fig2), width="stretch")
+
+        # --- Pareto tables ---
+        def _pareto_table(pareto_list):
+            h = _at_css + '<table class="at"><tr>'
+            h += '<th>T</th><th>\u03c4</th><th>N</th><th>cap</th>'
+            h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
+            for r in pareto_list:
+                h += f'<tr><td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
+                h += f'<td>{r["avg_n"]:.2f}</td>'
+                h += f'<td>{r["cap_rate"]:.1%}</td>'
+                h += f'<td>{r["acc"]:.1%}</td>'
+                h += f'<td>{r["acc_esc"]:.1%}</td>'
+                h += f'<td>{r["total_cost"]:.1f}</td></tr>'
+            h += '</table>'
+            return h
+
         for method_label, mkey in METHODS:
-            _add_method_traces(
-                fig2, mdata[f"{mkey}_grid"], mdata[f"{mkey}_pareto"],
-                MCOLORS[mkey], method_label, mkey == "prod",
-            )
-        baseline = mdata["baseline_acc"]
-        fig2.add_trace(go.Scatter(
-            x=[float(n_max)], y=[baseline],
-            mode="markers", name=f"All-{n_max} baseline",
-            marker=dict(size=12, color=GRAY_LIGHT, symbol="diamond"),
-        ))
-        fig2.update_layout(**_base_layout(
-            title=f"{mn} — Accuracy vs Total Cost",
-            xaxis_title="Total cost per question (base-query units)",
-            yaxis_title="Accuracy (with best escalation)",
-            height=400,
-            yaxis=dict(tickformat=".1%", gridcolor=GRID),
-            xaxis=dict(gridcolor=GRID),
-        ))
-        st.plotly_chart(_round_hover(fig2), width="stretch")
-
-    # --- Pareto tables: per method, models side by side ---
-    all_pareto_lists = []
-    for mn in model_names:
-        for _, mkey in METHODS:
-            all_pareto_lists.append(model_data[mn][f"{mkey}_pareto"])
-
-    _pcs = _make_highlight(
-        all_pareto_lists,
-        ["acc", "acc_esc"], ["cap_rate"],
-        skip_tau_zero=False,
-    )
-
-    def _pareto_table_t(pareto_list):
-        h = _at_css + '<table class="at"><tr>'
-        h += '<th>T</th><th>\u03c4</th><th>N</th><th>cap</th>'
-        h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
-        for r in pareto_list:
-            h += f'<tr><td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
-            h += f'<td>{r["avg_n"]:.2f}</td>'
-            h += f'<td{_pcs("cap_rate", r["cap_rate"])}>{r["cap_rate"]:.1%}</td>'
-            h += f'<td{_pcs("acc", r["acc"])}>{r["acc"]:.1%}</td>'
-            h += f'<td{_pcs("acc_esc", r["acc_esc"])}>{r["acc_esc"]:.1%}</td>'
-            h += f'<td>{r["total_cost"]:.1f}</td></tr>'
-        h += '</table>'
-        return h
-
-    def _pareto_table_notau(pareto_list):
-        h = _at_css + '<table class="at"><tr>'
-        h += '<th>\u03c4</th><th>N</th><th>cap</th>'
-        h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
-        for r in pareto_list:
-            h += f'<tr><td>{r["tau"]:.2f}</td>'
-            h += f'<td>{r["avg_n"]:.2f}</td>'
-            h += f'<td{_pcs("cap_rate", r["cap_rate"])}>{r["cap_rate"]:.1%}</td>'
-            h += f'<td{_pcs("acc", r["acc"])}>{r["acc"]:.1%}</td>'
-            h += f'<td{_pcs("acc_esc", r["acc_esc"])}>{r["acc_esc"]:.1%}</td>'
-            h += f'<td>{r["total_cost"]:.1f}</td></tr>'
-        h += '</table>'
-        return h
-
-    for method_label, mkey in METHODS:
-        st.markdown(f"**{method_label} — Pareto Frontiers**")
-        cols = st.columns(len(model_names))
-        for ci, mn in enumerate(model_names):
-            with cols[ci]:
-                st.markdown(f"*{mn}*")
-                if mkey == "prod":
-                    st.markdown(_pareto_table_t(model_data[mn][f"{mkey}_pareto"]),
-                                unsafe_allow_html=True)
-                else:
-                    st.markdown(_pareto_table_notau(model_data[mn][f"{mkey}_pareto"]),
-                                unsafe_allow_html=True)
+            st.markdown(f"**{method_label} \u2014 Pareto Frontiers**")
+            cols = st.columns(len(model_names))
+            for ci, mn in enumerate(model_names):
+                with cols[ci]:
+                    st.markdown(f"*{mn}*")
+                    st.markdown(
+                        _pareto_table(cal_pareto[(mkey, mn)]),
+                        unsafe_allow_html=True,
+                    )
+    else:
+        st.info("No temperature calibration data. "
+                "Run `python dashboard/precompute_adaptive.py` or click "
+                "**Recalculate Adaptive Cache** in the sidebar.")
 
     # --- Export results ---
     st.subheader("Export Results")
-    export_data = {"temperature": temperature, "n_max": n_max, "models": {}}
-    for mn in model_names:
-        mdata = model_data[mn]
-        m_export = {
-            "n_questions": mdata["n_q"],
-            "baseline_acc": mdata["baseline_acc"],
-            "tau_sweep": {},
-            "pareto": {},
-        }
-        for method_label, mkey in METHODS:
-            m_export["tau_sweep"][mkey] = mdata[f"{mkey}_results"]
-            m_export["pareto"][mkey] = mdata[f"{mkey}_pareto"]
-        export_data["models"][mn] = m_export
-
     import json as _json
     from pathlib import Path
+
+    export_data: dict = {"n_max": n_max, "models": {}}
+    for mn in model_names:
+        mdata = model_data[mn]
+        m_export: dict = {
+            "n_questions": mdata["n_q"],
+            "baseline_acc": mdata["baseline_acc"],
+            "raw_tau_sweep": {},
+        }
+        for _, mkey in METHODS:
+            m_export["raw_tau_sweep"][mkey] = mdata[f"{mkey}_results"]
+        if cal_opt:
+            m_export["calibrated"] = {}
+            for _, mkey in METHODS:
+                opt = cal_opt.get((mkey, mn), {})
+                m_export["calibrated"][mkey] = {
+                    "opt_T": opt.get("T"),
+                    "opt_tau": opt.get("tau"),
+                    "acc_esc": opt.get("acc_esc"),
+                    "pareto": cal_pareto.get((mkey, mn), []),
+                }
+                if mn in cal_model_data:
+                    m_export["calibrated"][mkey]["tau_sweep"] = (
+                        cal_model_data[mn][f"{mkey}_results"]
+                    )
+        export_data["models"][mn] = m_export
+
     export_json = _json.dumps(export_data, indent=2, default=float)
-    export_path = Path(r"C:\Users\evama\Dropbox\Family Room\Projects\bayesian-uq\results\adaptive_sampling_export.json")
+    export_path = Path(
+        r"C:\Users\evama\Dropbox\Family Room\Projects\bayesian-uq"
+        r"\paper\results\adaptive_sampling_export.json"
+    )
 
     col_dl, col_save = st.columns(2)
     with col_dl:
@@ -2957,10 +3092,10 @@ def tab_adaptive() -> None:
             mime="application/json",
         )
     with col_save:
-        if st.button("Save to results/"):
+        if st.button("Save to paper/results/", key="save_export"):
             export_path.parent.mkdir(parents=True, exist_ok=True)
             export_path.write_text(export_json, encoding="utf-8")
-            st.success(f"Saved to `{export_path.name}`")
+            st.success(f"Saved to `{export_path}`")
 
 
 # ---------------------------------------------------------------------------

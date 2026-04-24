@@ -232,7 +232,24 @@ NOT doing: production system (paper = empirical validation), training anything (
 
 **What this gets over the original three methods:** concentration estimated from data (not assumed = N like Sum), no temperature (unlike Product), works at N=2 with principled regularization (unlike raw MLE), and the stopping threshold has a clean probabilistic interpretation that accounts for estimation uncertainty.
 
-### 8.3 Signal-augmented stopping (designed, TODO: implement)
+### 8.3 Temperature-for-all hypothesis (April 24, 2026)
+
+**Insight:** Temperature scaling isn't a Product-specific hack — it's a preprocessing step all methods should use. Product needs it to prevent exponential overconcentration. MoM/MoM+Bayes need it to prevent **illusory consistency**: overconfident logprobs compress vectors toward simplex vertices, making two genuinely different opinions look identical in variance space.
+
+**The interaction effect:** Qwen 3 (MSP≈0.91, most overconfident) shows MoM+Bayes stopping too aggressively at intermediate τ. At N=2, two near-vertex vectors produce R̂≈0 → α̂₀→∞ → premature stop. The Gamma prior dampens this but not enough when the prior itself allows high α₀.
+
+**Predictions to test:**
+1. **Product** optimal T ≈ 3.0 (already known from ECE optimization)
+2. **Sum** optimal T ≈ 1.0 (temperature doesn't change pseudo-count ordering, only accumulation rate — if T>1 helps Sum significantly, that's surprising and worth investigating)
+3. **MoM/MoM+Bayes** optimal T < Product's T (1.5–2.5 range?) — concentration estimation already handles some overconfidence, so you need less temperature correction
+4. **MLE** optimal T unknown — the iterative fit should partially compensate, but log-space sufficient statistics may still benefit from calibration
+
+**Complementarity story for the paper:** "Temperature fixes the *shape* (how peaked each vector is). Concentration fixes the *agreement* (how consistent vectors are across shuffles). You need less of one when you have the other."
+
+**Implementation:** Dashboard restructured: Raw section (T=1 for all) on top as honest baseline. Calibrated section below with button that sweeps T∈[1,5] for all methods, finds optimal T per (method, model), displays results. This directly tests whether MoM+Bayes is the recommended method *with or without* temperature.
+
+### 8.4 Signal-augmented stopping (designed, TODO: implement)
+
 
 Pure posterior measures consistency, not correctness. Veto signals:
 - **2nd Gap** < threshold → don't stop (runner-up too close, posterior may be wrong)
@@ -241,7 +258,7 @@ Pure posterior measures consistency, not correctness. Veto signals:
 - **Confidence variance** > threshold → unstable
 - **Tier 2 (future):** cross-mode disagreement, think trace hedging phrase count
 
-### 8.4 Full adaptive pipeline (TODO: design + implement)
+### 8.5 Full adaptive pipeline (TODO: design + implement)
 
 The dashboard retroactively simulates adaptive stopping on existing data. For publishable results, need a real pipeline that:
 1. Actually stops early (not just simulates)
@@ -249,7 +266,7 @@ The dashboard retroactively simulates adaptive stopping on existing data. For pu
 3. Implements escalation (switch to CoT/think on capped questions)
 4. Uses held-out calibration set for T and τ
 
-### 8.5 Flat baselines for comparison
+### 8.6 Flat baselines for comparison
 
 - **Flat direct**: all 4609 × 2.5s = ~3.2h. Accuracy ~75%.
 - **Flat CoT shuffle**: all 4609 × 60s = ~77h. Accuracy ~79%.

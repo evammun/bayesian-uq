@@ -3,7 +3,7 @@
 **Authors:** Eva Martin, Professor Luigi
 **Working title:** TBD
 **Started:** March 2026 (pivot from MMLU-based UQ)
-**Status:** Experiments running on CSC Mahti. 15/19 conditions complete. Adaptive sampling framework with 5 posterior methods.
+**Status:** Experiments running on CSC Mahti. 15/19 conditions complete. 5 posterior methods implemented + temperature-for-all calibration framework.
 
 ---
 
@@ -647,5 +647,41 @@ Added MoM and MoM+Bayes to adaptive sampling tab alongside Product, Sum, MLE. Al
 Section 8.2 added: full posterior aggregation debate summary. Implementation strategy note from Browser: test MoM-simple first, if it already dominates Sum, the Bayesian wrapper goes in "principled extension" section. Decision: implement both, compare all 5 on Pareto frontier.
 
 ### Explainer document
-Wrote `paper/numbskull spud.md` — 3-level escalating explainer of all 5 methods (ELI10 → ELI15 → MSc/PhD). Consistent examples threading through all levels.
+Wrote `paper/numbskull spud.md` — 3-level escalating explainer of all 5 methods (ELI10 → ELI15 → MSc/PhD). Consistent examples threading through all levels. Added empirical results section with cross-model analysis of all 5 methods.
+
+### Cross-model analysis of 5 posterior methods (from adaptive sampling export)
+**Key findings at τ=0.95:**
+- **Product** fastest (avg_N=1.9–5.3) but wildly inconsistent across models. Gemma escalation rate just 2.1% — barely catches hard questions.
+- **MoM+Bayes** best efficiency tradeoff: 3.4–4.1 queries consistently, healthy escalation (16–22%), near-best Pareto accuracy. No hyperparameters.
+- **Sum/MLE** thorough but expensive (6–7.4 queries). MLE dominated — always slowest, no accuracy gain over Sum.
+- MoM+Bayes Pareto-best: Gemma 76.94%, Qwen 3 77.11%, Qwen 3.5 83.47%.
+
+### Temperature-for-all-methods hypothesis
+**Insight:** Temperature isn't Product-specific. MoM/MoM+Bayes suffer from "illusory consistency" — overconfident logprobs compress vectors toward vertices, making variance look tiny even when model genuinely wavers. Temperature-scaling vectors before computing R̂ would expose hidden variance.
+
+**Predictions:**
+- Product T*≈3.0 (known), Sum T*≈1.0 (shouldn't matter), MoM/Bayes T*≈1.5–2.5 (lower than Product — concentration handles some overconfidence)
+- If Sum T*>1 significantly, that's surprising (linear accumulation shouldn't care about scale)
+
+**Dashboard restructured:** Raw section (T=1 for all methods) on top. Calibrated section below with "Optimize Temperature" button: sweeps T∈[1,5] for ALL methods, finds T* per (method, model), displays optimal T table + calibrated τ-sweep tables + Pareto frontiers.
+
+Other dashboard improvements: cross-method highlighting (greens compare 5 methods per model, not globally), thick borders between model columns, export saves to paper/results/.
+
+### Brainstorm updated
+Section 8.3 added: temperature-for-all hypothesis with predictions, complementarity story, implementation plan.
+
+### Dashboard precompute cache for adaptive sampling
+Adaptive sampling tab was taking 10+ min to load (grid sweep of T×τ for 5 methods × 3 models). Created standalone `dashboard/precompute_adaptive.py` script that:
+- Loads all result data, builds per-model question data
+- Computes raw trajectories (T=1) and tau sweeps for all 5 methods
+- Runs full temperature grid sweep (T∈[1,5], τ∈[0.6,0.99]) with esc1/esc2 tracking
+- Saves everything to `dashboard/adaptive_cache.pkl`
+
+Dashboard (`app.py`) now:
+- Checks for cache file at load time — if valid, skips all expensive computation
+- Falls back to live computation if no cache (with warning message)
+- Calibrated section extracts tau-sweep results directly from grid data at optimal T (no trajectory recomputation)
+- Sidebar "Recalculate Adaptive Cache" button runs precompute script via subprocess
+
+Net effect: dashboard loads in seconds instead of 10+ min. Run `python dashboard/precompute_adaptive.py` after data changes.
 
