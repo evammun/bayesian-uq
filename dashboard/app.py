@@ -32,9 +32,11 @@ from streamlit_autorefresh import st_autorefresh
 # Paths
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DASHBOARD_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = DASHBOARD_DIR.parent
 RESULTS_DIR = PROJECT_ROOT / "results"
 SIGNALS_CSV = PROJECT_ROOT / "analysis" / "signals.csv"
+ANALYSIS_CACHE = DASHBOARD_DIR / "analysis_cache.pkl.gz"
 
 # ---------------------------------------------------------------------------
 # Palette
@@ -412,6 +414,66 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+def _slim_query_log(query_log: list[dict]) -> list[dict]:
+    """Strip heavy text fields from query_log entries for caching."""
+    keep = ("canonical_probs", "canonical_answer", "pass1_canonical_answer",
+            "answer_permutation", "inference_time_s", "query_number")
+    return [{k: ql.get(k) for k in keep if k in ql} for ql in query_log]
+
+
+def build_analysis_cache() -> dict:
+    """Build a compact cache of all analysis data from result files."""
+    import pickle as _pickle
+    import gzip as _gzip
+
+    files = get_result_files()
+    all_data: dict[str, dict] = {}
+    run_meta: dict[str, dict] = {}
+    for fp in files:
+        data = _load_json(fp)
+        if data:
+            prefix = _extract_run_prefix(fp.stem)
+            all_data[prefix] = data
+            cfg = data.get("config", {})
+            run_meta[prefix] = {
+                "config": cfg,
+                "label": format_run_label(cfg) if cfg else prefix,
+            }
+
+    full_df = results_to_df(all_data)
+
+    if not full_df.empty:
+        if "query_log" in full_df.columns:
+            full_df["query_log"] = full_df["query_log"].apply(_slim_query_log)
+        full_df = full_df.drop(columns=["question_text", "options"], errors="ignore")
+
+    signals = load_signals()
+
+    cache = {
+        "df": full_df,
+        "run_meta": run_meta,
+        "signals_df": signals,
+        "built_at": datetime.now().isoformat(),
+    }
+
+    raw = _pickle.dumps(cache, protocol=4)
+    with open(ANALYSIS_CACHE, "wb") as f:
+        f.write(_gzip.compress(raw, compresslevel=6))
+
+    return cache
+
+
+@st.cache_data(ttl=None)
+def _load_analysis_cache(_mtime: float) -> dict | None:
+    import pickle as _pickle
+    import gzip as _gzip
+    try:
+        with open(ANALYSIS_CACHE, "rb") as f:
+            return _pickle.load(_gzip.open(f, "rb"))
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -419,67 +481,96 @@ def results_to_df(all_data: dict[str, dict]) -> pd.DataFrame:
 st.sidebar.markdown("# Pre-Action UQ")
 
 result_files = get_result_files()
-if not result_files:
-    st.sidebar.warning("No result files in results/")
+HAS_LOCAL_FILES = len(result_files) > 0
+HAS_ANALYSIS_CACHE = ANALYSIS_CACHE.exists()
+
+if not HAS_LOCAL_FILES and not HAS_ANALYSIS_CACHE:
+    st.sidebar.warning("No result files or analysis cache found")
     st.title("Pre-Action Uncertainty Quantification")
-    st.info("No results found. Run experiments first.")
+    st.info("No results found. Run experiments first, or deploy with an analysis cache.")
     st.stop()
 
-# Auto-refresh
-auto_refresh = st.sidebar.toggle("Auto-refresh (2 min)", value=False)
-if auto_refresh:
-    st_autorefresh(interval=120_000, key="auto_refresh_counter")
+# Auto-refresh — only touches Progress tab (live file reading)
+auto_refresh = False
+if HAS_LOCAL_FILES:
+    auto_refresh = st.sidebar.toggle("Auto-refresh progress (2 min)", value=False)
+    if auto_refresh:
+        st_autorefresh(interval=120_000, key="auto_refresh_counter")
 
-# Recalculate adaptive sampling cache
+# --- Cache management buttons ---
 st.sidebar.divider()
-st.sidebar.caption("Adaptive cache: ~36 min to recompute")
-if st.sidebar.button("Recalculate Adaptive Cache", key="recalc_adaptive"):
-    import subprocess, sys
-    _script = Path(__file__).resolve().parent / "precompute_adaptive.py"
-    _python = Path(sys.executable)
-    with st.sidebar.status("Recomputing adaptive sampling...", expanded=True):
-        _proc = subprocess.run(
-            [str(_python), str(_script)],
-            capture_output=True, text=True, timeout=1200,
-        )
-        if _proc.returncode == 0:
-            st.sidebar.success("Cache updated! Refresh the page to use new results.")
-        else:
-            st.sidebar.error(f"Precompute failed:\n{_proc.stderr[-500:]}")
-        if _proc.stdout:
-            st.sidebar.text(_proc.stdout[-1000:])
 
-# Build run labels
-run_labels: dict[str, Path] = {}
-for fp in result_files:
-    cfg = _extract_config_head(fp)
-    if cfg:
-        label = format_run_label(cfg)
-    else:
-        label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
-    run_labels[label] = fp
+if HAS_LOCAL_FILES:
+    if st.sidebar.button("Update Analysis Cache", key="update_analysis"):
+        with st.sidebar.status("Building analysis cache...", expanded=True):
+            t0 = time.time()
+            cache = build_analysis_cache()
+            elapsed = time.time() - t0
+            n_runs = len(cache.get("run_meta", {}))
+            n_rows = len(cache["df"]) if cache["df"] is not None and not cache["df"].empty else 0
+            sz = ANALYSIS_CACHE.stat().st_size / 1e6
+            st.sidebar.success(
+                f"Cache built in {elapsed:.0f}s — {n_runs} runs, "
+                f"{n_rows:,} questions, {sz:.1f} MB"
+            )
+        st.rerun()
 
-# Select all checkbox + multiselect
-select_all = st.sidebar.checkbox("Select all", value=True)
-if select_all:
+    st.sidebar.caption("Adaptive cache: ~36 min to recompute")
+    if st.sidebar.button("Recalculate Adaptive Cache", key="recalc_adaptive"):
+        import subprocess, sys
+        _script = Path(__file__).resolve().parent / "precompute_adaptive.py"
+        _python = Path(sys.executable)
+        with st.sidebar.status("Recomputing adaptive sampling...", expanded=True):
+            _proc = subprocess.run(
+                [str(_python), str(_script)],
+                capture_output=True, text=True, timeout=1200,
+            )
+            if _proc.returncode == 0:
+                st.sidebar.success("Cache updated! Refresh the page to use new results.")
+            else:
+                st.sidebar.error(f"Precompute failed:\n{_proc.stderr[-500:]}")
+            if _proc.stdout:
+                st.sidebar.text(_proc.stdout[-1000:])
+
+# --- Load analysis data from cache ---
+analysis_cache = None
+if HAS_ANALYSIS_CACHE:
+    _cache_mtime = ANALYSIS_CACHE.stat().st_mtime
+    analysis_cache = _load_analysis_cache(_cache_mtime)
+
+if analysis_cache is not None:
+    df = analysis_cache["df"]
+    signals_df = analysis_cache.get("signals_df")
+    _cached_meta = analysis_cache.get("run_meta", {})
+    run_labels = {v["label"]: None for v in _cached_meta.values()}
     selected_labels = list(run_labels.keys())
+    selected_paths: dict[str, Path | None] = run_labels.copy()
+    _cache_time = analysis_cache.get("built_at", "unknown")
+    st.sidebar.caption(f"Analysis cache: {_cache_time}")
 else:
-    selected_labels = st.sidebar.multiselect(
-        "Experiment runs", list(run_labels.keys()), default=list(run_labels.keys())
-    )
+    # No cache — build df live from files (first run / cache deleted)
+    run_labels: dict[str, Path] = {}
+    for fp in result_files:
+        cfg = _extract_config_head(fp)
+        if cfg:
+            label = format_run_label(cfg)
+        else:
+            label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
+        run_labels[label] = fp
 
-selected_paths = {label: run_labels[label] for label in selected_labels}
+    selected_labels = list(run_labels.keys())
+    selected_paths = run_labels.copy()
 
-# Load selected data
-all_data: dict[str, dict] = {}
-for label, fp in selected_paths.items():
-    data = _load_json(fp)
-    if data:
-        prefix = _extract_run_prefix(fp.stem)
-        all_data[prefix] = data
+    all_data: dict[str, dict] = {}
+    for label, fp in selected_paths.items():
+        data = _load_json(fp)
+        if data:
+            prefix = _extract_run_prefix(fp.stem)
+            all_data[prefix] = data
 
-df = results_to_df(all_data)
-signals_df = load_signals()
+    df = results_to_df(all_data)
+    signals_df = load_signals()
+    st.sidebar.warning("No analysis cache — click 'Update Analysis Cache' to build one.")
 
 
 # ---------------------------------------------------------------------------
@@ -1137,8 +1228,13 @@ def tab_explorer() -> None:
         return
 
     # Build dropdown by unique question (not per-run)
-    q_info = df_valid.drop_duplicates("question_id")[["question_id", "question_text", "difficult"]].copy()
-    q_info["label"] = q_info["question_id"].str[:20] + " | " + q_info["question_text"].str[:60]
+    _has_qtext = "question_text" in df_valid.columns
+    _id_cols = ["question_id", "difficult"] + (["question_text"] if _has_qtext else [])
+    q_info = df_valid.drop_duplicates("question_id")[_id_cols].copy()
+    if _has_qtext:
+        q_info["label"] = q_info["question_id"].str[:20] + " | " + q_info["question_text"].str[:60]
+    else:
+        q_info["label"] = q_info["question_id"].str[:40]
     selected_label = st.selectbox("Select a question", q_info["label"].values)
     if not selected_label:
         return
@@ -1148,15 +1244,19 @@ def tab_explorer() -> None:
     first = all_rows.iloc[0]
 
     # --- Question header (shared across runs) ---
-    st.markdown(f"**Q: {first['question_text']}**")
-    options = first.get("options", [])
+    if _has_qtext:
+        st.markdown(f"**Q: {first['question_text']}**")
+    else:
+        st.markdown(f"**Q: {qid}**")
+    options = first.get("options", []) if "options" in first.index else []
     correct = first.get("correct_answer", -1)
     diff_label = "Hard" if first["difficult"] else "Easy"
-    opts_html = ""
-    for i, opt in enumerate(options):
-        marker = ' <span style="color:#2A8C8F; font-weight:600;">[CORRECT]</span>' if i == correct else ""
-        opts_html += f'<div style="font-size:13px; margin:2px 0;"><b>{ANSWER_LETTERS[i]})</b> {opt}{marker}</div>'
-    st.markdown(opts_html, unsafe_allow_html=True)
+    if options:
+        opts_html = ""
+        for i, opt in enumerate(options):
+            marker = ' <span style="color:#2A8C8F; font-weight:600;">[CORRECT]</span>' if i == correct else ""
+            opts_html += f'<div style="font-size:13px; margin:2px 0;"><b>{ANSWER_LETTERS[i]})</b> {opt}{marker}</div>'
+        st.markdown(opts_html, unsafe_allow_html=True)
     st.caption(f"Difficulty: {diff_label} · Article: {first.get('article_id', '?')}")
 
     # --- Article context ---
@@ -3173,7 +3273,11 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 ])
 
 with tab1:
-    tab_progress()
+    if HAS_LOCAL_FILES:
+        tab_progress()
+    else:
+        st.info("Progress monitoring requires local result files. "
+                "Analysis tabs below use the cached data.")
 with tab2:
     tab_distributions()
 with tab3:
