@@ -2596,50 +2596,45 @@ def tab_adaptive() -> None:
         "logprob vectors. This is the honest baseline — no knobs turned."
     )
 
-    # --- Cross-method highlighting: only tag best & worst across 5 methods ---
+    # --- Cross-method highlighting: best acc (teal), worst acc if spread >1.5pp (rose) ---
     def _make_cross_method_highlight(model_data_src, model_names_src, methods_src,
-                                     tau_vals, keys_good, keys_bad):
-        """For each (model, tau, metric): highlight only the best and worst method."""
-        best_worst = {}
+                                     tau_vals):
+        """For each (model, tau): highlight best and worst accuracy across methods."""
+        acc_range = {}
         for mn in model_names_src:
             for ti, tau in enumerate(tau_vals):
                 if tau == 0.0:
                     continue
-                for k in keys_good + keys_bad:
-                    vals = []
-                    for _, mkey in methods_src:
-                        res = model_data_src[mn].get(f"{mkey}_results", [])
-                        if ti < len(res):
-                            v = res[ti].get(k)
-                            if v is not None:
-                                vals.append(v)
-                    if len(vals) >= 2:
-                        lo, hi = min(vals), max(vals)
-                        if hi - lo >= 0.005:
-                            best_worst[(mn, ti, k)] = (lo, hi)
-        bad_set = set(keys_bad)
+                vals = []
+                for _, mkey in methods_src:
+                    res = model_data_src[mn].get(f"{mkey}_results", [])
+                    if ti < len(res):
+                        v = res[ti].get("acc")
+                        if v is not None:
+                            vals.append(v)
+                if len(vals) >= 2:
+                    lo, hi = min(vals), max(vals)
+                    acc_range[(mn, ti)] = (lo, hi)
 
         def _hl(mn, ti, metric, value, skip=False):
-            if skip or value is None:
+            if skip or value is None or metric != "acc":
                 return ""
-            key = (mn, ti, metric)
-            if key not in best_worst:
+            key = (mn, ti)
+            if key not in acc_range:
                 return ""
-            lo, hi = best_worst[key]
-            is_best = abs(value - hi) < 1e-6
-            is_worst = abs(value - lo) < 1e-6
-            if metric in bad_set:
-                is_best, is_worst = is_worst, is_best
-            if is_best:
-                return ' style="background:rgba(42,140,143,0.18)"'
-            if is_worst:
-                return ' style="background:rgba(202,74,122,0.14)"'
+            lo, hi = acc_range[key]
+            spread = hi - lo
+            if spread < 0.005:
+                return ""
+            if abs(value - hi) < 1e-6:
+                return ' style="background:rgba(42,140,143,0.18);font-weight:700"'
+            if abs(value - lo) < 1e-6 and spread >= 0.015:
+                return ' style="background:rgba(202,74,122,0.12)"'
             return ""
         return _hl
 
     _cs = _make_cross_method_highlight(
         model_data, model_names, METHODS, tau_values,
-        ["acc", "esc1", "esc2"], ["cap"],
     )
 
     _at_css = """<style>
@@ -3112,7 +3107,6 @@ def tab_adaptive() -> None:
         # --- Calibrated \u03c4-sweep tables ---
         cal_hl = _make_cross_method_highlight(
             cal_model_data, model_names, METHODS, tau_values_cal,
-            ["acc", "esc1", "esc2"], ["cap"],
         )
         cal_descs = {}
         for _, mkey in METHODS:
