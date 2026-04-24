@@ -2,72 +2,50 @@
 
 ## Project Overview
 
-This is a research project developing **pre-action uncertainty quantification** for LLM-based systems. The core question: before a local LLM acts on a user query + retrieved context, can we detect whether it actually understood the situation — and route accordingly?
-
-The project builds on prior work (archived in `v2_mmlu_archive/`) that developed paraphrase-based logprob analysis for MCQA uncertainty. The new direction applies these techniques to realistic RAG and tool-calling scenarios rather than academic benchmarks.
+Research project on **uncertainty quantification for local LLMs** — can we measure how confident a model really is by probing it multiple times with shuffled/paraphrased inputs, treating the resulting logprob distributions as Bayesian evidence, and using that to make smarter routing decisions (answer directly vs escalate to a more expensive mode)?
 
 **Authors:** Eva Martin (lead researcher) and Professor Luigi (supervisor, Bayesian inference and computational neuroscience background).
 
-**Status:** Early-stage pivot. Brainstorming and design phase. No experiments yet.
+**Status:** Experiments running on CSC Mahti (A100 GPUs). 3 models × multiple conditions. Core pipeline complete, adaptive sampling framework built, analysis ongoing.
 
-## The Core Idea
+## What We're Doing
 
-In production LLM deployments (customer service, knowledge assistants, RAG-augmented agents), the model receives a user query + retrieved context and must decide what to do: answer directly, call a tool, ask for clarification, or escalate. At that decision point, nobody checks whether the model actually understood the query or the context.
+We present the same MCQ question to a local LLM multiple times with **shuffled answer orderings** (and optionally paraphrased question text). Each query yields a full probability vector [P(A), P(B), P(C), P(D)] from first-token logprobs, mapped back to canonical order. These N probability vectors are then aggregated into a posterior belief about the correct answer.
 
-We propose a **pre-action verification layer** that uses paraphrased comprehension probes + logprob analysis to measure three types of uncertainty before the model acts:
+The key contribution is the **adaptive sampling framework**: instead of always running all N permutations, we monitor the posterior as evidence accumulates and stop early when confident enough (saving compute) or escalate to a more expensive inference mode (CoT or think) when uncertain. The research questions are about which posterior aggregation method best serves this stopping decision, and how the uncertainty signals behave across models and reasoning modes.
 
-1. **Query comprehension uncertainty** — Does the model understand what the user is asking? Tested by paraphrasing the user query and checking whether the model's interpretation is stable across phrasings.
+**Dataset:** QuALITY (4609 long-form reading comprehension MCQs with article context). Chosen because it requires genuine comprehension of provided context — a proxy for RAG scenarios.
 
-2. **Context sufficiency uncertainty** — Does the model recognise whether the RAG-retrieved context actually contains the information needed? Tested by probing comprehension of the retrieved context and comparing model behaviour with sufficient vs insufficient context.
+**Models:** Qwen 3 8B, Qwen 3.5 9B, Gemma 4 E4B (all Q4_K_M quantised, run via llama-cpp-python).
 
-3. **Action selection uncertainty** — Should the model answer, call a tool, ask for clarification, or escalate? Tested by extracting logprobs at the action-selection decision point across paraphrased inputs.
+**Conditions (factorial):** prompt_mode (direct/CoT) × shuffle (on/off) × think (on/off). CoT and think use a two-pass pipeline: Pass 1 generates reasoning, Pass 2 extracts logprobs conditioned on the reasoning.
 
-## How Prior Work Maps Onto This
+## Key Findings So Far
 
-The v2 MMLU work established:
-- Paraphrase-based logprob extraction pipeline (query LLM with paraphrased inputs, extract logprob distributions, aggregate)
-- Uncertainty signals: entropy, agreement, epistemic/aleatoric decomposition, confidence variance, rank stability, answer coverage
-- The "fragile confidence" finding: high single-prompt confidence + low cross-paraphrase consistency = dangerous failure mode
-- Scaffolding absorption: CoT and structured output absorb uncertainty into token scaffolding before the decision token
+- **Scaffolding absorption:** CoT reasoning absorbs uncertainty into scaffolding tokens, spiking logprobs to near-1.0. Think mode collapses them entirely (MSP=1.000). Two-pass pipeline recovers informative logprobs.
+- **Per-query overconfidence:** Individual logprob vectors have MSP ≈ 0.91, ECE = 0.186. Mean across permutations is well-calibrated. This distinction is critical for posterior aggregation.
+- **Fragile confidence:** High single-prompt confidence + low cross-permutation consistency = dangerous failure mode. Invisible to any single metric.
+- **Adaptive stopping works:** At τ=0.95 with temperature-scaled Product posterior, avg_N=2.76 (of 10), accuracy maintained, 15% of hard questions escalated to think mode.
 
-All of this transfers. The model changes from "Qwen answering MCQs" to "Qwen acting as a RAG-augmented assistant." The logprob machinery is identical. The evaluation framework is identical. We just need a different experimental setup and dataset.
-
-## What Needs To Be Figured Out
-
-- **Dataset design:** What does the evaluation dataset look like? Options: adapt existing QA datasets (Natural Questions, SQuAD, MS MARCO) with sufficient/insufficient context variants, build a synthetic business-scenario dataset, or both.
-- **Comprehension probe generation:** How are the probes created? Auto-generated MCQ from query + context? Templated from the action space? Simpler consistency checks?
-- **Ground truth:** What counts as "correct understanding"? For action selection, ground truth is cleaner (there's a correct action). For comprehension, need a proxy.
-- **Tool-calling evaluation:** How to set up a realistic tool-calling scenario with defined tools and clear correct/incorrect action choices.
-- **Scope:** Is this one paper or two? Comprehension + context sufficiency is one story; tool-calling verification might be a separate one.
-
-## Architecture (from v2 — to be adapted)
+## Architecture
 
 ### Tech Stack
-- **Python** with Pydantic for data models, NumPy/SciPy for analysis
-- **Ollama** (or llama-cpp-python) for local model inference
-- **Primary model:** Qwen 3 8B Q4 (`qwen3:8b-q4_K_M`) — or newer equivalent
+- **Python** with Pydantic data models, NumPy/SciPy for analysis
+- **llama-cpp-python** for local inference with low-level logit extraction
 - **YAML** configs for experiment definitions
+- **Streamlit** dashboard for monitoring and analysis
+- **CSC Mahti** (A100 40GB) and vast.ai (RTX 5090) for compute
 
 ### Project Structure
 ```
-src/pre_action_uq/       Core library (to be built)
-data/                     Evaluation datasets
-results/                  Experiment output
-paper/                    Drafts, notes, lit review
-experiments/configs/      YAML experiment configs
-v2_mmlu_archive/          All prior MMLU work (code, data, results, paper drafts)
+src/pre_action_uq/       Core library (inference.py, pipeline.py, config.py)
+data/                     QuALITY dataset + paraphrases
+results/                  Experiment output (JSON, one file per condition)
+paper/                    Brainstorm, running notes, lit review
+experiments/configs/      YAML experiment configs (local + mahti)
+dashboard/                Streamlit monitoring + analysis dashboard
+v2_mmlu_archive/          Prior MMLU work (code, data, results, paper drafts)
 ```
-
-## Prior Work Archive
-
-Everything from the MMLU-based project is preserved in `v2_mmlu_archive/`, including:
-- `v1_sampling_archive/` — Original Dirichlet sampling approach
-- `src/bayesian_uq/` — v2 logprob extraction pipeline (query.py, pipeline.py, analysis.py, config.py)
-- `analysis/` — Signal computation and exploration notebooks
-- `paper/` — Brainstorm docs, lit review, running notes, uncertainty signals spec
-- `data/` — MMLU Redux questions, paraphrases
-- `results/` — Full experiment results (10 conditions, ~2.7GB)
-- `dashboard/` — Streamlit monitoring dashboard
 
 ## Coding Style
 
