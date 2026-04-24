@@ -538,15 +538,33 @@ if HAS_ANALYSIS_CACHE:
     _cache_mtime = ANALYSIS_CACHE.stat().st_mtime
     analysis_cache = _load_analysis_cache(_cache_mtime)
 
+_run_name_cfg: dict[str, dict] = {}
+
 if analysis_cache is not None:
     df = analysis_cache["df"]
     signals_df = analysis_cache.get("signals_df")
     _cached_meta = analysis_cache.get("run_meta", {})
-    run_labels = {v["label"]: None for v in _cached_meta.values()}
-    selected_labels = list(run_labels.keys())
-    selected_paths: dict[str, Path | None] = run_labels.copy()
     _cache_time = analysis_cache.get("built_at", "unknown")
     st.sidebar.caption(f"Analysis cache: {_cache_time}")
+
+    for prefix, meta in _cached_meta.items():
+        _run_name_cfg[prefix] = meta.get("config", {})
+
+    if HAS_LOCAL_FILES:
+        # Build real file paths for progress tab, cache for everything else
+        run_labels: dict[str, Path] = {}
+        for fp in result_files:
+            cfg = _extract_config_head(fp)
+            if cfg:
+                label = format_run_label(cfg)
+            else:
+                label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
+            run_labels[label] = fp
+        selected_paths: dict[str, Path | None] = run_labels.copy()
+    else:
+        run_labels = {v["label"]: None for v in _cached_meta.values()}
+        selected_paths: dict[str, Path | None] = run_labels.copy()
+    selected_labels = list(run_labels.keys())
 else:
     # No cache — build df live from files (first run / cache deleted)
     run_labels: dict[str, Path] = {}
@@ -557,6 +575,8 @@ else:
         else:
             label = _extract_run_prefix(fp.stem).replace("quality_pilot_", "")
         run_labels[label] = fp
+        if cfg:
+            _run_name_cfg[_extract_run_prefix(fp.stem)] = cfg
 
     selected_labels = list(run_labels.keys())
     selected_paths = run_labels.copy()
@@ -571,6 +591,16 @@ else:
     df = results_to_df(all_data)
     signals_df = load_signals()
     st.sidebar.warning("No analysis cache — click 'Update Analysis Cache' to build one.")
+
+
+def _cfg_for_run_name(run_name: str) -> dict | None:
+    """Look up config for a run_name, using cache metadata or file-based fallback."""
+    if run_name in _run_name_cfg:
+        return _run_name_cfg[run_name]
+    for _l, _p in selected_paths.items():
+        if _p is not None and _extract_run_prefix(_p.stem) == run_name:
+            return _extract_config_head(_p)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +665,7 @@ def tab_progress() -> None:
         st.info("Select at least one run.")
         return
 
-    rows = [_progress_row(label, fp) for label, fp in selected_paths.items()]
+    rows = [_progress_row(label, fp) for label, fp in selected_paths.items() if fp is not None]
     in_progress = [r for r in rows if not r["is_done"]]
     completed = [r for r in rows if r["is_done"]]
 
@@ -728,16 +758,12 @@ def tab_distributions() -> None:
         return fig
 
     def _run_label(run_name):
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
         return format_run_label(cfg) if cfg else run_name.replace("quality_", "")
 
     def _run_sort_key(run_name):
         """Sort runs into visual groups: mode, then shuffle/para variant, then model."""
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
         if cfg:
             mode = _effective_mode(cfg)
             shuffle = cfg.get("shuffle_options", False)
@@ -753,9 +779,7 @@ def tab_distributions() -> None:
 
     def _run_group_label(run_name):
         """Group header like 'Direct' or 'Direct · shuffle'."""
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
         if cfg:
             mode = _effective_mode(cfg)
             shuffle = cfg.get("shuffle_options", False)
@@ -1149,9 +1173,7 @@ def _plot_calibration_single(df_valid: pd.DataFrame, title: str = "Calibration",
         if len(sub) < 5:
             continue
 
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
 
         model_name = _short_model_name(cfg) if cfg else "Unknown"
@@ -1280,9 +1302,7 @@ def tab_explorer() -> None:
     # --- Per-run results ---
     for ri, (_, row) in enumerate(all_rows.iterrows()):
         # Build run label
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == row["run_name"]), ""), None))
+        cfg = _cfg_for_run_name(row["run_name"])
         label = format_run_label(cfg) if cfg else row["run_name"].replace("quality_", "")
         prompt_mode = cfg.get("prompt_mode", "direct") if cfg else "direct"
 
@@ -1398,9 +1418,7 @@ def tab_effects() -> None:
     summary_rows = []
     for run_name, m in sorted(run_metrics.items()):
         # Build label from config
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
 
         def _delta_str(correct_val, incorrect_val):
@@ -1517,9 +1535,7 @@ def tab_effects() -> None:
         if len(sub) == 0:
             continue
 
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
         label = format_run_label(cfg) if cfg else run_name.replace("quality_", "")
         # Color by model for visual grouping
         model_name = _short_model_name(cfg) if cfg else "Unknown"
@@ -1650,9 +1666,7 @@ def _compute_signal_battery(df: pd.DataFrame) -> list[dict]:
 
         correct_sub = valid[valid["is_correct"] == True]
         incorrect_sub = valid[valid["is_correct"] == False]
-        cfg = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg = _cfg_for_run_name(run_name)
 
         def _delta(correct_vals: list, incorrect_vals: list) -> float | None:
             """Compute incorrect_mean - correct_mean. Positive = signal is higher for wrong answers."""
@@ -1854,9 +1868,7 @@ def tab_signals() -> None:
         sub = df[df["run_name"] == run_name]
         if len(sub) == 0:
             continue
-        cfg_r = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg_r = _cfg_for_run_name(run_name)
         if not cfg_r:
             continue
         mode = _effective_mode(cfg_r)
@@ -1928,9 +1940,7 @@ def tab_signals() -> None:
         sub = df[df["run_name"] == run_name]
         if len(sub) == 0:
             continue
-        cfg_r = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg_r = _cfg_for_run_name(run_name)
         if not cfg_r or not cfg_r.get("shuffle_options", False):
             continue
 
@@ -1984,9 +1994,7 @@ def tab_signals() -> None:
         sub = df[df["run_name"] == run_name]
         if len(sub) == 0:
             continue
-        cfg_r = _extract_config_head(selected_paths.get(
-            next((l for l, p in selected_paths.items()
-                  if _extract_run_prefix(p.stem) == run_name), ""), None))
+        cfg_r = _cfg_for_run_name(run_name)
         if not cfg_r:
             continue
         mode = _effective_mode(cfg_r)
@@ -2116,10 +2124,8 @@ def tab_adaptive() -> None:
 
         # --- Discover runs ---
         run_meta: dict[str, dict] = {}
-        for label, fp in selected_paths.items():
-            cfg = _extract_config_head(fp)
+        for prefix, cfg in _run_name_cfg.items():
             if cfg:
-                prefix = _extract_run_prefix(fp.stem)
                 run_meta[prefix] = {
                     "label": format_run_label(cfg),
                     "model": _short_model_name(cfg),
