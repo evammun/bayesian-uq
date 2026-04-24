@@ -719,7 +719,19 @@ Original job timed out at 51% (2360/4609, ~24h). Remaining 2249 questions split 
 ### Numbskull Spud printable document
 Generated Word doc (`paper/numbskull spud/numbskull_spud.docx`) from markdown via python-docx. Key challenge: LaTeX-to-Unicode math conversion with brace-aware parsing, combining diacritics, Unicode sub/superscripts. HTML-to-PDF approach abandoned (Chrome headless print layout broken).
 
-### Job status (19:00 UTC)
-**Completed (18/19):** All Qwen 3 (7), all Gemma 4 (6), Qwen 3.5 direct x4, Qwen 3.5 CoT noshuffle
-**Running:** Qwen 3.5 think noshuffle — split into 2 parallel jobs, each ~30% done (~8h remaining)
+### Per-model cost multipliers (measured on A100, 50-question timing runs)
+| Model | Direct (s) | CoT × | Think × |
+|-------|-----------|--------|---------|
+| Gemma 4 | 0.96 | 2.2× | 5.9× |
+| Qwen 3 | 1.27 | 2.6× | 7.3× |
+| Qwen 3.5 | 1.05 | 3.6× | 20.1× |
+
+Qwen 3.5 think is dramatically more expensive (20×) due to long reasoning traces. Dashboard cost model updated from single global multiplier to per-model lookup: `total_cost = avg_N + cap_rate × esc_multiplier[model]`.
+
+### Streamlit cache bug fix
+`_load_analysis_cache` used `_mtime` parameter (leading underscore) → Streamlit excluded it from cache key → function always returned first-ever loaded result. Renamed to `mtime`. Also added `.clear()` call after rebuilds, increased adaptive cache timeout from 20→60 min.
+
+### Job status (23:15 UTC)
+**Completed (18/19 + timing):** All Qwen 3 (7), all Gemma 4 (6), Qwen 3.5 direct x4, Qwen 3.5 CoT noshuffle. Qwen 3 timing runs (direct/CoT/think × 50 questions) complete and deleted.
+**Running:** Qwen 3.5 think noshuffle — split jobs at ~4h, ~55% done
 

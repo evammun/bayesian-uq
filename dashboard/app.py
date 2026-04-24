@@ -474,7 +474,7 @@ def build_analysis_cache() -> dict:
 
 
 @st.cache_data(ttl=None)
-def _load_analysis_cache(_mtime: float) -> dict | None:
+def _load_analysis_cache(mtime: float) -> dict | None:
     import pickle as _pickle
     import gzip as _gzip
     try:
@@ -523,6 +523,7 @@ if HAS_LOCAL_FILES:
                 f"Cache built in {elapsed:.0f}s — {n_runs} runs, "
                 f"{n_rows:,} questions, {sz:.1f} MB"
             )
+        _load_analysis_cache.clear()
         st.rerun()
 
     st.sidebar.caption("Adaptive cache: ~36 min to recompute")
@@ -533,7 +534,7 @@ if HAS_LOCAL_FILES:
         with st.sidebar.status("Recomputing adaptive sampling...", expanded=True):
             _proc = subprocess.run(
                 [str(_python), str(_script)],
-                capture_output=True, text=True, timeout=1200,
+                capture_output=True, text=True, timeout=3600,
             )
             if _proc.returncode == 0:
                 st.sidebar.success("Cache updated! Refresh the page to use new results.")
@@ -2691,7 +2692,7 @@ def tab_adaptive() -> None:
                         v = r["esc1"]
                         if v is not None:
                             delta = v - r["acc"]
-                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            d_str = f"+{delta:.1%}" if delta > 1e-9 else "-"
                             html += f'<td{hl_fn(mn, ti, "esc1", v, is_zero)}>{d_str}</td>'
                         else:
                             html += "<td>-</td>"
@@ -2699,7 +2700,7 @@ def tab_adaptive() -> None:
                         v = r["esc2"]
                         if v is not None:
                             delta = v - r["acc"]
-                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            d_str = f"+{delta:.1%}" if delta > 1e-9 else "-"
                             html += f'<td{hl_fn(mn, ti, "esc2", v, is_zero)}>{d_str}</td>'
                         else:
                             html += "<td>-</td>"
@@ -2758,7 +2759,7 @@ def tab_adaptive() -> None:
                         v = r.get("esc1")
                         if v is not None:
                             delta = v - r["acc"]
-                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            d_str = f"+{delta:.1%}" if delta > 1e-9 else "-"
                             html += f'<td{hl_fn(mn, ti, "esc1", v, is_zero)}>{d_str}</td>'
                         else:
                             html += "<td>-</td>"
@@ -2766,7 +2767,7 @@ def tab_adaptive() -> None:
                         v = r.get("esc2")
                         if v is not None:
                             delta = v - r["acc"]
-                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            d_str = f"+{delta:.1%}" if delta > 1e-9 else "-"
                             html += f'<td{hl_fn(mn, ti, "esc2", v, is_zero)}>{d_str}</td>'
                         else:
                             html += "<td>-</td>"
@@ -2996,15 +2997,39 @@ def tab_adaptive() -> None:
         "estimation already accounts for overconfidence."
     )
 
-    ESC_COSTS = {"CoT (2.4\u00d7)": 2.4, "Think (7.1\u00d7)": 7.1}
+    _ESC_MULTIPLIERS = {
+        "CoT": {"Gemma 4": 2.2, "Qwen 3": 2.6, "Qwen 3.5": 3.6},
+        "Think": {"Gemma 4": 5.9, "Qwen 3": 7.3, "Qwen 3.5": 20.1},
+    }
+    _ESC_DIRECT_S = {"Gemma 4": 0.96, "Qwen 3": 1.27, "Qwen 3.5": 1.05}
+
     esc_mode = st.selectbox(
-        "Escalation mode",
-        list(ESC_COSTS.keys()),
-        help="Measured cost relative to one direct query. "
-             "Gemma 4 A100: direct 0.96s, CoT 2.27s, Think 6.82s.",
+        "Escalation mode", ["CoT", "Think"], index=1,
+        help="Cost of escalation relative to one direct query, measured per model on A100.",
         key="esc_cost_select",
     )
-    esc_cost = ESC_COSTS[esc_mode]
+    esc_costs_by_model = _ESC_MULTIPLIERS[esc_mode]
+
+    with st.expander("Cost multipliers (measured on A100)"):
+        _cm_h = ('<table style="font-size:12px;border-collapse:collapse">'
+                 '<tr><th style="padding:4px 10px">Model</th>'
+                 '<th style="padding:4px 10px">Direct</th>'
+                 '<th style="padding:4px 10px">CoT \u00d7</th>'
+                 '<th style="padding:4px 10px">Think \u00d7</th></tr>')
+        for _mn in model_names:
+            _d = _ESC_DIRECT_S.get(_mn, "")
+            _c = _ESC_MULTIPLIERS["CoT"].get(_mn, "")
+            _t = _ESC_MULTIPLIERS["Think"].get(_mn, "")
+            _cm_h += (f'<tr><td style="padding:4px 10px">{_mn}</td>'
+                      f'<td style="padding:4px 10px;text-align:center">{_d}s</td>'
+                      f'<td style="padding:4px 10px;text-align:center">{_c}\u00d7</td>'
+                      f'<td style="padding:4px 10px;text-align:center">{_t}\u00d7</td></tr>')
+        _cm_h += '</table>'
+        st.markdown(_cm_h, unsafe_allow_html=True)
+        st.caption(
+            "Multipliers = mean inference\\_time\\_s / direct mean, from 50-question "
+            "timing runs. `total\\_cost = avg\\_N + cap\\_rate \u00d7 esc\\_multiplier`."
+        )
 
     def _pareto_from_grid(grid, esc_cost_val):
         """Pareto frontier, computing total_cost on the fly."""
@@ -3040,7 +3065,8 @@ def tab_adaptive() -> None:
     if _have_cal_grids:
         cal_grids = cal_grids_cached
         for (mkey, mn), grid in cal_grids.items():
-            pareto, enriched = _pareto_from_grid(grid, esc_cost)
+            _mn_esc = esc_costs_by_model.get(mn, 7.1)
+            pareto, enriched = _pareto_from_grid(grid, _mn_esc)
             cal_pareto[(mkey, mn)] = pareto
             cal_grids[(mkey, mn)] = enriched
             if pareto:
@@ -3394,6 +3420,7 @@ def tab_adaptive() -> None:
                         h += '<tr><td colspan="7">-</td></tr>'
                     h += '</table>'
                     st.markdown(h, unsafe_allow_html=True)
+            st.caption("Escalation deltas below 0.05 pp are hidden for clarity.")
     else:
         st.info("No temperature calibration data. "
                 "Run `python dashboard/precompute_adaptive.py` or click "
@@ -3412,7 +3439,17 @@ def tab_adaptive() -> None:
             return obj.tolist()
         return float(obj) if hasattr(obj, '__float__') else str(obj)
 
-    export_data: dict = {"n_max": n_max, "models": {}}
+    export_data: dict = {
+        "n_max": n_max,
+        "escalation_mode": esc_mode,
+        "cost_multipliers": {
+            mn: {"CoT": _ESC_MULTIPLIERS["CoT"].get(mn),
+                 "Think": _ESC_MULTIPLIERS["Think"].get(mn),
+                 "direct_s": _ESC_DIRECT_S.get(mn)}
+            for mn in model_names
+        },
+        "models": {},
+    }
     for mn in model_names:
         mdata = model_data[mn]
         m_export: dict = {
@@ -3447,6 +3484,26 @@ def tab_adaptive() -> None:
                         cal_model_data[mn][f"{mkey}_results"]
                     )
         export_data["models"][mn] = m_export
+
+    if cal_pareto:
+        _budget_levels = [2, 3, 4, 5, 7]
+        for mn in model_names:
+            budget_data: dict = {}
+            for budget in _budget_levels:
+                budget_row: dict = {}
+                for _, mkey in METHODS:
+                    pts = cal_pareto.get((mkey, mn), [])
+                    eligible = [r for r in pts if r["total_cost"] <= budget + 0.05]
+                    if eligible:
+                        best = max(eligible, key=lambda r: r["acc_esc"])
+                        budget_row[mkey] = {
+                            "acc_esc": best["acc_esc"], "acc": best["acc"],
+                            "T": best["T"], "tau": best["tau"],
+                            "avg_n": best["avg_n"], "cap_rate": best["cap_rate"],
+                            "total_cost": best["total_cost"],
+                        }
+                budget_data[str(budget)] = budget_row
+            export_data["models"][mn]["cost_budget_comparison"] = budget_data
 
     export_json = _json.dumps(export_data, indent=2, default=_make_serializable)
     export_path = Path(
