@@ -3229,24 +3229,27 @@ def tab_adaptive() -> None:
                     best_acc = max((r["acc_esc"] for r in pts), default=-1)
 
                     h = _pareto_css + f'<table class="pt">'
-                    h += f'<tr><th colspan="6" class="mhdr" style="border-color:{mcolor};color:{mcolor}">'
+                    h += f'<tr><th colspan="7" class="mhdr" style="border-color:{mcolor};color:{mcolor}">'
                     h += f'{method_label}{badges}</th></tr>'
                     h += '<tr><th>T</th><th>\u03c4</th><th>N\u0304</th><th>cap</th>'
-                    h += '<th>+esc</th><th>cost</th></tr>'
+                    h += '<th>acc</th><th>+esc</th><th>cost</th></tr>'
                     for r in pts:
                         is_best = abs(r["acc_esc"] - best_acc) < 1e-6
                         cls = ' class="best-row"' if is_best else ""
                         acc_bg = ""
                         if is_best and mkey == best_peak_method:
                             acc_bg = f' style="background:rgba(42,140,143,0.18)"'
+                        esc_delta = r["acc_esc"] - r["acc"]
+                        esc_str = f"+{esc_delta:.1%}" if esc_delta >= 0.0005 else "-"
                         h += f'<tr{cls}>'
                         h += f'<td>{r["T"]:.1f}</td><td>{r["tau"]:.2f}</td>'
                         h += f'<td>{r["avg_n"]:.1f}</td>'
                         h += f'<td>{r["cap_rate"]:.0%}</td>'
-                        h += f'<td{acc_bg}>{r["acc_esc"]:.1%}</td>'
+                        h += f'<td{acc_bg}>{r["acc"]:.1%}</td>'
+                        h += f'<td>{esc_str}</td>'
                         h += f'<td>{r["total_cost"]:.1f}</td></tr>'
                     if not pts:
-                        h += '<tr><td colspan="6">-</td></tr>'
+                        h += '<tr><td colspan="7">-</td></tr>'
                     h += '</table>'
                     st.markdown(h, unsafe_allow_html=True)
     else:
