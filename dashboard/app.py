@@ -3246,7 +3246,6 @@ def tab_adaptive() -> None:
                         h += '<td style="color:#ccc">\u2014</td>'
                         continue
                     acc_esc = pt["acc_esc"]
-                    esc_delta = acc_esc - pt["acc"]
                     gain = acc_esc - baseline
                     cls = ""
                     if spread >= 0.005:
@@ -3254,9 +3253,8 @@ def tab_adaptive() -> None:
                             cls = ' class="best"'
                         elif abs(acc_esc - worst_val) < 1e-6:
                             cls = ' class="worst"'
-                    esc_str = f' <span class="delta">+{esc_delta:.1%}</span>' if esc_delta >= 0.0005 else ""
                     gain_str = f' <span class="delta">({gain:+.1f}pp)</span>' if abs(gain) >= 0.05 else ""
-                    h += f'<td{cls}>{acc_esc:.1%}{esc_str}{gain_str}</td>'
+                    h += f'<td{cls}>{acc_esc:.1%}{gain_str}</td>'
                 h += '</tr>'
 
             h += f'<tr class="bl"><td>all-{n_max}</td>'
