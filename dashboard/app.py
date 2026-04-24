@@ -3189,6 +3189,84 @@ def tab_adaptive() -> None:
             ))
             st.plotly_chart(_round_hover(fig2), width="stretch")
 
+        # --- Cross-method comparison at fixed cost budgets ---
+        st.markdown("**Method Comparison at Fixed Cost Budgets**")
+        st.caption(
+            "Best achievable accuracy for each method at a given compute budget. "
+            "Read across to compare methods at the same cost."
+        )
+
+        cost_budgets = [2, 3, 4, 5, 7]
+        _cmp_css = """<style>
+        .cmp { border-collapse: collapse; width: 100%; font-family: Inter, sans-serif; font-size: 12px; }
+        .cmp th { padding: 5px 8px; text-align: center; font-weight: 600; font-size: 12px; }
+        .cmp td { padding: 5px 8px; text-align: center; border-bottom: 1px solid #E5E0DB; }
+        .cmp tr:hover { background: #F5F3F1; }
+        .cmp .bl td { border-top: 2px solid #ccc; font-style: italic; color: #8B95A1; }
+        .cmp .best { background: rgba(42,140,143,0.18); font-weight: 700; }
+        .cmp .worst { background: rgba(202,74,122,0.10); }
+        .cmp .delta { font-size: 10px; color: #8B95A1; }
+        .cmp .mhdr { font-size: 11px; }
+        </style>"""
+
+        for mn in model_names:
+            baseline = model_data[mn]["baseline_acc"]
+            method_at_budget: dict[str, dict[float, dict]] = {}
+            for _, mkey in METHODS:
+                pts = cal_pareto.get((mkey, mn), [])
+                method_at_budget[mkey] = {}
+                for budget in cost_budgets:
+                    eligible = [r for r in pts if r["total_cost"] <= budget + 0.05]
+                    if eligible:
+                        best = max(eligible, key=lambda r: r["acc_esc"])
+                        method_at_budget[mkey][budget] = best
+
+            h = _cmp_css + f'<table class="cmp"><tr><th></th>'
+            for method_label, mkey in METHODS:
+                mcolor = MCOLORS[mkey]
+                h += f'<th class="mhdr" style="border-bottom:2px solid {mcolor};color:{mcolor}">{method_label}</th>'
+            h += '</tr>'
+
+            for budget in cost_budgets:
+                accs = {}
+                for _, mkey in METHODS:
+                    pt = method_at_budget[mkey].get(budget)
+                    if pt:
+                        accs[mkey] = pt["acc_esc"]
+                if not accs:
+                    continue
+                best_val = max(accs.values())
+                worst_val = min(accs.values()) if len(accs) >= 2 else None
+                spread = best_val - worst_val if worst_val is not None else 0
+
+                h += f'<tr><td style="font-weight:600">\u2264{budget}</td>'
+                for _, mkey in METHODS:
+                    pt = method_at_budget[mkey].get(budget)
+                    if pt is None:
+                        h += '<td style="color:#ccc">\u2014</td>'
+                        continue
+                    acc_esc = pt["acc_esc"]
+                    esc_delta = acc_esc - pt["acc"]
+                    gain = acc_esc - baseline
+                    cls = ""
+                    if spread >= 0.005:
+                        if abs(acc_esc - best_val) < 1e-6:
+                            cls = ' class="best"'
+                        elif abs(acc_esc - worst_val) < 1e-6:
+                            cls = ' class="worst"'
+                    esc_str = f' <span class="delta">+{esc_delta:.1%}</span>' if esc_delta >= 0.0005 else ""
+                    gain_str = f' <span class="delta">({gain:+.1f}pp)</span>' if abs(gain) >= 0.05 else ""
+                    h += f'<td{cls}>{acc_esc:.1%}{esc_str}{gain_str}</td>'
+                h += '</tr>'
+
+            h += f'<tr class="bl"><td>all-{n_max}</td>'
+            for _ in METHODS:
+                h += f'<td>{baseline:.1%}</td>'
+            h += '</tr></table>'
+
+            st.markdown(f"**{mn}**")
+            st.markdown(h, unsafe_allow_html=True)
+
         # --- Pareto tables: one section per model, 5 methods side by side ---
         st.markdown("**Pareto Frontier Tables (by model)**")
 
