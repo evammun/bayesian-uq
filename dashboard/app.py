@@ -2719,8 +2719,76 @@ def tab_adaptive() -> None:
             html += "</tr></table>"
             st.markdown(html, unsafe_allow_html=True)
 
-    _render_tau_tables(model_data, model_names, METHODS, tau_values,
-                       _cs, _at_css, n_max)
+    def _render_tau_by_model(data_src, names_src, methods_src, tau_vals,
+                            hl_fn, css, n_max_val):
+        """Render τ-sweep tables: one per model, methods as column groups."""
+        for mn in names_src:
+            st.markdown(f"##### {mn}")
+            has_esc1 = data_src[mn]["has_esc1"]
+            has_esc2 = data_src[mn]["has_esc2"]
+
+            sub_cols = 3
+            if has_esc1:
+                sub_cols += 1
+            if has_esc2:
+                sub_cols += 1
+
+            html = css + '<table class="at"><tr><th rowspan="2" class="mb">\u03c4</th>'
+            for method_label, mkey in methods_src:
+                mcolor = MCOLORS[mkey]
+                html += f'<th class="mb" colspan="{sub_cols}" style="border-bottom:2px solid {mcolor};color:{mcolor}">{method_label}</th>'
+            html += "</tr><tr>"
+            for _, mkey in methods_src:
+                html += '<th class="mb">N\u0304</th><th>acc</th><th>cap</th>'
+                if has_esc1:
+                    html += "<th>+CoT</th>"
+                if has_esc2:
+                    html += "<th>+thk</th>"
+            html += "</tr>"
+
+            for ti, tau in enumerate(tau_vals):
+                is_zero = (tau == 0.0)
+                html += f'<tr><td class="mb">{tau:.2f}</td>'
+                for _, mkey in methods_src:
+                    r = data_src[mn].get(f"{mkey}_results", [])
+                    if ti < len(r):
+                        r = r[ti]
+                    else:
+                        html += f'<td class="mb" colspan="{sub_cols}">-</td>'
+                        continue
+                    html += f'<td class="mb">{r["avg_n"]:.2f}</td>'
+                    html += f'<td{hl_fn(mn, ti, "acc", r["acc"], is_zero)}>{r["acc"]:.1%}</td>'
+                    html += f'<td{hl_fn(mn, ti, "cap", r["cap"], is_zero)}>{r["cap"]:.1%}</td>'
+                    if has_esc1:
+                        v = r.get("esc1")
+                        if v is not None:
+                            delta = v - r["acc"]
+                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            html += f'<td{hl_fn(mn, ti, "esc1", v, is_zero)}>{d_str}</td>'
+                        else:
+                            html += "<td>-</td>"
+                    if has_esc2:
+                        v = r.get("esc2")
+                        if v is not None:
+                            delta = v - r["acc"]
+                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            html += f'<td{hl_fn(mn, ti, "esc2", v, is_zero)}>{d_str}</td>'
+                        else:
+                            html += "<td>-</td>"
+                html += "</tr>"
+
+            html += f'<tr class="bl"><td class="mb">all</td>'
+            for _, mkey in methods_src:
+                html += f'<td class="mb">{n_max_val}</td><td>{data_src[mn]["baseline_acc"]:.1%}</td><td>-</td>'
+                if has_esc1:
+                    html += "<td>-</td>"
+                if has_esc2:
+                    html += "<td>-</td>"
+            html += "</tr></table>"
+            st.markdown(html, unsafe_allow_html=True)
+
+    _render_tau_by_model(model_data, model_names, METHODS, tau_values,
+                         _cs, _at_css, n_max)
 
     # --- Method explanations ---
     with st.expander("How it works — Product (multiply likelihoods)"):
@@ -3052,8 +3120,8 @@ def tab_adaptive() -> None:
                   for mn in model_names]
             cal_descs[mkey] = f"T* = {', '.join(ts)}"
 
-        _render_tau_tables(cal_model_data, model_names, METHODS, tau_values_cal,
-                           cal_hl, _at_css, n_max, desc_override=cal_descs)
+        _render_tau_by_model(cal_model_data, model_names, METHODS, tau_values_cal,
+                             cal_hl, _at_css, n_max)
 
         # --- Calibrated Accuracy vs Compute ---
         st.markdown("**Accuracy vs Compute (at optimal T)**")
