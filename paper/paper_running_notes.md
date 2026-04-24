@@ -3,7 +3,7 @@
 **Authors:** Eva Martin, Professor Luigi
 **Working title:** TBD
 **Started:** March 2026 (pivot from MMLU-based UQ)
-**Status:** Brainstorming / design phase. No experiments yet.
+**Status:** Experiments running on CSC Mahti. 15/19 conditions complete. Adaptive sampling framework with 5 posterior methods.
 
 ---
 
@@ -617,4 +617,35 @@ Note: Qwen 3.5 think is extremely slow (~2 q/min vs Gemma 4 ~8 q/min). Full 4609
 **Running (24h limit):** Gemma 4 direct ×3 (shuffle/para variants, ~880 each)
 **Pending (24h limit):** Gemma 4 think + Qwen 3.5 think (fresh start, 8192 max_tokens)
 **Time limit concern:** Several 6h runs will need resubmission — Qwen 3.5 shuffle/para (~22h each), Qwen 3.5 CoT (~7.7h). Resume supported, no data loss.
+
+---
+
+## April 24, 2026
+
+### Job status (morning check)
+**Completed (15/19):** All Qwen 3 (7 conditions), all Gemma 4 (6 conditions), Qwen 3.5 direct noshuffle, Qwen 3.5 CoT noshuffle. Every Gemma 4 run at 4609/4609 including the 3 direct runs that needed last-9-question resubmission.
+
+**Still running (4 Qwen 3.5):**
+- qwen35_direct_noshuffle_paraphrase: 4130/4609 (90%)
+- qwen35_direct_shuffle_paraphrase: 3810/4609 (83%)
+- qwen35_direct_shuffle: 4150/4609 (90%)
+- qwen35_think_noshuffle: 1620/4609 (35%) — ~101 q/hr, will need 1 more 24h resubmission
+
+### Posterior aggregation brainstorm (3-round debate with Claude Browser)
+**Core problem:** Sum method can't distinguish consistent ignorance from contradictory confidence ([0.5,0.5]+[0.5,0.5] vs [1,0]+[0,1] → same α). Product needs temperature. MLE is a point estimate.
+
+**Converged answer:** Concentration α₀ must be estimated from data, not assumed = N (Sum) or calibrated away (Product's T). Two proposals converged:
+- **MoM (Method of Moments):** Pooled variance ratio R̂ = Σs²ₖ / Σμ̂ₖ(1-μ̂ₖ), then α̂₀ = (1-R̂)/R̂. One-line formula.
+- **MoM+Bayes:** Same R̂ but marginalize exceedance over Gamma(2,5) prior on α₀ via χ² likelihood. At small N, posterior is wide → conservative stopping. At large N, converges to MoM.
+
+Key design decisions: N_min=2 always (N=1 is prior-driven, not data-earned). Clamp [1,200] for MoM is strictly worse than proper Gamma prior.
+
+### Dashboard: 5 posterior methods implemented
+Added MoM and MoM+Bayes to adaptive sampling tab alongside Product, Sum, MLE. All 5 appear in tau-sweep tables, accuracy-vs-compute charts, and Pareto frontiers. New helper functions: `_mom_estimate_alpha()` (pooled variance ratio), `_bayesian_mom_exceedance()` (80-point grid posterior on α₀). Added method explainer expanders. Added export button (save results JSON to results/ or browser download).
+
+### Brainstorm updated
+Section 8.2 added: full posterior aggregation debate summary. Implementation strategy note from Browser: test MoM-simple first, if it already dominates Sum, the Bayesian wrapper goes in "principled extension" section. Decision: implement both, compare all 5 on Pareto frontier.
+
+### Explainer document
+Wrote `paper/numbskull spud.md` — 3-level escalating explainer of all 5 methods (ELI10 → ELI15 → MSc/PhD). Consistent examples threading through all levels.
 

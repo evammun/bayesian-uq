@@ -44,6 +44,8 @@ DEEP_BLUE = "#4B7C92"
 SLATE = "#5B5E8D"
 ROSE = "#CA4A7A"
 GOLD = "#D4A017"
+INDIGO = "#6366F1"
+EMERALD = "#50C878"
 PURPLE = "#7B68AE"
 PURPLE = "#6C4F7F"
 MAGENTA = "#9B4F8F"
@@ -1941,13 +1943,13 @@ def tab_adaptive() -> None:
     """Bayesian adaptive sampling with posterior stopping criterion."""
     st.header("Adaptive Sampling")
     st.caption(
-        "Two aggregation methods compared side by side. **Product:** sequentially multiply "
-        "logprob probability vectors as Bayesian likelihoods — needs temperature scaling "
-        "because raw logprobs are overconfident (posterior concentrates exponentially). "
-        "**Sum:** accumulate probability vectors as fractional Dirichlet pseudo-counts — "
-        "converges linearly, no temperature needed. Both methods stop when a confidence "
-        "measure exceeds τ (Product: max posterior; Sum/MLE: Gaussian-copula exceedance probability). "
-        "Capped questions (hit N_max without crossing τ) escalate to a more expensive mode."
+        "Five posterior aggregation methods compared side by side. "
+        "**Product:** multiply logprob likelihoods with temperature scaling (T). "
+        "**Sum:** Dirichlet pseudo-counts (no temperature). "
+        "**MLE:** fit Dirichlet α via Minka 2000. "
+        "**MoM:** one-line variance-ratio estimate of concentration α₀. "
+        "**MoM+Bayes:** MoM with Gamma prior on α₀, marginalized exceedance. "
+        "All methods stop when confidence > τ. Capped questions escalate to CoT/think."
     )
 
     if df.empty:
@@ -2160,6 +2162,52 @@ def tab_adaptive() -> None:
         P = np.clip(prod_all + damping * correction, 0.0, 1.0)
         return float(P[0]) if squeeze else P
 
+    def _mom_estimate_alpha(mu, var_sum, mu_var_sum, N, K=4):
+        """Estimate Dirichlet α via Method of Moments (variance ratio).
+
+        Pooled R̂ = Σₖ s²ₖ / Σₖ μ̂ₖ(1-μ̂ₖ).  For Dirichlet(α₀·μ),
+        E[R̂] = 1/(α₀+1), so α̂₀ = (1-R̂)/R̂.
+        Returns α = α̂₀ · μ̂, clamped to [1, 200].
+        """
+        if mu_var_sum < 1e-15:
+            return mu * 10.0
+        R = var_sum / mu_var_sum
+        R = np.clip(R, 1e-6, 1.0 - 1e-6)
+        alpha0 = (1.0 - R) / R
+        alpha0 = np.clip(alpha0, 1.0, 200.0)
+        alpha = alpha0 * mu
+        return np.maximum(alpha, 1e-8)
+
+    _BAYES_GRID = np.logspace(np.log10(0.5), np.log10(300), 80)
+
+    def _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K=4):
+        """Marginalize exceedance over Gamma posterior on α₀.
+
+        Likelihood: pooled R̂·K(N-1)/R_true ~ χ²(K(N-1)).
+        Prior: Gamma(shape=2, rate=0.2)  →  mean=10, mode=5.
+        """
+        from scipy.stats import chi2 as _chi2, gamma as _gamma
+        df = K * (N - 1)
+        if mu_var_sum < 1e-15:
+            return _exceedance_copula(mu * 10.0)
+
+        R_hat = var_sum / mu_var_sum
+        grid = _BAYES_GRID
+        R_true = 1.0 / (grid + 1.0)
+        ratio = R_hat / np.maximum(R_true, 1e-15) * df
+        log_lik = _chi2.logpdf(ratio, df) + np.log(df) - np.log(np.maximum(R_true, 1e-15))
+        log_prior = _gamma.logpdf(grid, a=2.0, scale=5.0)
+        log_post = log_lik + log_prior
+        log_post -= log_post.max()
+        post = np.exp(log_post)
+        post /= post.sum()
+
+        alpha_grid = grid[:, None] * mu[None, :]
+        alpha_grid = np.maximum(alpha_grid, 1e-8)
+        exc_grid = _exceedance_copula(alpha_grid)
+
+        return float(np.dot(post, exc_grid))
+
     def _fit_dirichlet_mle(log_p_sum, N, prior_strength=1.0, max_iter=50, tol=1e-4):
         """Fit Dirichlet α via MLE (Minka 2000) with uniform pseudo-observation."""
         K = len(log_p_sum)
@@ -2233,9 +2281,11 @@ def tab_adaptive() -> None:
         """Compute (confidence, argmax) at each permutation step.
 
         Methods:
-          product   — Bayesian posterior, confidence = max P(k|data)
-          sum       — Dirichlet pseudo-counts, confidence = copula exceedance
-          mle       — Dirichlet MLE fit, confidence = copula exceedance
+          product    — Bayesian posterior, confidence = max P(k|data)
+          sum        — Dirichlet pseudo-counts, confidence = copula exceedance
+          mle        — Dirichlet MLE fit, confidence = copula exceedance
+          mom        — Method of Moments α₀ estimate, confidence = copula exceedance
+          mom_bayes  — MoM + Gamma prior on α₀, marginalized exceedance
         """
         traj: list[tuple[float, int]] = []
 
@@ -2273,6 +2323,30 @@ def tab_adaptive() -> None:
                     continue
                 alpha = _fit_dirichlet_mle(log_p_sum, N)
                 traj.append((_exceedance_copula(alpha), int(np.argmax(alpha))))
+
+        elif method in ("mom", "mom_bayes"):
+            K = 4
+            p_sum = np.zeros(K)
+            p_sq_sum = np.zeros(K)
+            for n in range(len(probs)):
+                p = np.array(probs[n], dtype=float)
+                p_sum += p
+                p_sq_sum += p * p
+                N = n + 1
+                if N < 2:
+                    traj.append((0.0, int(np.argmax(p))))
+                    continue
+                mu = p_sum / N
+                var = (p_sq_sum / N - mu * mu) * N / (N - 1)
+                var = np.maximum(var, 0.0)
+                var_sum = var.sum()
+                mu_var_sum = (mu * (1.0 - mu)).sum()
+                if method == "mom":
+                    alpha = _mom_estimate_alpha(mu, var_sum, mu_var_sum, N, K)
+                    traj.append((_exceedance_copula(alpha), int(np.argmax(mu))))
+                else:
+                    exc = _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K)
+                    traj.append((exc, int(np.argmax(mu))))
 
         else:  # sum
             alpha = np.ones(4)
@@ -2329,7 +2403,7 @@ def tab_adaptive() -> None:
             "esc2": sum(esc2_c) / n_q if esc2_run else None,
         }
 
-    # --- Compute trajectories per model (Product, Sum, MLE) ---
+    # --- Compute trajectories per model (Product, Sum, MLE, MoM, MoM+Bayes) ---
     for mn, mdata in model_data.items():
         qs = mdata["questions"]
         mdata["prod_trajs"] = [
@@ -2339,11 +2413,19 @@ def tab_adaptive() -> None:
             _compute_trajectory(q["probs"], "sum", 1.0) for q in qs
         ]
         mdata["mle_trajs"] = _batch_mle_trajectories(qs)
+        mdata["mom_trajs"] = [
+            _compute_trajectory(q["probs"], "mom", 1.0) for q in qs
+        ]
+        mdata["mom_bayes_trajs"] = [
+            _compute_trajectory(q["probs"], "mom_bayes", 1.0) for q in qs
+        ]
 
     # --- Adaptive stopping: sweep τ per model ---
     tau_values = [0.00, 0.60, 0.70, 0.80, 0.90, 0.95]
-    METHODS = [("Product", "prod"), ("Sum", "sum"), ("Dirichlet MLE", "mle")]
-    MCOLORS = {"prod": TEAL, "sum": ROSE, "mle": GOLD}
+    METHODS = [("Product", "prod"), ("Sum", "sum"), ("Dirichlet MLE", "mle"),
+               ("MoM", "mom"), ("MoM + Bayes", "mom_bayes")]
+    MCOLORS = {"prod": TEAL, "sum": ROSE, "mle": GOLD,
+               "mom": INDIGO, "mom_bayes": EMERALD}
 
     for mn, mdata in model_data.items():
         qs, n_q_m = mdata["questions"], mdata["n_q"]
@@ -2412,7 +2494,9 @@ def tab_adaptive() -> None:
     for method_label, mkey in METHODS:
         desc = {"prod": f"multiply likelihoods, T={temperature:.1f}",
                 "sum": "Dirichlet pseudo-counts",
-                "mle": "fit α from data"}[mkey]
+                "mle": "fit α via Minka MLE",
+                "mom": "variance-ratio α₀ estimate",
+                "mom_bayes": "Bayesian wrapper on MoM"}[mkey]
         st.markdown(f"**{method_label}** ({desc})")
         html = _at_css + '<table class="at"><tr><th rowspan="2">\u03c4</th>'
         for mn in model_names:
@@ -2550,6 +2634,45 @@ def tab_adaptive() -> None:
             "pseudo-count approximation may work just as well in practice with our "
             "sample sizes (N ≤ 10)."
         )
+    with st.expander("How it works — MoM (Method of Moments)"):
+        st.markdown(
+            "**Model:** For Dirichlet(α₀·μ), the variance of component k is "
+            "μₖ(1−μₖ)/(α₀+1). The pooled variance ratio R̂ = Σₖ s²ₖ / Σₖ μ̂ₖ(1−μ̂ₖ) "
+            "estimates 1/(α₀+1), giving:\n\n"
+            "$$\\hat{\\alpha}_0 = \\frac{1 - \\hat{R}}{\\hat{R}}, \\qquad "
+            "\\hat{\\alpha} = \\hat{\\alpha}_0 \\cdot \\hat{\\mu}$$\n\n"
+            "**Stopping criterion:** Copula exceedance on the estimated α (same as "
+            "Sum and MLE). Needs N ≥ 2 — can't estimate variance from one sample.\n\n"
+            "**Key advantage:** One-line formula. No iterative fitting (unlike MLE), "
+            "no temperature (unlike Product). The pooled ratio naturally downweights "
+            "components near 0 or 1 where variance estimates are noisy.\n\n"
+            "**Key limitation:** Point estimate with no error bars. At N=2, the sample "
+            "variance has 1 degree of freedom — the 95% CI on s² spans a factor of "
+            "~1000. The stopping criterion doesn't know how uncertain it is about "
+            "its own certainty. See MoM+Bayes for the principled fix."
+        )
+    with st.expander("How it works — MoM + Bayes (Bayesian wrapper)"):
+        st.markdown(
+            "**Model:** Same variance ratio R̂ as MoM, but instead of trusting the "
+            "point estimate, put a Gamma(2, 5) prior on α₀ and compute a posterior:\n\n"
+            "$$P(\\alpha_0 \\mid \\hat{R}, N) \\propto "
+            "f_{\\chi^2}\\!\\left(\\frac{\\hat{R}}{R(\\alpha_0)} \\cdot \\nu;\\; \\nu\\right) "
+            "\\cdot \\pi(\\alpha_0)$$\n\n"
+            "where R(α₀) = 1/(α₀+1), ν = K(N−1) degrees of freedom, and π is the "
+            "Gamma prior.\n\n"
+            "**Stopping criterion:** Marginalized exceedance — integrate the copula "
+            "exceedance over the α₀ posterior on an 80-point log-spaced grid:\n\n"
+            "$$P(\\text{leader best}) = \\sum_g P(\\text{leader best} \\mid \\alpha_{0,g}, "
+            "\\hat{\\mu}) \\cdot P(\\alpha_{0,g} \\mid \\hat{R}, N) \\cdot \\Delta g$$\n\n"
+            "**Why it matters for adaptive stopping:** At small N (2–3), the posterior "
+            "on α₀ is wide → the exceedance is blurred → the system is conservative "
+            "(won't stop early on flimsy evidence). At large N (8+), the posterior "
+            "tightens → converges to plain MoM. This is exactly the behavior you want: "
+            "uncertain about your uncertainty early, decisive later.\n\n"
+            "**Prior choice:** Gamma(shape=2, scale=5) → mean=10, mode=5. Says "
+            "'models are moderately consistent before seeing data.' Not sensitive — "
+            "the data overwhelms the prior by N=4–5."
+        )
 
     # --- Accuracy vs Compute: one chart per model ---
     st.subheader("Accuracy vs Compute")
@@ -2603,7 +2726,7 @@ def tab_adaptive() -> None:
     # --- Joint Optimization ---
     st.subheader("Joint Optimization — All Methods")
     st.caption(
-        "Product sweeps T × τ. Sum & MLE sweep τ only. "
+        "Product sweeps T × τ. Sum, MLE, MoM & MoM+Bayes sweep τ only. "
         "Pareto frontiers per model."
     )
 
@@ -2685,6 +2808,10 @@ def tab_adaptive() -> None:
         mdata["sum_grid"] = _grid_sweep(qs, "sum", temps_grid, taus_grid, n_q_m, esc_cost)
         mdata["mle_grid"] = _grid_sweep(qs, "mle", temps_grid, taus_grid, n_q_m, esc_cost,
                                          pre_trajs=mdata["mle_trajs"])
+        mdata["mom_grid"] = _grid_sweep(qs, "mom", temps_grid, taus_grid, n_q_m, esc_cost,
+                                         pre_trajs=mdata["mom_trajs"])
+        mdata["mom_bayes_grid"] = _grid_sweep(qs, "mom_bayes", temps_grid, taus_grid, n_q_m, esc_cost,
+                                               pre_trajs=mdata["mom_bayes_trajs"])
         for _, mkey in METHODS:
             mdata[f"{mkey}_pareto"] = _pareto(mdata[f"{mkey}_grid"])
 
@@ -2799,6 +2926,41 @@ def tab_adaptive() -> None:
                 else:
                     st.markdown(_pareto_table_notau(model_data[mn][f"{mkey}_pareto"]),
                                 unsafe_allow_html=True)
+
+    # --- Export results ---
+    st.subheader("Export Results")
+    export_data = {"temperature": temperature, "n_max": n_max, "models": {}}
+    for mn in model_names:
+        mdata = model_data[mn]
+        m_export = {
+            "n_questions": mdata["n_q"],
+            "baseline_acc": mdata["baseline_acc"],
+            "tau_sweep": {},
+            "pareto": {},
+        }
+        for method_label, mkey in METHODS:
+            m_export["tau_sweep"][mkey] = mdata[f"{mkey}_results"]
+            m_export["pareto"][mkey] = mdata[f"{mkey}_pareto"]
+        export_data["models"][mn] = m_export
+
+    import json as _json
+    from pathlib import Path
+    export_json = _json.dumps(export_data, indent=2, default=float)
+    export_path = Path(r"C:\Users\evama\Dropbox\Family Room\Projects\bayesian-uq\results\adaptive_sampling_export.json")
+
+    col_dl, col_save = st.columns(2)
+    with col_dl:
+        st.download_button(
+            "Download results JSON",
+            data=export_json,
+            file_name="adaptive_sampling_export.json",
+            mime="application/json",
+        )
+    with col_save:
+        if st.button("Save to results/"):
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            export_path.write_text(export_json, encoding="utf-8")
+            st.success(f"Saved to `{export_path.name}`")
 
 
 # ---------------------------------------------------------------------------

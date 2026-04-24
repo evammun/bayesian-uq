@@ -1,6 +1,6 @@
 # Brainstorm — Pre-Action UQ
 
-**Last updated:** 2026-03-30
+**Last updated:** 2026-04-24
 
 ---
 
@@ -197,7 +197,42 @@ NOT doing: production system (paper = empirical validation), training anything (
 
 **Joint (T, τ) optimization:** T=3.0 optimises calibration, not deployment cost. Real objective: total_cost = avg_N + cap_rate × esc_cost. Dashboard grid searches T=[1.0..5.0] × τ=[0.60..0.99] and plots Pareto frontier. Escalation cost is configurable (CoT≈10×, think≈24× base query).
 
-### 8.2 Signal-augmented stopping (designed, TODO: implement)
+### 8.2 Posterior aggregation: the Dirichlet concentration debate (April 24, 2026)
+
+**The problem:** Three original posterior methods (Product, Sum, MLE) all have structural blind spots.
+
+- **Product** (likelihood multiplication): needs temperature T=3.0 because per-query logprobs are overconfident (MSP≈0.91). T is a free hyperparameter — calibrated on training data, not principled.
+- **Sum** (Dirichlet pseudo-counts, α = Σpᵢ): can't distinguish consistent ignorance from contradictory confidence. [0.5,0.5]+[0.5,0.5] and [1,0]+[0,1] both give α=(2,2) — but the first is "always unsure" and the second is "confidently contradictory." Sum is blind to dispersion because it treats each vector as a pseudo-count increment, losing all variance info.
+- **MLE** (Dirichlet maximum likelihood via Minka 2000): mathematically elegant but a point estimate with no uncertainty quantification. At N=2, the MLE of α₀ has enormous variance — feeding it into an exceedance probability as if it's truth is dangerous for an early-stopping system.
+
+**Core insight (converged):** The concentration parameter α₀ must be *estimated from data*, not assumed equal to N (Sum) or calibrated away (Product's temperature). High α₀ = model is consistent across permutations. Low α₀ = responses vary wildly. This single parameter jointly captures answer confidence and model stability.
+
+**Two proposals, one convergence:**
+
+*Proposal A (Bayesian Dirichlet-Dirichlet):* Put a LogNormal prior on α₀, compute Dirichlet likelihood of observed vectors given α₀, get 1D posterior P(α₀|data) via grid integration. Marginalize exceedance probability over this posterior. At small N, the wide posterior makes exceedance conservative (you don't stop early because you're uncertain about your own certainty). At large N, the posterior tightens and you get crisp stopping decisions. Key advantage: uncertainty about uncertainty is built in.
+
+*Proposal B (Method of Moments):* Variance ratio R = s²/[μ̂(1-μ̂)], then α₀ = (1-R)/R. One-line formula, intuitive, fast. But R is a point estimate — at N=2 you have 1 degree of freedom, the 95% CI on s² spans a factor of ~1000. No error bars on the stopping decision.
+
+**The synthesis (final algorithm):**
+1. Observe p⁽¹⁾, ..., p⁽ⁿ⁾. Compute μ̂ (arithmetic mean) and R (variance ratio — fast, handles zeros)
+2. R gives a noisy point estimate of α₀. Don't trust it directly. Combine with a Gamma prior on α₀ via the approximate sampling distribution of R given α₀ → posterior P(α₀|R,N)
+3. Compute exceedance by marginalizing over this posterior. At small N, wide posterior → conservative. At large N, posterior tightens → converges to what MoM alone would give
+4. Stop when exceedance > τ. Escalate to CoT/think when exceedance stalls below τ after enough samples
+
+**Design decisions:**
+- **N_min=2 always.** At N=1, the exceedance is dominated by the prior, not data. The cost of one extra permutation is tiny compared to a wrong early stop. Use the framework starting at N=2 where you have actual dispersion info.
+- **log(0) avoided.** The hybrid uses MoM (arithmetic), not geometric mean. If implementing full Bayesian Dirichlet likelihood as ablation baseline, need additive smoothing.
+- **~50 lines of NumPy.** The grid posterior on α₀ is a 1D integral. The R formula is one line. This is not complex to implement.
+
+**Paper framing:** "Shuffle-permutation logprob vectors are treated as draws from a Dirichlet. The estimated concentration parameter jointly captures answer confidence and model stability. This replaces temperature-calibrated likelihood products and sum-based pseudo-counts with a single, principled, K-agnostic framework for adaptive stopping." R formula in main text (intuitive, one line), Bayesian wrapper in methods section (rigorous). Same story, two levels of detail.
+
+**Implementation strategy (Browser's pragmatic note):** Before sinking effort into the analytic sampling distribution of R̂, check whether the Bayesian wrapper actually changes outcomes on real data. For N≥3 on K=4 MCQ, the raw MoM point estimate and the Bayesian-regularized version will likely produce nearly identical stopping decisions for 95%+ of questions. The divergence cases are N=2 edge cases where the model flips once — and "just draw a third sample" may be cheaper than fancy math. Recommended order: implement MoM with simple Gamma prior (the hybrid), run against existing three methods on dashboard, see if theoretical advantages show up as actual accuracy-vs-compute wins on the Pareto frontier. If raw MoM already dominates Sum and matches calibrated Product, the paper story is cleaner — wrapper goes in "principled extension" section, not the main result.
+
+**Decision:** Implement both. Five methods total: Product (temp-calibrated), Sum (pseudo-counts), MLE (Minka), MoM (simple point estimate), MoM+Bayesian (Gamma prior wrapper). Compare all five on the Pareto frontier. If MoM-simple already wins, the wrapper is gravy. If the wrapper matters, we have the data to show where and why.
+
+**What this gets over the original three methods:** concentration estimated from data (not assumed = N like Sum), no temperature (unlike Product), works at N=2 with principled regularization (unlike raw MLE), and the stopping threshold has a clean probabilistic interpretation that accounts for estimation uncertainty.
+
+### 8.3 Signal-augmented stopping (designed, TODO: implement)
 
 Pure posterior measures consistency, not correctness. Veto signals:
 - **2nd Gap** < threshold → don't stop (runner-up too close, posterior may be wrong)
@@ -206,7 +241,7 @@ Pure posterior measures consistency, not correctness. Veto signals:
 - **Confidence variance** > threshold → unstable
 - **Tier 2 (future):** cross-mode disagreement, think trace hedging phrase count
 
-### 8.3 Full adaptive pipeline (TODO: design + implement)
+### 8.4 Full adaptive pipeline (TODO: design + implement)
 
 The dashboard retroactively simulates adaptive stopping on existing data. For publishable results, need a real pipeline that:
 1. Actually stops early (not just simulates)
@@ -214,7 +249,7 @@ The dashboard retroactively simulates adaptive stopping on existing data. For pu
 3. Implements escalation (switch to CoT/think on capped questions)
 4. Uses held-out calibration set for T and τ
 
-### 8.4 Flat baselines for comparison
+### 8.5 Flat baselines for comparison
 
 - **Flat direct**: all 4609 × 2.5s = ~3.2h. Accuracy ~75%.
 - **Flat CoT shuffle**: all 4609 × 60s = ~77h. Accuracy ~79%.
