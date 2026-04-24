@@ -3049,7 +3049,6 @@ def tab_adaptive() -> None:
     # --- Export results ---
     st.subheader("Export Results")
     import json as _json
-    from pathlib import Path
 
     export_data: dict = {"n_max": n_max, "models": {}}
     for mn in model_names:
