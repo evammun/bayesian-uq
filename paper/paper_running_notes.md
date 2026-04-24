@@ -685,3 +685,41 @@ Dashboard (`app.py`) now:
 
 Net effect: dashboard loads in seconds instead of 10+ min. Run `python dashboard/precompute_adaptive.py` after data changes.
 
+---
+
+## April 24, 2026 (evening) — Dashboard Cloud Deploy, Mahti Split Jobs
+
+### Streamlit Cloud deployment for Luigi
+Deployed dashboard to Streamlit Cloud so Luigi can view analysis tabs remotely. Several issues hit and resolved:
+- **Missing `requirements.txt`** — Streamlit Cloud couldn't find plotly. Created project-root `requirements.txt` with all dashboard deps.
+- **`results/` is gitignored (3GB)** — Cloud had no data. Solution: built `analysis_cache.pkl.gz` (compressed pickle, 33.4MB) containing slimmed DataFrame (94K rows), run metadata, signals, and adaptive sampling cache. Pushed to git.
+- **`selected_paths` has `None` values on cloud** — 15+ places called `p.stem` or `_extract_config_head(fp)` on file paths that are `None` when running from cache without local files. Created `_cfg_for_run_name()` helper backed by cache metadata. Replaced all instances.
+- **Adaptive tab "No precomputed cache"** — `adaptive_cache.pkl` is gitignored (built locally, 7MB). Bundled adaptive data inside `analysis_cache.pkl.gz` at build time. Dashboard falls back to bundled data when standalone cache absent.
+
+### Architecture: two-layer caching
+1. **Analysis cache** (`analysis_cache.pkl.gz`, git-tracked): Updated via "Update Analysis Cache" sidebar button (fast, seconds). Contains DataFrame, run metadata, signals, and bundled adaptive data. Used by cloud + local for all analysis tabs.
+2. **Adaptive cache** (`adaptive_cache.pkl`, gitignored): Updated via "Recalculate Adaptive Cache" button (~36 min). Contains full T*tau grid sweep results. Next analysis cache build automatically bundles the latest adaptive data.
+3. **Progress tab**: Always reads live result files (local only). Auto-refresh only affects this tab.
+
+### Adaptive sampling tab: highlighting fix
+Replaced heatmap-style gradient highlighting (everything above 25th percentile got color) with discrete best/worst markers. For each (model, tau, metric), only the best method across all 5 gets teal, only the worst gets rose. Everything else stays plain.
+
+### Deprecated Streamlit API fix
+Replaced 4 instances of `use_container_width=True` with `width="stretch"` (deprecated after 2025-12-31).
+
+### Mahti: Qwen 3.5 think noshuffle split into parallel jobs
+Original job timed out at 51% (2360/4609, ~24h). Remaining 2249 questions split into two parallel SLURM jobs:
+- Added `--slice` argument to `run_experiment.py` and `pipeline.py` — takes `start:end` range, applied after resume filtering
+- Job A (6435011): slice 0:1125, Job B (6435012): slice 1125:2249
+- Both resume from the same partial result file, write to the same output file
+- Concurrent write is safe: `_IncrementalWriter` uses seek-from-end with fixed-size tail — both processes append correctly
+- Verified at 3h mark: 2980 results, 0 duplicates, different question IDs in each job
+- Estimated completion: ~8 more hours from 19:00 UTC
+
+### Numbskull Spud printable document
+Generated Word doc (`paper/numbskull spud/numbskull_spud.docx`) from markdown via python-docx. Key challenge: LaTeX-to-Unicode math conversion with brace-aware parsing, combining diacritics, Unicode sub/superscripts. HTML-to-PDF approach abandoned (Chrome headless print layout broken).
+
+### Job status (19:00 UTC)
+**Completed (18/19):** All Qwen 3 (7), all Gemma 4 (6), Qwen 3.5 direct x4, Qwen 3.5 CoT noshuffle
+**Running:** Qwen 3.5 think noshuffle — split into 2 parallel jobs, each ~30% done (~8h remaining)
+
