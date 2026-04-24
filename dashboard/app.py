@@ -2893,9 +2893,9 @@ def tab_adaptive() -> None:
             title=f"{mn} — +Think Escalation", **_layout_kwargs))
 
         with col_base:
-            st.plotly_chart(_round_hover(fig_base), use_container_width=True)
+            st.plotly_chart(_round_hover(fig_base), width="stretch")
         with col_esc:
-            st.plotly_chart(_round_hover(fig_esc), use_container_width=True)
+            st.plotly_chart(_round_hover(fig_esc), width="stretch")
 
     # ===================================================================
     # SECTION 2: TEMPERATURE CALIBRATION
@@ -3099,9 +3099,9 @@ def tab_adaptive() -> None:
                 title=f"{mn} \u2014 +Think (calibrated)", **_lay_c))
 
             with col_base_c:
-                st.plotly_chart(_round_hover(fig_base_c), use_container_width=True)
+                st.plotly_chart(_round_hover(fig_base_c), width="stretch")
             with col_esc_c:
-                st.plotly_chart(_round_hover(fig_esc_c), use_container_width=True)
+                st.plotly_chart(_round_hover(fig_esc_c), width="stretch")
 
         # --- Pareto frontier charts (all methods sweep T) ---
         st.markdown("**Pareto Frontiers (all methods sweep T \u00d7 \u03c4)**")
