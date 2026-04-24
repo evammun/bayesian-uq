@@ -2678,7 +2678,7 @@ def tab_adaptive() -> None:
             html += "</tr><tr>"
             for mi, mn in enumerate(names_src):
                 first = ' class="mb"' if True else ''
-                html += f"<th{first}>N</th><th>acc</th><th>cap</th>"
+                html += f"<th{first}>N\u0304</th><th>acc</th><th>cap</th>"
                 if data_src[mn]["has_esc1"]:
                     html += "<th>+CoT</th>"
                 if data_src[mn]["has_esc2"]:
@@ -2695,13 +2695,17 @@ def tab_adaptive() -> None:
                     if data_src[mn]["has_esc1"]:
                         v = r["esc1"]
                         if v is not None:
-                            html += f'<td{hl_fn(mn, ti, "esc1", v, is_zero)}>{v:.1%}</td>'
+                            delta = v - r["acc"]
+                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            html += f'<td{hl_fn(mn, ti, "esc1", v, is_zero)}>{d_str}</td>'
                         else:
                             html += "<td>-</td>"
                     if data_src[mn]["has_esc2"]:
                         v = r["esc2"]
                         if v is not None:
-                            html += f'<td{hl_fn(mn, ti, "esc2", v, is_zero)}>{v:.1%}</td>'
+                            delta = v - r["acc"]
+                            d_str = f"+{delta:.1%}" if delta >= 0.0005 else "-"
+                            html += f'<td{hl_fn(mn, ti, "esc2", v, is_zero)}>{d_str}</td>'
                         else:
                             html += "<td>-</td>"
                 html += "</tr>"
