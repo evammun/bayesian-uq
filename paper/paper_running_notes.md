@@ -735,3 +735,27 @@ Qwen 3.5 think is dramatically more expensive (20×) due to long reasoning trace
 **Completed (18/19 + timing):** All Qwen 3 (7), all Gemma 4 (6), Qwen 3.5 direct x4, Qwen 3.5 CoT noshuffle. Qwen 3 timing runs (direct/CoT/think × 50 questions) complete and deleted.
 **Running:** Qwen 3.5 think noshuffle — split jobs at ~4h, ~55% done
 
+---
+
+## April 25, 2026 — Dashboard polish, cache cleanup, all experiments complete
+
+### All 21 experiments complete
+Qwen 3.5 think noshuffle finished (4609/4609). Final question required a separate gputest job due to split-job boundary issue (question 3486 fell exactly on the slice boundary). All 3 models × 7 conditions = 21 runs, 96,789 total question rows.
+
+### Timing experiment cleanup
+Deleted `qwen3_timing_{direct,cot,think}` from `results/` — these 50-question timing runs were polluting the analysis cache as extra Qwen 3 entries. Caused duplicate Qwen 3 lines in calibration curves, extra rows in all per-run tables. Rebuilt analysis cache clean (21 runs, no timing data).
+
+### Adaptive cache: extended temperature grid
+Expanded T grid from [1.0..5.0] step 0.5 (9 temps) to [1.0..10.0] step 0.5 (19 temps). Several methods were hitting the T*=5.0 boundary, especially for Gemma 4. Also fixed RuntimeWarning in `_bayesian_mom_exceedance` where `log_post -= log_post.max()` produced NaN when all values were `-inf`.
+
+### Dashboard highlighting audit
+- **Comparison tab accuracy:** Best (teal+bold) / worst (rose) with ≥1pp / ≥3pp spread thresholds
+- **Comparison tab confidence:** Top-3 best-calibrated (teal) + top-3 most overconfident (rose), bold for rank 1. Relative ranking instead of absolute thresholds — all conditions are significantly overconfident (5-20pp gaps)
+- **Calibration curves:** Added markers (`lines+markers`) so single-bin runs are visible. Gemma 4 think has MSP≈1.0 for 99.96% of questions — only 1 valid calibration bin. Added degenerate-run warning caption. Perfect line now black dashed; data lines thinner (1.8px); shuffle+para variants use dotted style.
+
+### Distributions tab restructured
+Changed MSP histograms, agreement histograms, and fragile confidence box plots from grouping by config (models as subplots) to grouping by model (configs as subplots). 3 columns per row, one model per row.
+
+### Footnotes/captions added
+Added explanatory captions under: all calibration charts, comparison accuracy/confidence table, effect summary table, matched pair effects table, signal battery tables, heatmap signals, position loyalty, raw/calibrated τ-sweep tables, cost budget tables, accuracy vs compute charts, optimal temperature table, Pareto frontier charts, question explorer probability bars.
+

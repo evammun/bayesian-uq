@@ -804,68 +804,67 @@ def tab_distributions() -> None:
             parts.append("paraphrase")
         return " · ".join(parts)
 
-    # --- Per-run MSP distributions (2 per row, grouped by mode) ---
-    st.subheader("MSP by Run (Correct vs Incorrect)")
-    st.caption("Teal = correct, Gold = incorrect")
+    # --- Per-model MSP distributions (grouped by model, subplots per config) ---
+    st.subheader("MSP by Condition (Correct vs Incorrect)")
+    st.caption("Teal = correct, Gold = incorrect. Grouped by model to compare across conditions.")
     run_names = sorted(active["run_name"].unique(), key=_run_sort_key)
-    prev_group = None
-    group_buffer: list[str] = []
-    def _flush_buffer(buf):
-        for i in range(0, len(buf), 2):
-            cols = st.columns(2)
+
+    models_in_data = []
+    runs_by_model: dict[str, list[str]] = {}
+    for rn in run_names:
+        cfg = _cfg_for_run_name(rn)
+        model = _short_model_name(cfg) if cfg else "Unknown"
+        if model not in runs_by_model:
+            runs_by_model[model] = []
+            models_in_data.append(model)
+        runs_by_model[model].append(rn)
+
+    for model in models_in_data:
+        st.markdown(f"---")
+        st.markdown(f"**{model}**")
+        mruns = runs_by_model[model]
+        for i in range(0, len(mruns), 3):
+            cols = st.columns(3)
             for j, col in enumerate(cols):
                 idx = i + j
-                if idx >= len(buf):
+                if idx >= len(mruns):
                     break
-                sub = active[active["run_name"] == buf[idx]]
+                sub = active[active["run_name"] == mruns[idx]]
                 with col:
-                    st.plotly_chart(_round_hover(_msp_hist(sub, _run_label(buf[idx]))),
+                    st.plotly_chart(_round_hover(_msp_hist(sub, _run_group_label(mruns[idx]))),
                                     width="stretch")
 
-    for rn in run_names:
-        grp = _run_group_label(rn)
-        if grp != prev_group:
-            if group_buffer:
-                _flush_buffer(group_buffer)
-                group_buffer = []
-            st.markdown(f"---")
-            st.markdown(f"**{grp}**")
-            prev_group = grp
-        group_buffer.append(rn)
-    if group_buffer:
-        _flush_buffer(group_buffer)
-
-    # --- Agreement (only for multi-query runs, 2 per row) ---
+    # --- Agreement (only for multi-query runs, grouped by model) ---
     multi = active[(active["num_queries"] > 1) & active["agreement"].notna()]
     if not multi.empty:
-        st.subheader("Agreement by Run (Correct vs Incorrect)")
+        st.subheader("Agreement by Condition (Correct vs Incorrect)")
+        st.caption("Grouped by model to compare how shuffle/paraphrase affects agreement.")
         multi_runs = sorted(multi["run_name"].unique(), key=_run_sort_key)
-        prev_group = None
-        group_buffer = []
-        def _flush_agree_buffer(buf):
-            for i in range(0, len(buf), 2):
-                cols = st.columns(2)
+
+        mruns_by_model: dict[str, list[str]] = {}
+        mmodels: list[str] = []
+        for rn in multi_runs:
+            cfg = _cfg_for_run_name(rn)
+            model = _short_model_name(cfg) if cfg else "Unknown"
+            if model not in mruns_by_model:
+                mruns_by_model[model] = []
+                mmodels.append(model)
+            mruns_by_model[model].append(rn)
+
+        for model in mmodels:
+            st.markdown(f"---")
+            st.markdown(f"**{model}**")
+            mbuf = mruns_by_model[model]
+            for i in range(0, len(mbuf), 3):
+                cols = st.columns(3)
                 for j, col in enumerate(cols):
                     idx = i + j
-                    if idx >= len(buf):
+                    if idx >= len(mbuf):
                         break
-                    sub = multi[multi["run_name"] == buf[idx]]
+                    sub = multi[multi["run_name"] == mbuf[idx]]
                     with col:
-                        st.plotly_chart(_round_hover(_agree_hist(sub, _run_label(buf[idx]))),
+                        st.plotly_chart(_round_hover(_agree_hist(sub, _run_group_label(mbuf[idx]))),
                                         width="stretch")
-
-        for rn in multi_runs:
-            grp = _run_group_label(rn)
-            if grp != prev_group:
-                if group_buffer:
-                    _flush_agree_buffer(group_buffer)
-                    group_buffer = []
-                st.markdown(f"---")
-                st.markdown(f"**{grp}**")
-                prev_group = grp
-            group_buffer.append(rn)
-        if group_buffer:
-            _flush_agree_buffer(group_buffer)
 
     # --- Fragile confidence: MSP by agreement bin ---
     st.subheader("Fragile Confidence: MSP by Agreement Level")
@@ -889,18 +888,34 @@ def tab_distributions() -> None:
             fig3.update_xaxes(dtick=0.1)
             return fig3
 
-        fc_runs = [rn for rn in sorted(multi_fc["run_name"].unique())
-                   if len(multi_fc[multi_fc["run_name"] == rn]) >= 5]
-        for i in range(0, len(fc_runs), 2):
-            cols = st.columns(2)
-            for j, col in enumerate(cols):
-                idx = i + j
-                if idx >= len(fc_runs):
-                    break
-                sub = multi_fc[multi_fc["run_name"] == fc_runs[idx]].dropna(subset=["agreement", "msp"])
-                with col:
-                    st.plotly_chart(_round_hover(_fragile_box(sub, _run_label(fc_runs[idx]))),
-                                    width="stretch")
+        fc_runs = sorted(
+            [rn for rn in multi_fc["run_name"].unique()
+             if len(multi_fc[multi_fc["run_name"] == rn]) >= 5],
+            key=_run_sort_key,
+        )
+        fc_by_model: dict[str, list[str]] = {}
+        fc_models: list[str] = []
+        for rn in fc_runs:
+            cfg = _cfg_for_run_name(rn)
+            model = _short_model_name(cfg) if cfg else "Unknown"
+            if model not in fc_by_model:
+                fc_by_model[model] = []
+                fc_models.append(model)
+            fc_by_model[model].append(rn)
+
+        for model in fc_models:
+            st.markdown(f"**{model}**")
+            mbuf = fc_by_model[model]
+            for i in range(0, len(mbuf), 2):
+                cols = st.columns(2)
+                for j, col in enumerate(cols):
+                    idx = i + j
+                    if idx >= len(mbuf):
+                        break
+                    sub = multi_fc[multi_fc["run_name"] == mbuf[idx]].dropna(subset=["agreement", "msp"])
+                    with col:
+                        st.plotly_chart(_round_hover(_fragile_box(sub, _run_group_label(mbuf[idx]))),
+                                        width="stretch")
     else:
         st.caption("Requires multi-query runs (shuffle conditions).")
 
@@ -984,9 +999,8 @@ def tab_comparison() -> None:
         factor_hdrs = [factor_labels.get(c, c) for c in factor_cols]
         n_factors = len(factor_hdrs)
 
-        # Per-column landmarks: best, p75, p50, p25, worst
-        # Only these 5 cells get highlighted; everything else stays plain
-        landmarks: dict[str, dict[str, str]] = {}  # col -> {val_str: style}
+        # Per-column best/worst accuracy highlighting
+        acc_extremes: dict[str, tuple[float, float, float]] = {}
         for key in ("Accuracy", "Acc Easy", "Acc Hard"):
             vals = []
             for row in pivot_data:
@@ -998,25 +1012,27 @@ def tab_comparison() -> None:
                         pass
             if len(vals) < 3:
                 continue
-            sv = sorted(vals)
-            marks = {
-                sv[-1]: "rgba(42,140,143,0.25)",     # best — strong teal
-                sv[(3*len(sv))//4]: "rgba(42,140,143,0.12)",  # p75 — light teal
-                sv[len(sv)//2]: "rgba(160,160,160,0.10)",     # p50 — neutral
-                sv[len(sv)//4]: "rgba(200,120,80,0.12)",      # p25 — light warm
-                sv[0]: "rgba(200,80,60,0.22)",       # worst — strong warm
-            }
-            landmarks[key] = {f"{v:.0f}%": bg for v, bg in marks.items()}
+            lo, hi = min(vals), max(vals)
+            acc_extremes[key] = (lo, hi, hi - lo)
 
         def _acc_highlight(val_str: str, col: str) -> str:
-            bg = landmarks.get(col, {}).get(val_str)
-            return f' style="background:{bg}"' if bg else ""
+            ext = acc_extremes.get(col)
+            if not ext or ext[2] < 1.0:
+                return ""
+            try:
+                v = float(val_str.replace("%", ""))
+            except (ValueError, AttributeError):
+                return ""
+            if abs(v - ext[1]) < 0.05:
+                return ' style="background:rgba(42,140,143,0.20);font-weight:700"'
+            if abs(v - ext[0]) < 0.05 and ext[2] >= 3.0:
+                return ' style="background:rgba(202,74,122,0.12)"'
+            return ""
 
-        # Per-column confidence highlights: best 5 calibrated (teal) + worst 5 overconfident (warm)
-        # Key: (conf_col, row_index) -> style string
+        # Confidence calibration: top 3 best calibrated (teal) + top 3 worst overconfident (rose)
         conf_styles: dict[tuple[str, int], str] = {}
         for conf_key, acc_key in [("Confidence", "Accuracy"), ("Conf Easy", "Acc Easy"), ("Conf Hard", "Acc Hard")]:
-            gaps = []  # (row_idx, gap)
+            gaps = []
             for ri, row in enumerate(pivot_data):
                 a, c = row.get(acc_key, "-"), row.get(conf_key, "-")
                 if a == "-" or c == "-":
@@ -1025,33 +1041,18 @@ def tab_comparison() -> None:
                     gaps.append((ri, float(c) - float(a.replace("%", "")) / 100))
                 except ValueError:
                     pass
-            if len(gaps) < 3:
+            if len(gaps) < 5:
                 continue
-            by_gap = sorted(gaps, key=lambda x: abs(x[1]))
-            n_pick = min(5, len(gaps))
-            # Best calibrated: smallest |gap|
-            best_cal = by_gap[:n_pick]
-            gap_best_max = max(abs(g) for _, g in best_cal) if best_cal else 0.01
-            for rank, (ri, gap) in enumerate(best_cal):
-                t = 1.0 - rank / max(n_pick, 1)
-                alpha = 0.08 + t * 0.14
-                conf_styles[(conf_key, ri)] = f'background:rgba(42,140,143,{alpha:.2f})'
-            # Worst overconfident: largest gap (most positive)
+            by_abs = sorted(gaps, key=lambda x: abs(x[1]))
+            for rank, (ri, _) in enumerate(by_abs[:3]):
+                style = 'background:rgba(42,140,143,0.20);font-weight:700' if rank == 0 else 'background:rgba(42,140,143,0.12)'
+                conf_styles[(conf_key, ri)] = style
             by_overconf = sorted(gaps, key=lambda x: x[1], reverse=True)
-            worst_oc = by_overconf[:n_pick]
-            gap_worst_max = worst_oc[0][1] if worst_oc else 0.2
-            gap_worst_min = worst_oc[-1][1] if worst_oc else 0.1
-            oc_range = max(gap_worst_max - gap_worst_min, 0.01)
-            for ri, gap in worst_oc:
+            for rank, (ri, _) in enumerate(by_overconf[:3]):
                 if (conf_key, ri) in conf_styles:
-                    continue  # already marked as well-calibrated
-                t = (gap - gap_worst_min) / oc_range
-                t = max(0.0, min(1.0, t))
-                r = int(200 + t * 40)
-                g = int(120 - t * 80)
-                b = int(80 - t * 50)
-                alpha = 0.10 + t * 0.22
-                conf_styles[(conf_key, ri)] = f'background:rgba({r},{g},{b},{alpha:.2f})'
+                    continue
+                style = 'background:rgba(202,74,122,0.18);font-weight:700' if rank == 0 else 'background:rgba(202,74,122,0.10)'
+                conf_styles[(conf_key, ri)] = style
 
         def _conf_highlight(conf_key: str, row_idx: int) -> str:
             s = conf_styles.get((conf_key, row_idx))
@@ -1099,6 +1100,12 @@ def tab_comparison() -> None:
 
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
+        st.caption(
+            "Accuracy: **teal** = best per column (spread \u2265 1 pp), "
+            "**rose** = worst (spread \u2265 3 pp). "
+            "Confidence: **teal** = 3 best-calibrated per column (smallest |conf \u2212 acc|), "
+            "**rose** = 3 most overconfident. Bold = rank 1."
+        )
 
     # Signals table from CSV
     if signals_df is not None and not signals_df.empty:
@@ -1118,6 +1125,9 @@ def tab_comparison() -> None:
                     row[col] = f"{vals.mean():.2f}" if len(vals) > 0 else "-"
                 summary_rows.append(row)
             _html_table(summary_rows, heatmap_cols=available)
+            st.caption(
+                "Blue intensity \u221d column-normalised signal strength (min\u2013max scaling)."
+            )
 
     # Calibration curves — one chart per prompt mode
     st.subheader("Calibration: Reliability Diagram")
@@ -1171,14 +1181,15 @@ def _plot_calibration_single(df_valid: pd.DataFrame, title: str = "Calibration",
 
     fig.add_trace(go.Scatter(
         x=[0.25, 1], y=[0.25, 1], mode="lines",
-        line=dict(color=GRAY_LIGHT, dash="dash", width=1),
+        line=dict(color="#000000", dash="dash", width=1.5),
         name="Perfect", showlegend=True,
     ))
 
-    LINE_STYLES = ["solid", "dash", "dot", "dashdot", "longdash"]
+    LINE_STYLES = ["solid", "dot", "dashdot", "longdash", "dash"]
 
     run_names = sorted(df_valid["run_name"].unique())
     model_run_count: dict[str, int] = {}
+    degenerate_runs: list[str] = []
     for ri, run_name in enumerate(run_names):
         sub = df_valid[df_valid["run_name"] == run_name]
         if len(sub) < 5:
@@ -1224,11 +1235,15 @@ def _plot_calibration_single(df_valid: pd.DataFrame, title: str = "Calibration",
         valid = [(c, a) for c, a in zip(bin_centers, bin_accs) if not math.isnan(a)]
         if valid:
             plot_x, plot_y = zip(*valid)
+            suffix = " · MSP≈1" if len(valid) <= 2 else ""
+            if len(valid) <= 2:
+                degenerate_runs.append(label)
             fig.add_trace(go.Scatter(
                 x=list(plot_x), y=list(plot_y),
-                mode="lines",
-                line=dict(color=color, width=2.5, dash=dash_style),
-                name=f"{label} (ECE={ece:.2f})",
+                mode="lines+markers",
+                line=dict(color=color, width=1.8, dash=dash_style),
+                marker=dict(size=6 if len(valid) <= 2 else 4, color=color),
+                name=f"{label} (ECE={ece:.2f}){suffix}",
             ))
 
     fig.update_layout(**_base_layout(
@@ -1242,6 +1257,15 @@ def _plot_calibration_single(df_valid: pd.DataFrame, title: str = "Calibration",
     ))
 
     st.plotly_chart(_round_hover(fig), width="stretch")
+
+    if degenerate_runs:
+        degen_list = ", ".join(degenerate_runs)
+        st.caption(f"\u26a0 {degen_list}: near-degenerate MSP (\u22481.0 for almost all questions) "
+                   "\u2014 too little spread for a meaningful calibration curve. Shown as a single marker.")
+
+    st.caption("Reliability diagram: each point is the actual accuracy of questions whose mean "
+               "confidence (MSP) falls in that bin. A perfectly calibrated model follows the "
+               "diagonal. ECE = weighted mean absolute gap between confidence and accuracy across bins.")
 
 
 # ---------------------------------------------------------------------------
@@ -1354,6 +1378,10 @@ def tab_explorer() -> None:
             ))
             fig.update_traces(hovertemplate="%{fullData.name}: %{y:.2f}<extra></extra>")
             st.plotly_chart(fig, width="stretch")
+            st.caption(
+                "Stacked probability vectors per query (shuffle permutation). "
+                "Consistent stacking = stable prediction; shifting colours = position-sensitive."
+            )
 
         # Reasoning trace (CoT / think modes)
         if prompt_mode in ("cot", "cot_structured") or (cfg and cfg.get("think")):
@@ -1457,6 +1485,11 @@ def tab_effects() -> None:
             "Agree delta": "neg_good",
             "Epist. delta": "pos_good",
         })
+        st.caption(
+            "Colour intensity \u221d effect size (normalised to column max). "
+            "**Teal** = delta in the direction expected for a useful signal, "
+            "**rose** = opposite direction."
+        )
 
     # --- Matched pair analysis ---
     st.subheader("Matched Pair Effects")
@@ -1535,6 +1568,11 @@ def tab_effects() -> None:
             "MSP Delta": "pos_good",
             "Epistemic Delta": "pos_good",
         })
+        st.caption(
+            "Colour intensity \u221d effect size (normalised to column max). "
+            "**Teal** = positive effect (condition A improves metric), "
+            "**rose** = negative effect."
+        )
 
     # --- Per-run distribution comparison ---
     st.subheader("MSP Distributions by Run")
@@ -1837,6 +1875,11 @@ def tab_signals() -> None:
             html += "</tr>"
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
+        st.caption(
+            "Colour intensity \u221d signal strength\u00b2 (normalised to column max). "
+            "**Teal** = signal in the expected direction for detecting errors, "
+            "**rose** = opposite direction."
+        )
 
     _signal_table(
         "Single-Query Signals",
@@ -1989,6 +2032,10 @@ def tab_signals() -> None:
 
     if pos_rows:
         _html_table(pos_rows, highlight={"Delta": "pos_good"})
+        st.caption(
+            "Delta colour: **teal** = higher variance on incorrect (expected), "
+            "**rose** = opposite. Intensity \u221d effect size."
+        )
         st.markdown("Higher position variance on incorrect answers means the model's wrong answers are more position-dependent — relying on heuristics rather than comprehension.")
     else:
         st.info("Need shuffle runs to compute position loyalty.")
@@ -2785,6 +2832,10 @@ def tab_adaptive() -> None:
 
     _render_tau_by_model(model_data, model_names, METHODS, tau_values,
                          _cs, _at_css, n_max)
+    st.caption(
+        "Accuracy highlighting: **teal** = best method at each \u03c4 (spread \u2265 0.5 pp), "
+        "**rose** = worst (spread \u2265 1.5 pp). Other metrics unhighlighted."
+    )
 
     # --- Method explanations ---
     with st.expander("How it works — Product (multiply likelihoods)"):
@@ -2918,6 +2969,11 @@ def tab_adaptive() -> None:
 
     # --- Accuracy vs Compute: one chart per model ---
     st.subheader("Accuracy vs Compute")
+    st.caption(
+        "Left: base accuracy (no escalation) vs avg queries used. "
+        "Right: accuracy after escalating capped questions to think mode. "
+        "Diamond = all-N baseline (use all permutations, no stopping)."
+    )
 
     for mn in model_names:
         mdata = model_data[mn]
@@ -3095,6 +3151,11 @@ def tab_adaptive() -> None:
             html += '</tr>'
         html += '</table>'
         st.markdown(html, unsafe_allow_html=True)
+        st.caption(
+            "T* = temperature that maximises acc+escalation on the Pareto frontier. "
+            "\u03c4* = corresponding stopping threshold. "
+            "Higher T softens per-query logprobs before posterior aggregation."
+        )
 
         # --- Extract calibrated τ-sweep from grid at optimal T ---
         for mn in model_names:
@@ -3142,9 +3203,17 @@ def tab_adaptive() -> None:
 
         _render_tau_by_model(cal_model_data, model_names, METHODS, tau_values_cal,
                              cal_hl, _at_css, n_max)
+        st.caption(
+            "Accuracy highlighting: **teal** = best method at each \u03c4 (spread \u2265 0.5 pp), "
+            "**rose** = worst (spread \u2265 1.5 pp). Other metrics unhighlighted."
+        )
 
         # --- Calibrated Accuracy vs Compute ---
         st.markdown("**Accuracy vs Compute (at optimal T)**")
+        st.caption(
+            "Same as above but using each method's optimal temperature. "
+            "Compare how methods trade off compute for accuracy after calibration."
+        )
         for mn in model_names:
             cmd = cal_model_data[mn]
             col_base_c, col_esc_c = st.columns(2)
@@ -3217,6 +3286,11 @@ def tab_adaptive() -> None:
 
         # --- Pareto frontier charts (all methods sweep T) ---
         st.markdown("**Pareto Frontiers (all methods sweep T \u00d7 \u03c4)**")
+        st.caption(
+            "Each point is a (T, \u03c4) configuration. Stars = Pareto-optimal points "
+            "(no other config achieves higher accuracy at equal or lower cost). "
+            "Faint dots = dominated configurations. Cost = avg\\_N + cap\\_rate \u00d7 esc\\_multiplier."
+        )
 
         def _add_method_traces(fig, grid, pareto, color, name):
             p_keys = {(r["T"], r["tau"]) for r in pareto}
@@ -3352,6 +3426,10 @@ def tab_adaptive() -> None:
 
             st.markdown(f"**{mn}**")
             st.markdown(h, unsafe_allow_html=True)
+        st.caption(
+            "Per budget row: **teal** = best method (spread \u2265 0.5 pp), "
+            "**rose** = worst. Grey delta = gain over all-N baseline."
+        )
 
         # --- Pareto tables: one section per model, 5 methods side by side ---
         st.markdown("**Pareto Frontier Tables (by model)**")

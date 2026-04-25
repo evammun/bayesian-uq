@@ -301,9 +301,13 @@ def _bayesian_mom_exceedance(mu, var_sum, mu_var_sum, N, K=4):
     log_lik = _chi2.logpdf(ratio, df) + np.log(df) - np.log(np.maximum(R_true, 1e-15))
     log_prior = _gamma.logpdf(grid, a=2.0, scale=5.0)
     log_post = log_lik + log_prior
-    log_post -= log_post.max()
+    lp_max = log_post[np.isfinite(log_post)].max() if np.any(np.isfinite(log_post)) else 0.0
+    log_post -= lp_max
     post = np.exp(log_post)
-    post /= post.sum()
+    ps = post.sum()
+    if ps < 1e-30:
+        return _exceedance_copula(mu * 10.0)
+    post /= ps
 
     alpha_grid = grid[:, None] * mu[None, :]
     alpha_grid = np.maximum(alpha_grid, 1e-8)
@@ -756,7 +760,7 @@ def run_precompute(n_max: int = 10) -> dict:
             mdata[f"{mkey}_results"] = results
 
     # --- Temperature grid sweep (all methods) ---
-    temps_grid = np.arange(1.0, 5.5, 0.5)
+    temps_grid = np.arange(1.0, 10.5, 0.5)
     taus_grid = [0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99]
     log.info("\nTemperature grid sweep (this is the slow part)...")
     cal_grids: dict[tuple[str, str], list] = {}
